@@ -86,6 +86,7 @@ dependencies = [
  "anyhow",
  "autopiercam-asi",
  "autopiercam-core",
+ "autopiercam-protocol",
  "clap",
  "ctrlc",
  "image",

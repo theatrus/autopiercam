@@ -7,6 +7,7 @@ use autopiercam_core::{
     config::{CameraConfig, Config},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
+use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera};
 use image::{
     ColorType, ImageEncoder,
     codecs::{jpeg::JpegEncoder, png::PngEncoder},
@@ -16,7 +17,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, RwLock, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
@@ -70,6 +71,77 @@ impl AgentControl {
 
     fn capture_generation(&self) -> u64 {
         self.capture_generation.load(Ordering::Acquire)
+    }
+}
+
+/// Read-only runtime status shared with the tray and local IPC server.
+#[derive(Clone, Debug)]
+pub struct AgentMonitor {
+    inner: Arc<RwLock<AgentStatus>>,
+}
+
+impl Default for AgentMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentMonitor {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(AgentStatus::new(AgentState::Starting))),
+        }
+    }
+
+    pub fn snapshot(&self) -> AgentStatus {
+        match self.inner.read() {
+            Ok(status) => status.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, AgentStatus> {
+        match self.inner.write() {
+            Ok(status) => status,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn reset(&self) {
+        *self.write() = AgentStatus::new(AgentState::Starting);
+    }
+
+    fn set_camera(&self, info: &CameraInfo) {
+        self.write().camera = Some(StatusCamera {
+            id: info.camera_id,
+            name: info.name.clone(),
+        });
+    }
+
+    fn set_state(&self, state: AgentState) {
+        self.write().state = state;
+    }
+
+    fn frame_captured(&self, paused: bool) {
+        let mut status = self.write();
+        status.frames_captured = status.frames_captured.saturating_add(1);
+        status.state = if paused {
+            AgentState::Paused
+        } else {
+            AgentState::Capturing
+        };
+    }
+
+    fn artifact_saved(&self, path: &Path) {
+        let mut status = self.write();
+        status.frames_saved = status.frames_saved.saturating_add(1);
+        status.last_artifact = Some(path.to_string_lossy().into_owned());
+    }
+
+    fn fault(&self, error: &anyhow::Error) {
+        let mut status = self.write();
+        status.state = AgentState::Faulted;
+        status.last_error = Some(format!("{error:#}"));
     }
 }
 
@@ -228,11 +300,39 @@ pub fn run_agent_with_control(
     max_frames: Option<u64>,
     control: &AgentControl,
 ) -> Result<()> {
+    run_agent_with_monitor(sdk, config_path, max_frames, control, &AgentMonitor::new())
+}
+
+/// Run the worker while publishing snapshots for the tray and local clients.
+pub fn run_agent_with_monitor(
+    sdk: &Arc<Sdk>,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+) -> Result<()> {
+    monitor.reset();
+    let result = run_agent_inner(sdk, config_path, max_frames, control, monitor);
+    match &result {
+        Ok(()) => monitor.set_state(AgentState::Idle),
+        Err(error) => monitor.fault(error),
+    }
+    result
+}
+
+fn run_agent_inner(
+    sdk: &Arc<Sdk>,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+) -> Result<()> {
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
     }
     let config = Config::load(config_path)?;
     let info = select_configured_camera(sdk, &config.camera)?;
+    monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
     let mut camera = sdk.open(info.clone())?;
     let controls = camera.controls()?;
@@ -276,9 +376,10 @@ pub fn run_agent_with_control(
         .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
 
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
+    let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
-        .spawn(move || writer_loop(writer_rx))
+        .spawn(move || writer_loop(writer_rx, &writer_monitor))
         .context("starting still writer")?;
 
     info!(
@@ -297,8 +398,10 @@ pub fn run_agent_with_control(
         &capture_directory,
         max_frames,
         control,
+        monitor,
         &writer_tx,
     );
+    monitor.set_state(AgentState::Stopping);
     drop(writer_tx);
     let writer_result = writer
         .join()
@@ -318,6 +421,7 @@ fn capture_loop(
     capture_directory: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
+    monitor: &AgentMonitor,
     writer: &SyncSender<CaptureJob>,
 ) -> Result<()> {
     camera.start_video()?;
@@ -334,6 +438,11 @@ fn capture_loop(
         {
             return Ok(());
         }
+        monitor.set_state(if control.is_paused() {
+            AgentState::Paused
+        } else {
+            AgentState::Capturing
+        });
         let interval = Duration::from_millis(config.capture.interval_ms);
         let mut next_capture = Instant::now();
         let mut queued = 0_u64;
@@ -353,6 +462,7 @@ fn capture_loop(
             if control.is_shutdown() {
                 break;
             }
+            monitor.frame_captured(control.is_paused());
 
             let now = Instant::now();
             let capture_generation = control.capture_generation();
@@ -519,12 +629,13 @@ fn wait_for_auto_settle(
     }
 }
 
-fn writer_loop(receiver: Receiver<CaptureJob>) -> Result<()> {
+fn writer_loop(receiver: Receiver<CaptureJob>, monitor: &AgentMonitor) -> Result<()> {
     for job in receiver {
         let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
             .with_context(|| format!("debayering frame {}", job.sequence))?;
         let stats = luma_stats(&rgb, 64)?;
         save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
+        monitor.artifact_saved(&job.output);
         info!(
             sequence = job.sequence,
             path = %job.output.display(),
@@ -833,6 +944,37 @@ mod tests {
         assert!(!worker_view.is_shutdown());
         control.shutdown();
         assert!(worker_view.is_shutdown());
+    }
+
+    #[test]
+    fn agent_monitor_publishes_cloneable_protocol_status() {
+        let monitor = AgentMonitor::new();
+        monitor.set_camera(&CameraInfo {
+            camera_id: 7,
+            name: "Test camera".to_owned(),
+            max_width: 1,
+            max_height: 1,
+            is_color: true,
+            bayer_pattern: AsiBayerPattern::Rg,
+            supported_bins: vec![1],
+            supported_formats: vec![ImageType::Raw8],
+            pixel_size_um: 1.0,
+            has_mechanical_shutter: false,
+            has_st4_port: false,
+            is_cooled: false,
+            is_usb3_camera: true,
+            bit_depth: 8,
+            is_trigger_camera: false,
+        });
+        monitor.frame_captured(false);
+        monitor.artifact_saved(Path::new("captures/test.jpg"));
+
+        let status = monitor.snapshot();
+        assert_eq!(status.state, AgentState::Capturing);
+        assert_eq!(status.camera.expect("camera").id, 7);
+        assert_eq!(status.frames_captured, 1);
+        assert_eq!(status.frames_saved, 1);
+        assert_eq!(status.last_artifact.as_deref(), Some("captures/test.jpg"));
     }
 
     #[test]
