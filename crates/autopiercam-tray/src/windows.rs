@@ -1,5 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
+use autopiercam_core::ConfigStore;
 use autopiercam_protocol::{AgentState, AgentStatus};
 use tao::{
     event::{Event, StartCause},
@@ -33,6 +34,14 @@ enum UserEvent {
 pub(crate) fn run(options: Options) {
     init_tracing();
 
+    let config_store = match ConfigStore::open(&options.config) {
+        Ok(store) => store,
+        Err(error) => {
+            error!(path = %options.config.display(), %error, "failed to open managed configuration");
+            return;
+        }
+    };
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let menu_proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event| {
@@ -41,7 +50,7 @@ pub(crate) fn run(options: Options) {
 
     let worker_proxy = event_loop.create_proxy();
     let worker_options = WorkerOptions {
-        config_path: options.config,
+        config_path: config_store.path().to_path_buf(),
         sdk_path: options.sdk,
     };
     let worker = match start_capture_worker(worker_options, move |event| {
@@ -54,15 +63,17 @@ pub(crate) fn run(options: Options) {
         }
     };
     let agent_monitor = worker.monitor();
-    let agent_control = worker.control();
-    let mut control_server = match ControlServer::start(agent_control.clone(), agent_monitor) {
+    let mut control_server = match ControlServer::start(worker.clone(), agent_monitor, config_store)
+    {
         Ok(server) => Some(server),
         Err(error) => {
             error!(%error, "failed to start the local control pipe");
             // Failure often means another tray instance owns the well-known
             // first pipe. Do not leave a second camera owner running headless.
-            agent_control.shutdown();
-            None
+            if let Err(shutdown_error) = worker.shutdown_and_join() {
+                error!(%shutdown_error, "failed to stop the capture worker after pipe startup failure");
+            }
+            return;
         }
     };
 
@@ -79,7 +90,14 @@ pub(crate) fn run(options: Options) {
         &quit,
     ]) {
         error!(%error, "failed to construct the tray menu");
-        let _ = worker.send(TrayCommand::Shutdown);
+        if let Some(mut server) = control_server.take()
+            && let Err(stop_error) = server.stop_and_join()
+        {
+            error!(%stop_error, "failed to stop the local control pipe after menu failure");
+        }
+        if let Err(shutdown_error) = worker.shutdown_and_join() {
+            error!(%shutdown_error, "failed to stop the capture worker after menu failure");
+        }
         return;
     }
 
@@ -162,6 +180,9 @@ pub(crate) fn run(options: Options) {
                     && let Err(error) = server.stop_and_join()
                 {
                     error!(%error, "failed to stop the local control pipe cleanly");
+                }
+                if let Err(error) = worker.join() {
+                    error!(%error, "failed to join the capture supervisor cleanly");
                 }
                 tray.take();
                 *control_flow = ControlFlow::Exit;

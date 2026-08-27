@@ -150,8 +150,10 @@ version = "0.1.0"
 dependencies = [
  "autopiercam",
  "autopiercam-asi",
+ "autopiercam-core",
  "autopiercam-protocol",
  "clap",
+ "serde",
  "serde_json",
  "tao",
  "tokio",

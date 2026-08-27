@@ -3,9 +3,9 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -16,6 +16,7 @@ use autopiercam_asi::Sdk;
 use autopiercam_protocol::{AgentState, AgentStatus};
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_CAPTURE_REQUESTS_PER_POLL: u64 = 1_024;
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -34,7 +35,6 @@ pub(crate) struct WorkerOptions {
 pub(crate) enum TrayCommand {
     SetPaused(bool),
     CaptureNow,
-    #[allow(dead_code)] // Exposed for the next tray/IPC surface checkpoint.
     Restart,
     Shutdown,
 }
@@ -47,36 +47,71 @@ pub(crate) enum WorkerEvent {
 
 #[derive(Clone)]
 pub(crate) struct WorkerClient {
-    commands: Sender<TrayCommand>,
-    compatibility_control: AgentControl,
+    commands: Arc<Mutex<Sender<TrayCommand>>>,
     monitor: AgentMonitor,
-    stopped: Arc<AtomicBool>,
+    signals: Arc<WorkerSignals>,
+    thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+#[derive(Debug, Default)]
+struct WorkerSignals {
+    restart_pending: AtomicBool,
+    start_admission: Mutex<()>,
+    stopping: AtomicBool,
 }
 
 impl WorkerClient {
     pub(crate) fn send(&self, command: TrayCommand) -> Result<(), WorkerStopped> {
-        if self.stopped.load(Ordering::Acquire) {
+        let _admission = self
+            .signals
+            .start_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.signals.stopping.load(Ordering::Acquire) {
             return Err(WorkerStopped);
         }
-        self.commands
-            .send(command)
-            .map_err(|SendError(_)| WorkerStopped)
-    }
-
-    #[allow(dead_code)] // Exposed for the next tray/IPC surface checkpoint.
-    pub(crate) fn restart(&self) -> Result<(), WorkerStopped> {
-        self.send(TrayCommand::Restart)
+        match command {
+            TrayCommand::Restart if self.signals.restart_pending.swap(true, Ordering::AcqRel) => {
+                return Ok(());
+            }
+            TrayCommand::Shutdown => self.signals.stopping.store(true, Ordering::Release),
+            TrayCommand::SetPaused(_) | TrayCommand::CaptureNow | TrayCommand::Restart => {}
+        }
+        if commands.send(command).is_err() {
+            if command == TrayCommand::Restart {
+                self.signals.restart_pending.store(false, Ordering::Release);
+            }
+            self.signals.stopping.store(true, Ordering::Release);
+            return Err(WorkerStopped);
+        }
+        Ok(())
     }
 
     pub(crate) fn monitor(&self) -> AgentMonitor {
         self.monitor.clone()
     }
 
-    /// Compatibility control for the current named-pipe server. The supervisor mirrors its
-    /// pause, resume, and shutdown state into each camera session. New integrations should use
-    /// [`Self::send`] so all commands, including capture-now and restart, cross the command queue.
-    pub(crate) fn control(&self) -> AgentControl {
-        self.compatibility_control.clone()
+    pub(crate) fn join(&self) -> std::io::Result<()> {
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(thread) = thread else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("capture supervisor thread panicked"))
+    }
+
+    pub(crate) fn shutdown_and_join(&self) -> std::io::Result<()> {
+        let _ = self.send(TrayCommand::Shutdown);
+        self.join()
     }
 }
 
@@ -85,7 +120,7 @@ pub(crate) struct WorkerStopped;
 
 impl fmt::Display for WorkerStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("capture worker has already stopped")
+        formatter.write_str("capture worker is stopping or has already stopped")
     }
 }
 
@@ -101,14 +136,12 @@ where
     F: Fn(WorkerEvent) + Send + 'static,
 {
     let (commands, receiver) = mpsc::channel();
-    let compatibility_control = AgentControl::new();
     let monitor = AgentMonitor::new();
-    let stopped = Arc::new(AtomicBool::new(false));
+    let signals = Arc::new(WorkerSignals::default());
 
-    let supervisor_control = compatibility_control.clone();
     let supervisor_monitor = monitor.clone();
-    let supervisor_stopped = Arc::clone(&stopped);
-    thread::Builder::new()
+    let supervisor_signals = Arc::clone(&signals);
+    let thread = thread::Builder::new()
         .name("autopiercam-supervisor".to_owned())
         .spawn(move || {
             let mut last_status = None;
@@ -116,7 +149,7 @@ where
                 supervise_camera(
                     options,
                     receiver,
-                    &supervisor_control,
+                    &supervisor_signals,
                     &supervisor_monitor,
                     &emit,
                     &mut last_status,
@@ -129,22 +162,22 @@ where
                 supervisor_monitor.report_fault("capture supervisor panicked");
                 publish_status_if_changed(&supervisor_monitor, &emit, &mut last_status);
             }
-            supervisor_stopped.store(true, Ordering::Release);
+            supervisor_signals.stopping.store(true, Ordering::Release);
             emit(WorkerEvent::WorkerStopped);
         })?;
 
     Ok(WorkerClient {
-        commands,
-        compatibility_control,
+        commands: Arc::new(Mutex::new(commands)),
         monitor,
-        stopped,
+        signals,
+        thread: Arc::new(Mutex::new(Some(thread))),
     })
 }
 
 fn supervise_camera<F>(
     options: WorkerOptions,
     commands: Receiver<TrayCommand>,
-    compatibility_control: &AgentControl,
+    signals: &WorkerSignals,
     monitor: &AgentMonitor,
     emit: &F,
     last_status: &mut Option<AgentStatus>,
@@ -152,23 +185,15 @@ fn supervise_camera<F>(
     F: Fn(WorkerEvent),
 {
     let mut session = None;
-    let mut intent = SupervisorIntent::new(compatibility_control.is_paused());
+    let mut intent = SupervisorIntent::new(false);
     let mut backoff = RetryBackoff::default();
     let mut retry_at = Instant::now();
 
     loop {
-        if compatibility_control.is_shutdown() {
-            orderly_shutdown(
-                &mut session,
-                compatibility_control,
-                monitor,
-                emit,
-                last_status,
-            );
+        if signals.stopping.load(Ordering::Acquire) {
+            orderly_shutdown(&mut session, monitor, emit, last_status);
             return;
         }
-
-        mirror_compatibility_pause(compatibility_control, &mut intent, session.as_ref());
         observe_session_status(
             monitor,
             emit,
@@ -201,7 +226,7 @@ fn supervise_camera<F>(
                     &mut intent,
                     &mut backoff,
                     &mut retry_at,
-                    compatibility_control,
+                    &signals.restart_pending,
                     monitor,
                     emit,
                     last_status,
@@ -211,19 +236,20 @@ fn supervise_camera<F>(
                 continue;
             }
             Err(TryRecvError::Disconnected) => {
-                orderly_shutdown(
-                    &mut session,
-                    compatibility_control,
-                    monitor,
-                    emit,
-                    last_status,
-                );
+                orderly_shutdown(&mut session, monitor, emit, last_status);
                 return;
             }
             Err(TryRecvError::Empty) => {}
         }
 
         if session.is_none() && Instant::now() >= retry_at {
+            let _admission = signals
+                .start_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if signals.stopping.load(Ordering::Acquire) {
+                continue;
+            }
             match CameraSession::start(&options, monitor, intent.paused) {
                 Ok(camera) => session = Some(camera),
                 Err(error) => {
@@ -251,7 +277,7 @@ fn supervise_camera<F>(
                     &mut intent,
                     &mut backoff,
                     &mut retry_at,
-                    compatibility_control,
+                    &signals.restart_pending,
                     monitor,
                     emit,
                     last_status,
@@ -261,13 +287,7 @@ fn supervise_camera<F>(
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                orderly_shutdown(
-                    &mut session,
-                    compatibility_control,
-                    monitor,
-                    emit,
-                    last_status,
-                );
+                orderly_shutdown(&mut session, monitor, emit, last_status);
                 return;
             }
         }
@@ -281,7 +301,7 @@ fn handle_command<F>(
     intent: &mut SupervisorIntent,
     backoff: &mut RetryBackoff,
     retry_at: &mut Instant,
-    compatibility_control: &AgentControl,
+    restart_pending: &AtomicBool,
     monitor: &AgentMonitor,
     emit: &F,
     last_status: &mut Option<AgentStatus>,
@@ -289,16 +309,18 @@ fn handle_command<F>(
 where
     F: Fn(WorkerEvent),
 {
-    let session_ready = session.as_ref().is_some_and(|camera| camera.ready);
+    if command == TrayCommand::Restart {
+        restart_pending.store(false, Ordering::Release);
+    }
+    let status = monitor.snapshot();
+    let session_ready = matches!(status.state, AgentState::Capturing | AgentState::Paused)
+        && session
+            .as_ref()
+            .is_some_and(|camera| camera.ready && !camera.is_finished());
     let lifecycle = intent.accept(command, session_ready);
 
     match command {
         TrayCommand::SetPaused(paused) => {
-            if paused {
-                compatibility_control.pause();
-            } else {
-                compatibility_control.resume();
-            }
             if let Some(camera) = session {
                 camera.set_paused(paused);
             }
@@ -320,24 +342,9 @@ where
             false
         }
         LifecycleRequest::Shutdown => {
-            orderly_shutdown(session, compatibility_control, monitor, emit, last_status);
+            orderly_shutdown(session, monitor, emit, last_status);
             true
         }
-    }
-}
-
-fn mirror_compatibility_pause(
-    compatibility_control: &AgentControl,
-    intent: &mut SupervisorIntent,
-    session: Option<&CameraSession>,
-) {
-    let paused = compatibility_control.is_paused();
-    if paused == intent.paused {
-        return;
-    }
-    intent.paused = paused;
-    if let Some(camera) = session {
-        camera.set_paused(paused);
     }
 }
 
@@ -353,20 +360,25 @@ fn observe_session_status<F>(
 {
     let status = monitor.snapshot();
     if let Some(camera) = session {
+        if monitor.capturing_generation() != camera.started_capturing_generation {
+            camera.reached_capturing = true;
+            backoff.reset();
+        }
         match status.state {
             AgentState::Capturing => {
                 camera.ready = true;
-                camera.reached_capturing = true;
-                backoff.reset();
             }
             AgentState::Paused => camera.ready = true,
             AgentState::Starting
             | AgentState::Idle
             | AgentState::Faulted
-            | AgentState::Stopping => {}
+            | AgentState::Stopping => camera.ready = false,
         }
-        if camera.ready && intent.take_pending_capture() {
-            camera.capture_now();
+        if camera.ready {
+            let pending = intent.take_pending_captures(MAX_CAPTURE_REQUESTS_PER_POLL);
+            for _ in 0..pending {
+                camera.capture_now();
+            }
         }
     }
     publish_snapshot_if_changed(status, emit, last_status);
@@ -391,14 +403,12 @@ fn restart_session<F>(
 
 fn orderly_shutdown<F>(
     session: &mut Option<CameraSession>,
-    compatibility_control: &AgentControl,
     monitor: &AgentMonitor,
     emit: &F,
     last_status: &mut Option<AgentStatus>,
 ) where
     F: Fn(WorkerEvent),
 {
-    compatibility_control.shutdown();
     monitor.mark_stopping();
     publish_status_if_changed(monitor, emit, last_status);
     if let Some(camera) = session.take() {
@@ -455,6 +465,7 @@ struct CameraSession {
     thread: Option<JoinHandle<Result<(), String>>>,
     ready: bool,
     reached_capturing: bool,
+    started_capturing_generation: u64,
 }
 
 impl CameraSession {
@@ -470,6 +481,7 @@ impl CameraSession {
         let camera_options = options.clone();
         let camera_control = control.clone();
         let camera_monitor = monitor.clone();
+        let started_capturing_generation = monitor.capturing_generation();
         let thread = thread::Builder::new()
             .name("autopiercam-camera".to_owned())
             .spawn(move || run_camera(camera_options, &camera_control, &camera_monitor))?;
@@ -478,6 +490,7 @@ impl CameraSession {
             thread: Some(thread),
             ready: false,
             reached_capturing: false,
+            started_capturing_generation,
         })
     }
 
@@ -546,14 +559,14 @@ enum LifecycleRequest {
 #[derive(Debug)]
 struct SupervisorIntent {
     paused: bool,
-    pending_capture: bool,
+    pending_captures: u64,
 }
 
 impl SupervisorIntent {
     fn new(paused: bool) -> Self {
         Self {
             paused,
-            pending_capture: false,
+            pending_captures: 0,
         }
     }
 
@@ -565,7 +578,7 @@ impl SupervisorIntent {
             }
             TrayCommand::CaptureNow => {
                 if !session_ready {
-                    self.pending_capture = true;
+                    self.pending_captures = self.pending_captures.saturating_add(1);
                 }
                 LifecycleRequest::None
             }
@@ -574,8 +587,10 @@ impl SupervisorIntent {
         }
     }
 
-    fn take_pending_capture(&mut self) -> bool {
-        std::mem::take(&mut self.pending_capture)
+    fn take_pending_captures(&mut self, maximum: u64) -> u64 {
+        let count = self.pending_captures.min(maximum);
+        self.pending_captures -= count;
+        count
     }
 }
 
@@ -641,8 +656,13 @@ mod tests {
             intent.accept(TrayCommand::CaptureNow, false),
             LifecycleRequest::None
         );
-        assert!(intent.take_pending_capture());
-        assert!(!intent.take_pending_capture());
+        assert_eq!(
+            intent.accept(TrayCommand::CaptureNow, false),
+            LifecycleRequest::None
+        );
+        assert_eq!(intent.take_pending_captures(1), 1);
+        assert_eq!(intent.take_pending_captures(10), 1);
+        assert_eq!(intent.take_pending_captures(10), 0);
         assert_eq!(
             intent.accept(TrayCommand::Restart, false),
             LifecycleRequest::Restart
@@ -652,5 +672,42 @@ mod tests {
             intent.accept(TrayCommand::Shutdown, false),
             LifecycleRequest::Shutdown
         );
+    }
+
+    #[test]
+    fn accepting_shutdown_rejects_every_later_command() {
+        let (sender, receiver) = mpsc::channel();
+        let client = WorkerClient {
+            commands: Arc::new(Mutex::new(sender)),
+            monitor: AgentMonitor::new(),
+            signals: Arc::new(WorkerSignals::default()),
+            thread: Arc::new(Mutex::new(None)),
+        };
+
+        client.send(TrayCommand::Shutdown).unwrap();
+        assert!(client.send(TrayCommand::Restart).is_err());
+        assert_eq!(receiver.try_recv().unwrap(), TrayCommand::Shutdown);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn repeated_restart_requests_are_coalesced_until_dequeued() {
+        let (sender, receiver) = mpsc::channel();
+        let signals = Arc::new(WorkerSignals::default());
+        let client = WorkerClient {
+            commands: Arc::new(Mutex::new(sender)),
+            monitor: AgentMonitor::new(),
+            signals: Arc::clone(&signals),
+            thread: Arc::new(Mutex::new(None)),
+        };
+
+        client.send(TrayCommand::Restart).unwrap();
+        client.send(TrayCommand::Restart).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), TrayCommand::Restart);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        signals.restart_pending.store(false, Ordering::Release);
+        client.send(TrayCommand::Restart).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), TrayCommand::Restart);
     }
 }

@@ -10,9 +10,14 @@ use std::{
     time::Duration,
 };
 
-use autopiercam::{AgentControl, AgentMonitor};
+use autopiercam::AgentMonitor;
+use autopiercam_core::{
+    ConfigStore, ConfigStoreError,
+    config::{Config, ConfigError},
+};
 use autopiercam_protocol::{
-    ErrorBody, MAX_FRAME_SIZE, Method, PIPE_NAME, Request, Response, ValidationError,
+    Complete, ConfigReplace, ConfigSaved, ConfigSnapshot as ProtocolConfigSnapshot, ErrorBody,
+    MAX_FRAME_SIZE, Method, PIPE_NAME, Request, Response, RevisionConflictDetails, ValidationError,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -37,8 +42,11 @@ use windows_sys::{
     core::PWSTR,
 };
 
+use crate::worker::{TrayCommand, WorkerClient, WorkerStopped};
+
 const CONTROL_PIPE_PATH: &str = r"\\.\pipe\autopiercam-control-v1";
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ControlServer {
@@ -47,7 +55,11 @@ pub(crate) struct ControlServer {
 }
 
 impl ControlServer {
-    pub(crate) fn start(control: AgentControl, monitor: AgentMonitor) -> io::Result<Self> {
+    pub(crate) fn start(
+        worker: WorkerClient,
+        monitor: AgentMonitor,
+        config_store: ConfigStore,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -78,7 +90,8 @@ impl ControlServer {
                         return;
                     }
                     info!(pipe = CONTROL_PIPE_PATH, "local control pipe is ready");
-                    if let Err(error) = serve(server, &control, &monitor, &server_stop).await
+                    if let Err(error) =
+                        serve(server, &worker, &monitor, &config_store, &server_stop).await
                         && error.kind() != io::ErrorKind::Interrupted
                     {
                         warn!(%error, "local control pipe stopped with an error");
@@ -119,25 +132,26 @@ impl ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        let _ = self.stop_and_join();
     }
 }
 
 async fn serve(
     mut server: NamedPipeServer,
-    control: &AgentControl,
+    worker: &WorkerClient,
     monitor: &AgentMonitor,
+    config_store: &ConfigStore,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     loop {
-        wait_for_connection(&server, control, stop).await?;
+        wait_for_connection(&server, stop).await?;
         let mut connected_client = server;
         // Always publish the next instance before servicing this client. A
         // client can connect to it before ConnectNamedPipe is awaited, which
         // avoids a stale/broken connection between one-shot Viewer requests.
         server = create_current_user_pipe(false)?;
         let connection_result =
-            serve_connection(&mut connected_client, control, monitor, stop).await;
+            serve_connection(&mut connected_client, worker, monitor, config_store, stop).await;
         drop(connected_client);
 
         match connection_result {
@@ -151,20 +165,16 @@ async fn serve(
             }
         }
 
-        if should_stop(control, stop) {
+        if should_stop(stop) {
             return Ok(());
         }
     }
 }
 
-async fn wait_for_connection(
-    server: &NamedPipeServer,
-    control: &AgentControl,
-    stop: &AtomicBool,
-) -> io::Result<()> {
+async fn wait_for_connection(server: &NamedPipeServer, stop: &AtomicBool) -> io::Result<()> {
     let mut connect = Box::pin(server.connect());
     loop {
-        if should_stop(control, stop) {
+        if should_stop(stop) {
             return Err(stopping_error());
         }
         if let Ok(result) = timeout(IO_POLL_INTERVAL, connect.as_mut()).await {
@@ -175,23 +185,50 @@ async fn wait_for_connection(
 
 async fn serve_connection(
     server: &mut NamedPipeServer,
-    control: &AgentControl,
+    worker: &WorkerClient,
     monitor: &AgentMonitor,
+    config_store: &ConfigStore,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    loop {
-        let Some(request) = read_request(server, control, stop).await? else {
-            return Ok(());
-        };
-        let response = dispatch(request, control, monitor);
-        write_response(server, &response).await?;
-        if should_stop(control, stop) {
-            return Ok(());
-        }
+    // Protocol v1 deliberately serves one request per connection. This keeps
+    // an idle client from monopolizing the listener used by status and Quit.
+    let Some(request) = timeout(CLIENT_REQUEST_TIMEOUT, read_request(server, stop))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control client did not send a request within 5 seconds",
+            )
+        })??
+    else {
+        return Ok(());
+    };
+    let is_shutdown = request.method == Method::AgentShutdown;
+    let response = dispatch(request, worker, monitor, config_store);
+    let shutdown_accepted = is_shutdown && response.error.is_none();
+    write_response(server, &response).await?;
+    if shutdown_accepted {
+        return Err(stopping_error());
+    }
+    Ok(())
+}
+
+trait CommandSink {
+    fn send_command(&self, command: TrayCommand) -> Result<(), WorkerStopped>;
+}
+
+impl CommandSink for WorkerClient {
+    fn send_command(&self, command: TrayCommand) -> Result<(), WorkerStopped> {
+        self.send(command)
     }
 }
 
-fn dispatch(request: Request, control: &AgentControl, monitor: &AgentMonitor) -> Response {
+fn dispatch(
+    request: Request,
+    commands: &impl CommandSink,
+    monitor: &AgentMonitor,
+    config_store: &ConfigStore,
+) -> Response {
     if let Err(error) = request.validate() {
         return Response::failure(request.request_id, validation_error(error));
     }
@@ -208,35 +245,170 @@ fn dispatch(request: Request, control: &AgentControl, monitor: &AgentMonitor) ->
                 ),
             ),
         },
-        Method::CapturePause => {
-            control.pause();
-            Response::success(request_id, serde_json::json!({ "accepted": true }))
-        }
-        Method::CaptureResume => {
-            control.resume();
-            Response::success(request_id, serde_json::json!({ "accepted": true }))
-        }
-        Method::CaptureNow => {
-            control.capture_now();
-            Response::success(request_id, serde_json::json!({ "accepted": true }))
-        }
+        Method::CapturePause => command_response(
+            request_id,
+            commands,
+            TrayCommand::SetPaused(true),
+            "pause capture",
+        ),
+        Method::CaptureResume => command_response(
+            request_id,
+            commands,
+            TrayCommand::SetPaused(false),
+            "resume capture",
+        ),
+        Method::CaptureNow => command_response(
+            request_id,
+            commands,
+            TrayCommand::CaptureNow,
+            "capture a frame",
+        ),
         Method::AgentShutdown => {
-            monitor.mark_stopping();
-            control.shutdown();
-            Response::success(request_id, serde_json::json!({ "accepted": true }))
+            let response = command_response(
+                request_id,
+                commands,
+                TrayCommand::Shutdown,
+                "stop the agent",
+            );
+            if response.error.is_none() {
+                monitor.mark_stopping();
+            }
+            response
         }
-        Method::CamerasList | Method::ConfigGet | Method::ConfigReplace | Method::ArtifactsList => {
-            Response::failure(
+        Method::ConfigGet => config_get_response(request_id, config_store),
+        Method::ConfigReplace => {
+            config_replace_response(request_id, request.payload, commands, config_store)
+        }
+        Method::CamerasList | Method::ArtifactsList => Response::failure(
+            request_id,
+            ErrorBody::new(
+                "not_implemented",
+                format!(
+                    "method {} is not implemented in this checkpoint",
+                    request.method
+                ),
+            ),
+        ),
+    }
+}
+
+fn command_response(
+    request_id: String,
+    commands: &impl CommandSink,
+    command: TrayCommand,
+    action: &'static str,
+) -> Response {
+    match commands.send_command(command) {
+        Ok(()) => Response::success(request_id, serde_json::json!({ "accepted": true })),
+        Err(error) => Response::failure(
+            request_id,
+            ErrorBody::new("agent_stopped", format!("could not {action}: {error}")),
+        ),
+    }
+}
+
+fn config_get_response(request_id: String, config_store: &ConfigStore) -> Response {
+    match config_store.snapshot() {
+        Ok(snapshot) => serialize_success(
+            request_id,
+            ProtocolConfigSnapshot {
+                revision: snapshot.revision,
+                config: snapshot.config,
+            },
+            "configuration snapshot",
+        ),
+        Err(error) => Response::failure(request_id, config_store_error(error)),
+    }
+}
+
+fn config_replace_response(
+    request_id: String,
+    payload: serde_json::Value,
+    commands: &impl CommandSink,
+    config_store: &ConfigStore,
+) -> Response {
+    let replacement = match serde_json::from_value::<ConfigReplace<Complete<Config>>>(payload) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            return Response::failure(
                 request_id,
                 ErrorBody::new(
-                    "not_implemented",
-                    format!(
-                        "method {} is not implemented in this checkpoint",
-                        request.method
-                    ),
+                    "invalid_config",
+                    format!("config.replace payload is invalid: {error}"),
                 ),
-            )
+            );
         }
+    };
+
+    match config_store.replace(
+        replacement.expected_revision,
+        replacement.config.into_inner(),
+    ) {
+        Ok(snapshot) => match commands.send_command(TrayCommand::Restart) {
+            Ok(()) => serialize_success(
+                request_id,
+                ConfigSaved {
+                    revision: snapshot.revision,
+                    saved: true,
+                    restart_scheduled: true,
+                },
+                "configuration result",
+            ),
+            Err(error) => Response::failure(
+                request_id,
+                ErrorBody::new(
+                    "config_saved_agent_stopped",
+                    format!(
+                        "configuration revision {} was saved, but the agent could not restart: {error}",
+                        snapshot.revision
+                    ),
+                )
+                .with_details(serde_json::json!({ "revision": snapshot.revision })),
+            ),
+        },
+        Err(error) => Response::failure(request_id, config_store_error(error)),
+    }
+}
+
+fn serialize_success(
+    request_id: String,
+    value: impl serde::Serialize,
+    description: &'static str,
+) -> Response {
+    match serde_json::to_value(value) {
+        Ok(value) => Response::success(request_id, value),
+        Err(error) => Response::failure(
+            request_id,
+            ErrorBody::new(
+                "internal_error",
+                format!("could not serialize {description}: {error}"),
+            ),
+        ),
+    }
+}
+
+fn config_store_error(error: ConfigStoreError) -> ErrorBody {
+    match error {
+        ConfigStoreError::RevisionConflict(conflict) => ErrorBody::new(
+            "revision_conflict",
+            format!(
+                "configuration changed since revision {}; current revision is {}",
+                conflict.expected, conflict.current
+            ),
+        )
+        .with_details(
+            serde_json::to_value(RevisionConflictDetails {
+                expected_revision: conflict.expected,
+                current_revision: conflict.current,
+            })
+            .expect("revision conflict details are always serializable"),
+        ),
+        ConfigStoreError::Config(ConfigError::Validation(message)) => ErrorBody::new(
+            "invalid_config",
+            format!("invalid configuration: {message}"),
+        ),
+        ConfigStoreError::Config(error) => ErrorBody::new("config_unavailable", error.to_string()),
+        error => ErrorBody::new("config_store_error", error.to_string()),
     }
 }
 
@@ -246,15 +418,14 @@ fn validation_error(error: ValidationError) -> ErrorBody {
 
 async fn read_request(
     server: &mut NamedPipeServer,
-    control: &AgentControl,
     stop: &AtomicBool,
 ) -> io::Result<Option<Request>> {
     let mut prefix = [0_u8; 4];
-    let first = read_some(server, &mut prefix[..1], control, stop).await?;
+    let first = read_some(server, &mut prefix[..1], stop).await?;
     if first == 0 {
         return Ok(None);
     }
-    read_exact(server, &mut prefix[1..], control, stop).await?;
+    read_exact(server, &mut prefix[1..], stop).await?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -264,7 +435,7 @@ async fn read_request(
     }
 
     let mut payload = vec![0_u8; length];
-    read_exact(server, &mut payload, control, stop).await?;
+    read_exact(server, &mut payload, stop).await?;
     serde_json::from_slice(&payload)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -273,12 +444,11 @@ async fn read_request(
 async fn read_exact(
     server: &mut NamedPipeServer,
     destination: &mut [u8],
-    control: &AgentControl,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut offset = 0;
     while offset < destination.len() {
-        let count = read_some(server, &mut destination[offset..], control, stop).await?;
+        let count = read_some(server, &mut destination[offset..], stop).await?;
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -293,7 +463,6 @@ async fn read_exact(
 async fn read_some(
     server: &mut NamedPipeServer,
     destination: &mut [u8],
-    control: &AgentControl,
     stop: &AtomicBool,
 ) -> io::Result<usize> {
     // Keep one overlapped ReadFile future alive across stop polls. Recreating
@@ -301,7 +470,7 @@ async fn read_some(
     // instance after a client disconnects.
     let mut read = Box::pin(server.read(destination));
     loop {
-        if should_stop(control, stop) {
+        if should_stop(stop) {
             return Err(stopping_error());
         }
         if let Ok(result) = timeout(IO_POLL_INTERVAL, read.as_mut()).await {
@@ -332,8 +501,8 @@ async fn write_response(server: &mut NamedPipeServer, response: &Response) -> io
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control response write timed out"))?
 }
 
-fn should_stop(control: &AgentControl, stop: &AtomicBool) -> bool {
-    stop.load(Ordering::Acquire) || control.is_shutdown()
+fn should_stop(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Acquire)
 }
 
 fn stopping_error() -> io::Error {
@@ -488,16 +657,78 @@ fn wide_pointer_to_string(pointer: PWSTR) -> io::Result<String> {
 mod tests {
     use super::*;
     use autopiercam_protocol::{AgentState, PROTOCOL_VERSION};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU64},
+        },
+    };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct TestCommands {
+        sent: Mutex<Vec<TrayCommand>>,
+        stopped: AtomicBool,
+    }
+
+    impl TestCommands {
+        fn snapshot(&self) -> Vec<TrayCommand> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandSink for TestCommands {
+        fn send_command(&self, command: TrayCommand) -> Result<(), WorkerStopped> {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(WorkerStopped);
+            }
+            self.sent.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("autopiercam-ipc-tests-{}-{id}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create test directory {path:?}: {error}"),
+                }
+            }
+        }
+
+        fn store(&self) -> ConfigStore {
+            ConfigStore::open(self.0.join("autopiercam.toml")).unwrap()
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
-    fn dispatch_reports_status_and_applies_capture_commands() {
-        let control = AgentControl::new();
+    fn dispatch_reports_status_and_queues_capture_commands() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let commands = TestCommands::default();
         let monitor = AgentMonitor::new();
 
         let response = dispatch(
             Request::new("status-1", Method::StatusGet),
-            &control,
+            &commands,
             &monitor,
+            &store,
         );
         assert_eq!(response.request_id, "status-1");
         assert_eq!(response.version, PROTOCOL_VERSION);
@@ -508,27 +739,204 @@ mod tests {
 
         let response = dispatch(
             Request::new("pause-1", Method::CapturePause),
-            &control,
+            &commands,
             &monitor,
+            &store,
         );
         assert!(response.error.is_none());
-        assert!(control.is_paused());
 
         let response = dispatch(
             Request::new("resume-1", Method::CaptureResume),
-            &control,
+            &commands,
             &monitor,
+            &store,
         );
         assert!(response.error.is_none());
-        assert!(!control.is_paused());
+
+        let response = dispatch(
+            Request::new("capture-1", Method::CaptureNow),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert!(response.error.is_none());
+
+        assert_eq!(
+            commands.snapshot(),
+            [
+                TrayCommand::SetPaused(true),
+                TrayCommand::SetPaused(false),
+                TrayCommand::CaptureNow,
+            ]
+        );
+    }
+
+    #[test]
+    fn configuration_roundtrip_restarts_and_rejects_stale_revisions() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let commands = TestCommands::default();
+        let monitor = AgentMonitor::new();
+
+        let response = dispatch(
+            Request::new("config-get-1", Method::ConfigGet),
+            &commands,
+            &monitor,
+            &store,
+        );
+        let initial: ProtocolConfigSnapshot<Config> =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(initial.config.capture.interval_ms, 10_000);
+
+        let mut replacement = initial.config.clone();
+        replacement.capture.interval_ms = 2_500;
+        let request = Request::new("config-replace-1", Method::ConfigReplace).with_payload(
+            serde_json::to_value(ConfigReplace {
+                expected_revision: initial.revision,
+                config: replacement.clone(),
+            })
+            .unwrap(),
+        );
+        let response = dispatch(request, &commands, &monitor, &store);
+        let saved: ConfigSaved = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(saved.saved);
+        assert!(saved.restart_scheduled);
+        assert_ne!(saved.revision, initial.revision);
+        assert_eq!(store.snapshot().unwrap().config.capture.interval_ms, 2_500);
+        assert_eq!(commands.snapshot(), [TrayCommand::Restart]);
+
+        replacement.capture.interval_ms = 5_000;
+        let stale = Request::new("config-replace-stale", Method::ConfigReplace).with_payload(
+            serde_json::to_value(ConfigReplace {
+                expected_revision: initial.revision,
+                config: replacement,
+            })
+            .unwrap(),
+        );
+        let response = dispatch(stale, &commands, &monitor, &store);
+        let error = response.error.expect("stale replacement error");
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(
+            error.details.unwrap()["current_revision"],
+            serde_json::json!(saved.revision)
+        );
+        assert_eq!(store.snapshot().unwrap().revision, saved.revision);
+        assert_eq!(commands.snapshot(), [TrayCommand::Restart]);
+
+        let stopped_commands = TestCommands::default();
+        stopped_commands.stopped.store(true, Ordering::Release);
+        let current = store.snapshot().unwrap();
+        let mut persisted_without_restart = current.config;
+        persisted_without_restart.capture.interval_ms = 7_500;
+        let request = Request::new("config-replace-stopped", Method::ConfigReplace).with_payload(
+            serde_json::to_value(ConfigReplace {
+                expected_revision: current.revision,
+                config: persisted_without_restart,
+            })
+            .unwrap(),
+        );
+        let response = dispatch(request, &stopped_commands, &monitor, &store);
+        let error = response.error.expect("saved but not restarted error");
+        assert_eq!(error.code, "config_saved_agent_stopped");
+        let persisted_revision = error.details.unwrap()["revision"].as_u64().unwrap();
+        let persisted = store.snapshot().unwrap();
+        assert_eq!(persisted.revision, persisted_revision);
+        assert_eq!(persisted.config.capture.interval_ms, 7_500);
+    }
+
+    #[test]
+    fn invalid_configuration_and_stopped_worker_are_structured_errors() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let commands = TestCommands::default();
+        let monitor = AgentMonitor::new();
+        let initial = store.snapshot().unwrap();
+        let mut invalid = initial.config;
+        invalid.capture.interval_ms = 0;
+
+        let request = Request::new("config-invalid", Method::ConfigReplace).with_payload(
+            serde_json::to_value(ConfigReplace {
+                expected_revision: initial.revision,
+                config: invalid,
+            })
+            .unwrap(),
+        );
+        let response = dispatch(request, &commands, &monitor, &store);
+        assert_eq!(response.error.unwrap().code, "invalid_config");
+        assert_eq!(store.snapshot().unwrap().revision, initial.revision);
+
+        let partial =
+            Request::new("config-partial", Method::ConfigReplace).with_payload(serde_json::json!({
+                "expected_revision": initial.revision,
+                "config": { "capture": { "interval_ms": 2_500 } }
+            }));
+        let response = dispatch(partial, &commands, &monitor, &store);
+        let error = response.error.expect("partial replacement error");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("missing required field config."));
+        assert_eq!(store.snapshot().unwrap().revision, initial.revision);
+
+        let current = store.snapshot().unwrap();
+        let mut missing_optional = serde_json::to_value(ConfigReplace {
+            expected_revision: current.revision,
+            config: current.config,
+        })
+        .unwrap();
+        missing_optional["config"]["camera"]
+            .as_object_mut()
+            .unwrap()
+            .remove("camera_id");
+        let response = dispatch(
+            Request::new("config-missing-optional", Method::ConfigReplace)
+                .with_payload(missing_optional),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert!(
+            response
+                .error
+                .unwrap()
+                .message
+                .contains("config.camera.camera_id")
+        );
+
+        let current = store.snapshot().unwrap();
+        let mut unknown_nested = serde_json::to_value(ConfigReplace {
+            expected_revision: current.revision,
+            config: current.config,
+        })
+        .unwrap();
+        unknown_nested["config"]["camera"]["unknown"] = serde_json::json!(true);
+        let response = dispatch(
+            Request::new("config-unknown-nested", Method::ConfigReplace)
+                .with_payload(unknown_nested),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert_eq!(response.error.unwrap().code, "invalid_config");
+        assert_eq!(store.snapshot().unwrap().revision, initial.revision);
+
+        commands.stopped.store(true, Ordering::Release);
+        let response = dispatch(
+            Request::new("capture-stopped", Method::CaptureNow),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert!(response.result.is_none());
+        assert_eq!(response.error.expect("error").code, "agent_stopped");
     }
 
     #[test]
     fn dispatch_returns_structured_error_for_future_methods() {
+        let directory = TestDirectory::new();
         let response = dispatch(
-            Request::new("config-1", Method::ConfigGet),
-            &AgentControl::new(),
+            Request::new("cameras-1", Method::CamerasList),
+            &TestCommands::default(),
             &AgentMonitor::new(),
+            &directory.store(),
         );
         assert!(response.result.is_none());
         assert_eq!(response.error.expect("error").code, "not_implemented");

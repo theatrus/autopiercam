@@ -9,8 +9,10 @@ description = "Windows notification-area host for AutoPierCam"
 [target.'cfg(target_os = "windows")'.dependencies]
 autopiercam = { path = "../autopiercam" }
 autopiercam-asi = { path = "../autopiercam-asi" }
+autopiercam-core = { path = "../autopiercam-core" }
 autopiercam-protocol = { path = "../autopiercam-protocol" }
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tao = { version = "=0.34.4", default-features = false }
 tokio.workspace = true

@@ -215,15 +215,66 @@ pub struct ConfigSnapshot<T> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigReplace<T> {
     pub expected_revision: u64,
     pub config: T,
 }
 
+/// A wire value whose serialized object shape must include every field emitted
+/// by `T::default()`, including optional fields represented by JSON null.
+/// This lets full-replacement APIs stay strict while their storage model may
+/// still use serde defaults for hand-written TOML files.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Complete<T>(pub T);
+
+impl<T> Complete<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Complete<T>
+where
+    T: Default + Serialize + DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let actual = Value::deserialize(deserializer)?;
+        let template = serde_json::to_value(T::default()).map_err(serde::de::Error::custom)?;
+        require_complete_shape(&actual, &template, "config").map_err(serde::de::Error::custom)?;
+        serde_json::from_value(actual)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn require_complete_shape(actual: &Value, template: &Value, path: &str) -> Result<(), String> {
+    let Some(expected_fields) = template.as_object() else {
+        return Ok(());
+    };
+    let Some(actual_fields) = actual.as_object() else {
+        return Err(format!("field {path} must be an object"));
+    };
+
+    for (name, expected_value) in expected_fields {
+        let child_path = format!("{path}.{name}");
+        let actual_value = actual_fields
+            .get(name)
+            .ok_or_else(|| format!("missing required field {child_path}"))?;
+        require_complete_shape(actual_value, expected_value, &child_path)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ConfigApplied {
+pub struct ConfigSaved {
     pub revision: u64,
-    pub applied: bool,
+    pub saved: bool,
+    pub restart_scheduled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -590,18 +641,77 @@ mod tests {
         assert_eq!(payload["expected_revision"], 41);
         assert_eq!(payload["config"]["camera"]["bin"], 1);
 
-        let applied = ConfigApplied {
+        let saved = ConfigSaved {
             revision: 42,
-            applied: true,
+            saved: true,
+            restart_scheduled: true,
         };
         assert_eq!(
-            serde_json::to_value(applied).unwrap(),
-            json!({"revision": 42, "applied": true})
+            serde_json::to_value(saved).unwrap(),
+            json!({"revision": 42, "saved": true, "restart_scheduled": true})
         );
         let conflict = RevisionConflictDetails {
             expected_revision: 40,
             current_revision: 41,
         };
         assert_eq!(conflict.current_revision, 41);
+
+        let unknown = serde_json::from_value::<ConfigReplace<Value>>(json!({
+            "expected_revision": 41,
+            "config": {},
+            "unexpected": true
+        }));
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn complete_wire_values_require_nested_and_optional_fields() {
+        #[derive(Debug, Default, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct WireConfig {
+            required: u32,
+            optional: Option<String>,
+            nested: WireNested,
+        }
+
+        #[derive(Debug, Default, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct WireNested {
+            leaf: bool,
+        }
+
+        let complete = json!({
+            "expected_revision": 7,
+            "config": {
+                "required": 1,
+                "optional": null,
+                "nested": { "leaf": true }
+            }
+        });
+        let replacement =
+            serde_json::from_value::<ConfigReplace<Complete<WireConfig>>>(complete).unwrap();
+        assert_eq!(replacement.config.into_inner().required, 1);
+
+        let missing_optional = json!({
+            "expected_revision": 7,
+            "config": { "required": 1, "nested": { "leaf": true } }
+        });
+        assert!(
+            serde_json::from_value::<ConfigReplace<Complete<WireConfig>>>(missing_optional)
+                .unwrap_err()
+                .to_string()
+                .contains("config.optional")
+        );
+
+        let missing_leaf = json!({
+            "expected_revision": 7,
+            "config": { "required": 1, "optional": null, "nested": {} }
+        });
+        assert!(
+            serde_json::from_value::<ConfigReplace<Complete<WireConfig>>>(missing_leaf)
+                .unwrap_err()
+                .to_string()
+                .contains("config.nested.leaf")
+        );
     }
 }

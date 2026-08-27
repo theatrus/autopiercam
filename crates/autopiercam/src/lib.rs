@@ -78,6 +78,7 @@ impl AgentControl {
 #[derive(Clone, Debug)]
 pub struct AgentMonitor {
     inner: Arc<RwLock<AgentStatus>>,
+    capturing_generation: Arc<AtomicU64>,
 }
 
 impl Default for AgentMonitor {
@@ -90,6 +91,7 @@ impl AgentMonitor {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(AgentStatus::new(AgentState::Starting))),
+            capturing_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -109,6 +111,13 @@ impl AgentMonitor {
 
     pub fn mark_stopping(&self) {
         self.set_state(AgentState::Stopping);
+    }
+
+    /// Monotonically changes whenever an attempt enters the Capturing state.
+    /// Supervisors use this handshake so a short-lived successful connection
+    /// is not missed between status polls.
+    pub fn capturing_generation(&self) -> u64 {
+        self.capturing_generation.load(Ordering::Acquire)
     }
 
     fn write(&self) -> RwLockWriteGuard<'_, AgentStatus> {
@@ -133,17 +142,25 @@ impl AgentMonitor {
     }
 
     fn set_state(&self, state: AgentState) {
-        self.write().state = state;
+        let mut status = self.write();
+        if state == AgentState::Capturing && status.state != AgentState::Capturing {
+            self.capturing_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        status.state = state;
     }
 
     fn frame_captured(&self, paused: bool) {
         let mut status = self.write();
         status.frames_captured = status.frames_captured.saturating_add(1);
-        status.state = if paused {
+        let state = if paused {
             AgentState::Paused
         } else {
             AgentState::Capturing
         };
+        if state == AgentState::Capturing && status.state != AgentState::Capturing {
+            self.capturing_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        status.state = state;
     }
 
     fn artifact_saved(&self, path: &Path) {
@@ -325,11 +342,16 @@ pub fn run_agent_with_monitor(
 ) -> Result<()> {
     monitor.begin_attempt();
     let result = run_agent_inner(sdk, config_path, max_frames, control, monitor);
-    match &result {
+    publish_attempt_result(&result, control, monitor);
+    result
+}
+
+fn publish_attempt_result(result: &Result<()>, control: &AgentControl, monitor: &AgentMonitor) {
+    match result {
+        Ok(()) if control.is_shutdown() => monitor.mark_stopping(),
         Ok(()) => monitor.set_state(AgentState::Idle),
         Err(error) => monitor.fault(error),
     }
-    result
 }
 
 fn run_agent_inner(
@@ -450,6 +472,9 @@ fn capture_loop(
         {
             return Ok(());
         }
+        // Each AgentControl belongs to one camera attempt, so generation zero
+        // preserves requests made during startup/auto-exposure settling.
+        let mut seen_capture_generation = 0;
         monitor.set_state(if control.is_paused() {
             AgentState::Paused
         } else {
@@ -458,7 +483,6 @@ fn capture_loop(
         let interval = Duration::from_millis(config.capture.interval_ms);
         let mut next_capture = Instant::now();
         let mut queued = 0_u64;
-        let mut seen_capture_generation = control.capture_generation();
 
         while !control.is_shutdown() {
             let exposure_us = camera
@@ -479,7 +503,9 @@ fn capture_loop(
             let now = Instant::now();
             let capture_generation = control.capture_generation();
             let capture_requested = capture_generation != seen_capture_generation;
-            seen_capture_generation = capture_generation;
+            if capture_requested {
+                seen_capture_generation = seen_capture_generation.wrapping_add(1);
+            }
             let periodic_capture_due = !control.is_paused() && now >= next_capture;
             if !capture_requested && !periodic_capture_due {
                 continue;
@@ -1000,6 +1026,33 @@ mod tests {
             retry_status.last_artifact.as_deref(),
             Some("captures/test.jpg")
         );
+    }
+
+    #[test]
+    fn monitor_records_every_transition_into_capturing() {
+        let monitor = AgentMonitor::new();
+        assert_eq!(monitor.capturing_generation(), 0);
+
+        monitor.set_state(AgentState::Capturing);
+        assert_eq!(monitor.capturing_generation(), 1);
+        monitor.frame_captured(false);
+        assert_eq!(monitor.capturing_generation(), 1);
+        monitor.frame_captured(true);
+        assert_eq!(monitor.capturing_generation(), 1);
+        monitor.frame_captured(false);
+        assert_eq!(monitor.capturing_generation(), 2);
+    }
+
+    #[test]
+    fn controlled_attempt_completion_remains_stopping() {
+        let monitor = AgentMonitor::new();
+        let control = AgentControl::new();
+        monitor.set_state(AgentState::Capturing);
+        control.shutdown();
+
+        publish_attempt_result(&Ok(()), &control, &monitor);
+
+        assert_eq!(monitor.snapshot().state, AgentState::Stopping);
     }
 
     #[test]
