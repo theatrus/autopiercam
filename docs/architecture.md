@@ -78,12 +78,13 @@ process abruptly.
 
 The C#/XAML WinUI 3 app is deliberately thin. The current application displays
 agent/camera state, frame counters, and the most recent artifact; it can request
-an immediate still and edit max exposure, max gain, still cadence, HTTP upload,
-and video enablement. It preserves all hidden configuration fields when it
-writes a complete replacement. Planned additions include:
+an immediate still, render the latest JPEG preview with exposure/gain metadata,
+and edit max exposure, max gain, still cadence, HTTP upload, and video
+enablement. It preserves all hidden configuration fields when it writes a
+complete replacement. The preview UI reports connecting, waiting, live,
+reconnecting, stale, and malformed-frame conditions. Planned additions include:
 
-- current preview and capture timestamp;
-- connection, exposure, gain, temperature, queue, and disk status;
+- temperature, queue, and disk status;
 - camera and output settings with capability-aware ranges;
 - upload and segmented-video settings;
 - recent artifacts and recoverable errors.
@@ -102,7 +103,10 @@ The camera thread preallocates a small RAW buffer ring and drains video mode
 continuously. Consumers have independent policies:
 
 - Exposure statistics: latest frame wins; work on a sparse raw sample.
-- Preview: capacity one, latest wins, debayer and downscale at 2 to 5 fps.
+- Preview: a capacity-one latest-only queue samples at most every 500 ms,
+  including while scheduled stills are paused; a separate thread debayers,
+  aspect-preserving downscales to a 1280-pixel edge, and encodes JPEG at quality
+  75. Replaced work increments the session's dropped-frame counter.
 - Stills: bounded scheduled queue; a missed deadline is observable.
 - Video: sample at configured output fps before conversion/encoding.
 - Upload: accepts only durable completed files, never a borrowed frame buffer.
@@ -163,10 +167,16 @@ remote clients rejected. Unix builds can use a Unix-domain socket behind the
 same protocol.
 
 Control messages are length-prefixed UTF-8 JSON envelopes containing protocol
-version, request id, method, and payload. Preview data uses a separate
-latest-only stream containing length-prefixed metadata followed by JPEG bytes.
-Separating preview prevents an unresponsive image consumer from delaying
-control responses.
+version, request id, method, and payload. Preview data uses the separate
+outbound-only `autopiercam-preview-v1` pipe with the same current-user DACL,
+remote-client rejection, and first-instance ownership. Each latest-only record
+contains a bounded JSON metadata length and body (4 KiB maximum), followed by a
+bounded JPEG length and body (4 MiB maximum). Dimensions are limited to a
+1280-pixel edge and 1,638,400 pixels. A two-second write timeout evicts a stalled
+consumer without delaying control responses. Camera-attempt generation,
+process-wide sequence, and dropped-frame metadata describe resets, ordering,
+and producer loss; clearing an established session stream causes a bounded
+Viewer reconnect.
 
 Upload bearer material is never written into TOML. Configuration holds a
 credential reference or environment-variable name; packaged Windows builds
@@ -202,6 +212,6 @@ Task with restart-on-failure is appropriate for an unattended pier machine.
 The repository has completed item 1 and the reusable-buffer, bounded-writer,
 auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
 real tray host, secured one-request protocol-v1 control, atomic revisioned
-configuration persistence, and restart application. Item 4 has a live WinUI
-status, capture-now, and configuration client; preview transport and artifact
-browsing remain.
+configuration persistence, and restart application. Item 4 now has a live
+WinUI preview, status, capture-now, and configuration client; artifact browsing
+remains.

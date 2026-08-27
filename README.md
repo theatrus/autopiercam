@@ -20,9 +20,12 @@ The repository now contains a hardware-validated background capture slice:
   backoff;
 - a Windows notification-area host that owns and supervises the camera worker;
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
+- a separate secured, outbound-only preview pipe backed by a bounded latest-frame
+  producer;
 - atomic, content-revisioned configuration replacement through that pipe;
 - a buildable unpackaged WinUI 3 viewer that shows live status, requests an
-  immediate capture, and edits the supported live configuration fields.
+  immediate capture, renders the latest JPEG preview, and edits the supported
+  live configuration fields.
 
 ## Quick start
 
@@ -54,7 +57,7 @@ camera driver is installed separately.
 
 - crates/autopiercam-asi: dynamically loaded ASICamera2 wrapper.
 - crates/autopiercam-core: portable configuration and image processing.
-- crates/autopiercam-protocol: protocol-v1 envelopes, status types, and framing.
+- crates/autopiercam-protocol: control envelopes plus bounded preview-v1 framing.
 - crates/autopiercam: reusable capture engine plus diagnostic CLI.
 - crates/autopiercam-tray: Windows notification-area host and named-pipe server.
 - apps/AutoPierCam.Viewer: unpackaged WinUI 3 status/settings application.
@@ -83,11 +86,15 @@ camera restart, and refreshed back to the capturing state.
 - Frame reads always use checked buffer sizes and finite timeouts.
 - Slow writers, preview clients, encoders, and uploads may drop or queue their
   own work, but must never block the SDK drain loop.
+- Preview candidates are sampled at most every 500 milliseconds even while
+  scheduled still capture is paused. A one-slot latest-only queue feeds an
+  off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.
 - Auto-exposure limits use microseconds in AutoPierCam configuration. SDK 1.41
   documentation calls control 11 microseconds, while the ASI676MC exposes
   AutoExpMaxExpMS. The implementation detects the runtime control name and
   converts accordingly.
-- The Viewer preview and camera selector remain placeholders. Max exposure,
+- The Viewer renders the live preview and marks it stale after five seconds
+  without a new frame. Its camera selector remains read-only. Max exposure,
   max gain, still interval, upload endpoint/enable, and video enable are backed
   by versioned configuration replacement. HTTP upload and security video can
   be configured but remain designed seams rather than active sinks.

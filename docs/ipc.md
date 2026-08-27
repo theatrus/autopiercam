@@ -86,15 +86,66 @@ the worker has already stopped, the response is the structured
 `config_saved_agent_stopped` error with the persisted revision; clients must
 refresh before another edit.
 
-## Planned preview method
+## Preview stream v1
 
-The separate preview pipe will emit:
+Preview uses the separate outbound-only endpoint
+`\\.\pipe\autopiercam-preview-v1`; it is not a control method. The tray applies
+the same protected current-logon-SID DACL and remote-client rejection as the
+control pipe, requests the first pipe instance, and never accepts bytes from a
+preview client. Keeping preview separate means a stalled image consumer cannot
+delay status, configuration, or shutdown commands.
 
-    4-byte metadata length
-    metadata JSON
-    4-byte JPEG length
+Each record is:
+
+    uint32 little-endian metadata length (1..4096)
+    UTF-8 metadata JSON
+    uint32 little-endian JPEG length (1..4194304)
     JPEG bytes
 
-Preview metadata includes sequence, capture time, dimensions, exposure, gain,
-night/day mode, and dropped-frame counters. Consumers may reconnect at any time;
-the next available preview is always the newest one.
+Readers reject zero or oversized lengths before allocating payload storage.
+Metadata is strict: unknown or missing fields, unsupported enum values, and
+invalid dimensions are rejected. JPEG data must carry the JPEG start and end
+markers. The complete metadata object is:
+
+    {
+      "version": 1,
+      "session_generation": 4,
+      "sequence": 128,
+      "captured_at_unix_ms": 1725000000123,
+      "width": 1280,
+      "height": 960,
+      "exposure_us": 12500,
+      "gain": 120,
+      "content_type": "image/jpeg",
+      "mode": "unknown",
+      "dropped_frames": 3
+    }
+
+`exposure_us` and `gain` are required but may be null when reliable telemetry
+is unavailable. `mode` is `unknown`, `day`, or `night`; the current SDK-auto
+controller reports `unknown`. Width and height must each be at most 1280 and
+their product must not exceed 1,638,400 pixels.
+
+The producer samples no more often than every 500 milliseconds, including while
+scheduled still capture is paused. A one-slot queue replaces pending work with
+the newest RAW8 frame and counts discarded candidates. A dedicated thread
+debayers and aspect-preserving downscales the image to a 1280-pixel edge, then
+encodes JPEG at quality 75. Session generation changes for each camera attempt,
+sequence increases across the tray process, and `dropped_frames` is cumulative
+for the active preview session. Ending or restarting a camera session clears
+the published frame and prevents an old session from publishing later.
+
+A newly connected client receives the newest published frame, then only newer
+frames. The server keeps a replacement listener present while one client is
+streaming and allows two seconds for an entire frame write; a slow or broken
+consumer is disconnected without stopping the listener. Clearing a session
+closes an established active stream. The Viewer reconnects with bounded 250 ms, 500 ms,
+1 s, 2 s, then 5 s delays, uses a two-second connection timeout, and requires a
+record to finish within five seconds after its first byte arrives. Waiting for
+the next record's first byte is intentionally unbounded.
+
+The Viewer exposes connecting, waiting, live, and reconnecting stream states,
+clears an image when the connection epoch changes, and verifies metadata,
+monotonic sequence/session values, JPEG markers, and decoded dimensions. A live
+image is marked stale after five seconds without a newer frame; malformed or
+undecodable data is shown as a frame error.
