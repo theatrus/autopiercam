@@ -65,7 +65,10 @@ impl Config {
             .map(validate_upload_endpoint)
             .transpose()?;
         if let Some(variable) = self.upload.bearer_token_env.as_deref() {
-            if variable.is_empty() || variable.trim() != variable || variable.contains(['=', '\0'])
+            if variable.is_empty()
+                || variable.trim() != variable
+                || variable.contains(['=', '\0'])
+                || variable.chars().any(char::is_control)
             {
                 return Err(ConfigError::Validation(
                     "upload.bearer_token_env must be a valid nonblank environment-variable name",
@@ -281,6 +284,9 @@ mod tests {
         config.upload.queue_capacity = 1;
         config.upload.endpoint = Some("https://example.test/camera/latest".to_owned());
         config.upload.bearer_token_env = Some(" AUTOPIERCAM_TOKEN".to_owned());
+        assert!(config.validate().is_err());
+
+        config.upload.bearer_token_env = Some("AUTOPIERCAM\nTOKEN".to_owned());
         assert!(config.validate().is_err());
 
         config.upload.bearer_token_env = Some("AUTOPIERCAM_TOKEN".to_owned());

@@ -4,7 +4,7 @@ use autopiercam_asi::{
     ImageType, Roi, Sdk,
 };
 use autopiercam_core::{
-    config::{CameraConfig, Config},
+    config::{CameraConfig, Config, UploadConfig},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
 use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera};
@@ -26,9 +26,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 mod preview;
+mod upload;
 
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
+use upload::{UploadEnqueueResult, UploadOptions, UploadSink, UploadWorker, bearer_authorization};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -445,11 +447,15 @@ fn run_agent_inner(
     std::fs::create_dir_all(&capture_directory)
         .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
 
+    let (upload_worker, upload_sink) = match start_upload_worker(&config.upload)? {
+        Some((worker, sink)) => (Some(worker), Some(sink)),
+        None => (None, None),
+    };
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
-        .spawn(move || writer_loop(writer_rx, &writer_monitor))
+        .spawn(move || writer_loop(writer_rx, &writer_monitor, upload_sink.as_ref()))
         .context("starting still writer")?;
     let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
@@ -479,11 +485,15 @@ fn run_agent_inner(
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("still-writer thread panicked"));
+    let upload_result = upload_worker
+        .map(UploadWorker::stop_and_join)
+        .unwrap_or(Ok(()));
     let preview_result = preview_encoder
         .map(PreviewEncoder::stop_and_join)
         .unwrap_or(Ok(()));
     capture_result?;
     writer_result??;
+    upload_result.context("stopping HTTP upload worker")?;
     preview_result?;
     info!("continuous capture worker stopped cleanly");
     Ok(())
@@ -732,13 +742,82 @@ fn wait_for_auto_settle(
     }
 }
 
-fn writer_loop(receiver: Receiver<CaptureJob>, monitor: &AgentMonitor) -> Result<()> {
+fn start_upload_worker(config: &UploadConfig) -> Result<Option<(UploadWorker, UploadSink)>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .context("upload endpoint is missing despite validated configuration")?;
+    let endpoint = endpoint
+        .parse::<ureq::http::Uri>()
+        .context("parsing validated upload endpoint")?;
+    let authorization = config
+        .bearer_token_env
+        .as_deref()
+        .map(load_bearer_authorization)
+        .transpose()?;
+    UploadWorker::start(UploadOptions::new(
+        endpoint,
+        authorization,
+        config.queue_capacity,
+    ))
+    .map(Some)
+    .context("starting HTTP upload worker")
+}
+
+fn load_bearer_authorization(variable: &str) -> Result<ureq::http::HeaderValue> {
+    let token = match std::env::var(variable) {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => {
+            bail!("upload bearer-token environment variable {variable} is not set")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("upload bearer-token environment variable {variable} is not valid Unicode")
+        }
+    };
+    if token.is_empty() || token.trim() != token {
+        bail!(
+            "upload bearer-token environment variable {variable} is empty or has surrounding whitespace"
+        );
+    }
+    bearer_authorization(&token).map_err(|_| {
+        anyhow!(
+            "upload bearer-token environment variable {variable} cannot be represented safely in an HTTP header"
+        )
+    })
+}
+
+fn writer_loop(
+    receiver: Receiver<CaptureJob>,
+    monitor: &AgentMonitor,
+    upload: Option<&UploadSink>,
+) -> Result<()> {
     for job in receiver {
         let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
             .with_context(|| format!("debayering frame {}", job.sequence))?;
         let stats = luma_stats(&rgb, 64)?;
         save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
         monitor.artifact_saved(&job.output);
+        if let Some(upload) = upload {
+            match upload.try_enqueue(job.output.clone()) {
+                UploadEnqueueResult::Queued => {}
+                UploadEnqueueResult::QueueFull => warn!(
+                    path = %job.output.display(),
+                    "upload queue is full; finalized artifact remains on disk"
+                ),
+                UploadEnqueueResult::WorkerStopped => warn!(
+                    path = %job.output.display(),
+                    "upload worker stopped; finalized artifact remains on disk"
+                ),
+                UploadEnqueueResult::InvalidArtifactPath => warn!(
+                    path = %job.output.display(),
+                    "finalized artifact has no safe upload file name"
+                ),
+            }
+        }
         info!(
             sequence = job.sequence,
             path = %job.output.display(),
