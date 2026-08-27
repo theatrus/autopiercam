@@ -179,29 +179,66 @@
                         </Grid.ColumnDefinitions>
                         <StackPanel Spacing="6">
                             <TextBlock Text="Max exposure" />
-                            <NumberBox Header="Milliseconds" Maximum="60000" Minimum="1" SpinButtonPlacementMode="Compact" Value="5000" />
+                            <NumberBox
+                                x:Name="MaxExposureNumberBox"
+                                Header="Milliseconds"
+                                IsEnabled="False"
+                                Maximum="60000"
+                                Minimum="0.001"
+                                SpinButtonPlacementMode="Compact"
+                                Value="5000" />
                         </StackPanel>
                         <StackPanel Grid.Column="1" Spacing="6">
                             <TextBlock Text="Max gain" />
-                            <NumberBox Maximum="600" Minimum="0" SpinButtonPlacementMode="Compact" Value="300" />
+                            <NumberBox
+                                x:Name="MaxGainNumberBox"
+                                IsEnabled="False"
+                                Maximum="600"
+                                Minimum="0"
+                                SpinButtonPlacementMode="Compact"
+                                Value="300" />
                         </StackPanel>
                     </Grid>
                     <StackPanel Spacing="6">
                         <TextBlock Text="Still interval" />
-                        <NumberBox Header="Seconds" Maximum="86400" Minimum="1" SpinButtonPlacementMode="Compact" Value="10" />
+                        <NumberBox
+                            x:Name="StillIntervalNumberBox"
+                            Header="Seconds"
+                            IsEnabled="False"
+                            Maximum="86400"
+                            Minimum="0.001"
+                            SpinButtonPlacementMode="Compact"
+                            Value="10" />
                     </StackPanel>
-                    <ToggleSwitch Header="HTTP upload" OffContent="Disabled" OnContent="Enabled" />
-                    <TextBox Header="Upload endpoint" PlaceholderText="https://example.test/camera/latest" />
-                    <ToggleSwitch Header="Security video" OffContent="Disabled" OnContent="Enabled" />
+                    <ToggleSwitch
+                        x:Name="UploadEnabledToggle"
+                        Header="HTTP upload"
+                        IsEnabled="False"
+                        OffContent="Disabled"
+                        OnContent="Enabled" />
+                    <TextBox
+                        x:Name="UploadEndpointTextBox"
+                        Header="Upload endpoint"
+                        IsEnabled="False"
+                        PlaceholderText="https://example.test/camera/latest" />
+                    <ToggleSwitch
+                        x:Name="VideoEnabledToggle"
+                        Header="Security video"
+                        IsEnabled="False"
+                        OffContent="Disabled"
+                        OnContent="Enabled" />
                     <InfoBar
+                        x:Name="ConfigInfoBar"
                         IsClosable="False"
                         IsOpen="True"
-                        Message="Settings remain read-only. Refresh and Capture now use the local protocol v1 agent."
+                        Message="Connect to the local agent to load versioned settings."
                         Severity="Informational" />
                     <Button
+                        x:Name="SaveButton"
                         HorizontalAlignment="Stretch"
                         Click="SaveButton_Click"
                         Content="Save settings"
+                        IsEnabled="False"
                         Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>
             </ScrollViewer>

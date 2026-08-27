@@ -48,25 +48,18 @@ internal sealed class AgentPipeClient : IAsyncDisposable
     internal async Task<AgentStatus> GetStatusAsync(CancellationToken cancellationToken = default)
     {
         JsonElement result = await RequestAsync("status.get", cancellationToken).ConfigureAwait(false);
-        try
+        AgentStatus status = DeserializeResult<AgentStatus>(result, "status.get");
+        if (string.IsNullOrWhiteSpace(status.State))
         {
-            AgentStatus? status = result.Deserialize<AgentStatus>(JsonOptions);
-            if (status is null || string.IsNullOrWhiteSpace(status.State))
-            {
-                throw new AgentProtocolException("status.get returned no state.");
-            }
-
-            if (status.Camera is not null && string.IsNullOrWhiteSpace(status.Camera.Name))
-            {
-                throw new AgentProtocolException("status.get returned a camera without a name.");
-            }
-
-            return status;
+            throw new AgentProtocolException("status.get returned no state.");
         }
-        catch (JsonException exception)
+
+        if (status.Camera is not null && string.IsNullOrWhiteSpace(status.Camera.Name))
         {
-            throw new AgentProtocolException("status.get returned an invalid result object.", exception);
+            throw new AgentProtocolException("status.get returned a camera without a name.");
         }
+
+        return status;
     }
 
     internal async Task CaptureNowAsync(CancellationToken cancellationToken = default)
@@ -74,18 +67,60 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         _ = await RequestAsync("capture.now", cancellationToken).ConfigureAwait(false);
     }
 
+    internal async Task<AgentConfigurationSnapshot> GetConfigurationAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement result = await RequestAsync("config.get", cancellationToken).ConfigureAwait(false);
+        AgentConfigurationSnapshot snapshot =
+            DeserializeResult<AgentConfigurationSnapshot>(result, "config.get");
+        snapshot.Config.Validate("config.get");
+        return snapshot;
+    }
+
+    internal async Task<AgentConfigurationReplaceResult> ReplaceConfigurationAsync(
+        ulong expectedRevision,
+        AgentConfiguration configuration,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        configuration.Validate("config.replace");
+        JsonElement result = await RequestAsync(
+                "config.replace",
+                new AgentConfigurationReplacePayload(expectedRevision, configuration),
+                cancellationToken)
+            .ConfigureAwait(false);
+        AgentConfigurationReplaceResult replaceResult =
+            DeserializeResult<AgentConfigurationReplaceResult>(result, "config.replace");
+        if (!replaceResult.Saved || !replaceResult.RestartScheduled)
+        {
+            throw new AgentProtocolException(
+                "config.replace returned success without confirming both the save and scheduled restart.");
+        }
+
+        return replaceResult;
+    }
+
     internal async Task<JsonElement> RequestAsync(
         string method,
         CancellationToken cancellationToken = default)
     {
+        return await RequestAsync(method, new EmptyPayload(), cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<JsonElement> RequestAsync(
+        string method,
+        object payload,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(method);
+        ArgumentNullException.ThrowIfNull(payload);
         ThrowIfDisposed();
 
         await _requestGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
-            return await RequestCoreAsync(method, cancellationToken).ConfigureAwait(false);
+            return await RequestCoreAsync(method, payload, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -95,11 +130,12 @@ internal sealed class AgentPipeClient : IAsyncDisposable
 
     private async Task<JsonElement> RequestCoreAsync(
         string method,
+        object payload,
         CancellationToken cancellationToken)
     {
         string requestId = Guid.NewGuid().ToString("N");
         byte[] requestBody = JsonSerializer.SerializeToUtf8Bytes(
-            new AgentRequest(ProtocolVersion, requestId, method, new EmptyPayload()),
+            new AgentRequest(ProtocolVersion, requestId, method, payload),
             JsonOptions);
         if (requestBody.Length > MaxMessageBytes)
         {
@@ -269,6 +305,22 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         }
     }
 
+    private static T DeserializeResult<T>(JsonElement result, string method)
+    {
+        try
+        {
+            T? value = result.Deserialize<T>(JsonOptions);
+            return value ?? throw new AgentProtocolException(
+                $"{method} returned a null result instead of {typeof(T).Name}.");
+        }
+        catch (JsonException exception)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned an invalid {typeof(T).Name} result object.",
+                exception);
+        }
+    }
+
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -293,7 +345,211 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         [property: JsonPropertyName("version")] int Version,
         [property: JsonPropertyName("request_id")] string RequestId,
         [property: JsonPropertyName("method")] string Method,
-        [property: JsonPropertyName("payload")] EmptyPayload Payload);
+        [property: JsonPropertyName("payload")] object Payload);
+}
+
+internal sealed record AgentConfigurationSnapshot
+{
+    [JsonPropertyName("revision")]
+    [JsonRequired]
+    public ulong Revision { get; init; }
+
+    [JsonPropertyName("config")]
+    [JsonRequired]
+    public AgentConfiguration Config { get; init; } = null!;
+}
+
+internal sealed record AgentConfigurationReplacePayload(
+    [property: JsonPropertyName("expected_revision")] ulong ExpectedRevision,
+    [property: JsonPropertyName("config")] AgentConfiguration Config);
+
+internal sealed record AgentConfigurationReplaceResult
+{
+    [JsonPropertyName("revision")]
+    [JsonRequired]
+    public ulong Revision { get; init; }
+
+    [JsonPropertyName("saved")]
+    [JsonRequired]
+    public bool Saved { get; init; }
+
+    [JsonPropertyName("restart_scheduled")]
+    [JsonRequired]
+    public bool RestartScheduled { get; init; }
+}
+
+internal sealed record AgentConfiguration
+{
+    [JsonPropertyName("camera")]
+    [JsonRequired]
+    public AgentCameraConfiguration Camera { get; init; } = null!;
+
+    [JsonPropertyName("capture")]
+    [JsonRequired]
+    public AgentCaptureConfiguration Capture { get; init; } = null!;
+
+    [JsonPropertyName("upload")]
+    [JsonRequired]
+    public AgentUploadConfiguration Upload { get; init; } = null!;
+
+    [JsonPropertyName("video")]
+    [JsonRequired]
+    public AgentVideoConfiguration Video { get; init; } = null!;
+
+    [JsonPropertyName("api")]
+    [JsonRequired]
+    public AgentApiConfiguration Api { get; init; } = null!;
+
+    internal void Validate(string method)
+    {
+        if (Camera is null || Capture is null || Upload is null || Video is null || Api is null)
+        {
+            throw new AgentProtocolException($"{method} did not contain every configuration section.");
+        }
+
+        if (string.IsNullOrWhiteSpace(Capture.Directory))
+        {
+            throw new AgentProtocolException($"{method} returned an empty capture directory.");
+        }
+
+        if (string.IsNullOrWhiteSpace(Api.Listen))
+        {
+            throw new AgentProtocolException($"{method} returned an empty API listen address.");
+        }
+
+        if (Camera.MaxExposureUs < Camera.MinExposureUs)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned max_exposure_us below min_exposure_us.");
+        }
+
+        if (Camera.MinExposureUs < 0 ||
+            Camera.MaxExposureUs <= 0 ||
+            Camera.MaxGain < 0)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned negative camera limits or a non-positive maximum exposure.");
+        }
+
+        if (Capture.IntervalMs == 0 ||
+            Capture.JpegQuality is < 1 or > 100 ||
+            Capture.WriterQueueCapacity == 0)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned invalid capture timing, JPEG quality, or writer capacity.");
+        }
+
+        if (Upload.Enabled && string.IsNullOrWhiteSpace(Upload.Endpoint))
+        {
+            throw new AgentProtocolException(
+                $"{method} enabled upload without an endpoint.");
+        }
+    }
+}
+
+internal sealed record AgentCameraConfiguration
+{
+    [JsonPropertyName("camera_id")]
+    public int? CameraId { get; init; }
+
+    [JsonPropertyName("name_contains")]
+    public string? NameContains { get; init; }
+
+    [JsonPropertyName("width")]
+    public uint? Width { get; init; }
+
+    [JsonPropertyName("height")]
+    public uint? Height { get; init; }
+
+    [JsonPropertyName("bin")]
+    [JsonRequired]
+    public int Bin { get; init; }
+
+    [JsonPropertyName("min_exposure_us")]
+    [JsonRequired]
+    public long MinExposureUs { get; init; }
+
+    [JsonPropertyName("max_exposure_us")]
+    [JsonRequired]
+    public long MaxExposureUs { get; init; }
+
+    [JsonPropertyName("max_gain")]
+    [JsonRequired]
+    public long MaxGain { get; init; }
+
+    [JsonPropertyName("target_brightness")]
+    [JsonRequired]
+    public long TargetBrightness { get; init; }
+
+    [JsonPropertyName("settle_frames")]
+    [JsonRequired]
+    public uint SettleFrames { get; init; }
+}
+
+internal sealed record AgentCaptureConfiguration
+{
+    [JsonPropertyName("directory")]
+    [JsonRequired]
+    public string Directory { get; init; } = string.Empty;
+
+    [JsonPropertyName("interval_ms")]
+    [JsonRequired]
+    public ulong IntervalMs { get; init; }
+
+    [JsonPropertyName("jpeg_quality")]
+    [JsonRequired]
+    public byte JpegQuality { get; init; }
+
+    [JsonPropertyName("writer_queue_capacity")]
+    [JsonRequired]
+    public ulong WriterQueueCapacity { get; init; }
+
+    [JsonPropertyName("keep_latest")]
+    [JsonRequired]
+    public bool KeepLatest { get; init; }
+
+    [JsonPropertyName("retention_days")]
+    [JsonRequired]
+    public uint RetentionDays { get; init; }
+}
+
+internal sealed record AgentUploadConfiguration
+{
+    [JsonPropertyName("enabled")]
+    [JsonRequired]
+    public bool Enabled { get; init; }
+
+    [JsonPropertyName("endpoint")]
+    public string? Endpoint { get; init; }
+
+    [JsonPropertyName("bearer_token_env")]
+    public string? BearerTokenEnvironment { get; init; }
+
+    [JsonPropertyName("queue_capacity")]
+    [JsonRequired]
+    public ulong QueueCapacity { get; init; }
+}
+
+internal sealed record AgentVideoConfiguration
+{
+    [JsonPropertyName("enabled")]
+    [JsonRequired]
+    public bool Enabled { get; init; }
+
+    [JsonPropertyName("segment_seconds")]
+    [JsonRequired]
+    public uint SegmentSeconds { get; init; }
+
+    [JsonPropertyName("frames_per_second")]
+    [JsonRequired]
+    public uint FramesPerSecond { get; init; }
+}
+
+internal sealed record AgentApiConfiguration
+{
+    [JsonPropertyName("listen")]
+    [JsonRequired]
+    public string Listen { get; init; } = string.Empty;
 }
 
 internal sealed record AgentStatus
@@ -380,16 +636,39 @@ internal sealed class AgentProtocolException : AgentClientException
 
 internal sealed class AgentRequestException : AgentClientException
 {
-    private AgentRequestException(string message)
+    private AgentRequestException(
+        string code,
+        string message,
+        JsonElement? details,
+        ulong? currentRevision)
         : base(message)
     {
+        Code = code;
+        Details = details;
+        CurrentRevision = currentRevision;
     }
+
+    internal string Code { get; }
+
+    internal JsonElement? Details { get; }
+
+    internal ulong? CurrentRevision { get; }
+
+    internal bool IsRevisionConflict =>
+        string.Equals(Code, "revision_conflict", StringComparison.Ordinal);
+
+    internal bool IsSavedWithoutRestart =>
+        string.Equals(Code, "config_saved_agent_stopped", StringComparison.Ordinal);
 
     internal static AgentRequestException FromJson(JsonElement error)
     {
         if (error.ValueKind is JsonValueKind.String)
         {
-            return new AgentRequestException(error.GetString() ?? "The capture agent rejected the request.");
+            return new AgentRequestException(
+                "agent_error",
+                error.GetString() ?? "The capture agent rejected the request.",
+                null,
+                null);
         }
 
         if (error.ValueKind is JsonValueKind.Object)
@@ -402,21 +681,20 @@ internal sealed class AgentRequestException : AgentClientException
                               messageValue.ValueKind is JsonValueKind.String
                 ? messageValue.GetString()
                 : null;
+            JsonElement? details = error.TryGetProperty("details", out JsonElement detailsValue) &&
+                                   detailsValue.ValueKind is not JsonValueKind.Null
+                ? detailsValue.Clone()
+                : null;
+            ulong? currentRevision = TryReadCurrentRevision(details) ??
+                                     TryReadCurrentRevision(error);
 
-            if (!string.IsNullOrWhiteSpace(code) && !string.IsNullOrWhiteSpace(message))
-            {
-                return new AgentRequestException($"{code}: {message}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(message))
-            {
-                return new AgentRequestException(message);
-            }
-
-            if (!string.IsNullOrWhiteSpace(code))
-            {
-                return new AgentRequestException(code);
-            }
+            return new AgentRequestException(
+                string.IsNullOrWhiteSpace(code) ? "agent_error" : code,
+                string.IsNullOrWhiteSpace(message)
+                    ? "The capture agent rejected the request."
+                    : message,
+                details,
+                currentRevision);
         }
 
         string rawError = error.GetRawText();
@@ -425,6 +703,23 @@ internal sealed class AgentRequestException : AgentClientException
             rawError = rawError[..500] + "…";
         }
 
-        return new AgentRequestException($"The capture agent rejected the request: {rawError}");
+        return new AgentRequestException(
+            "agent_error",
+            $"The capture agent rejected the request: {rawError}",
+            null,
+            null);
+    }
+
+    private static ulong? TryReadCurrentRevision(JsonElement? value)
+    {
+        if (value is not { ValueKind: JsonValueKind.Object } objectValue ||
+            !objectValue.TryGetProperty("current_revision", out JsonElement revision) ||
+            revision.ValueKind is not JsonValueKind.Number ||
+            !revision.TryGetUInt64(out ulong currentRevision))
+        {
+            return null;
+        }
+
+        return currentRevision;
     }
 }
