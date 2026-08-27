@@ -4,6 +4,7 @@ members = [
     "crates/autopiercam-asi",
     "crates/autopiercam-core",
     "crates/autopiercam-protocol",
+    "crates/autopiercam-tray",
 ]
 resolver = "3"
 

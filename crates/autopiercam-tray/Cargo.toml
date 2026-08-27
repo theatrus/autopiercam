@@ -1,0 +1,13 @@
+[package]
+name = "autopiercam-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Windows notification-area host for AutoPierCam"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tao = { version = "=0.34.4", default-features = false }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tray-icon = { version = "=0.24.2", default-features = false }
