@@ -27,7 +27,6 @@ const PREVIEW_PIPE_PATH: &str = r"\\.\pipe\autopiercam-preview-v1";
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_BUFFER_SIZE: u32 = 256 * 1024;
-const PIPE_INSTANCES: usize = 2;
 
 pub(crate) struct PreviewServer {
     stop: Arc<AtomicBool>,
@@ -230,7 +229,10 @@ fn create_preview_pipe(first_instance: bool) -> io::Result<NamedPipeServer> {
         PipeAccess::Outbound,
         0,
         PIPE_BUFFER_SIZE,
-        Some(PIPE_INSTANCES),
+        // The server still creates only one active plus one waiting instance.
+        // Leaving Windows' global ceiling unlimited avoids ERROR_PIPE_BUSY
+        // while a cancelled overlapped write is finishing handle teardown.
+        None,
     )
 }
 
