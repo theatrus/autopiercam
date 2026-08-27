@@ -14,6 +14,12 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const PIPE_NAME: &str = "autopiercam-control-v1";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const PREVIEW_PROTOCOL_VERSION: u16 = 1;
+pub const PREVIEW_PIPE_NAME: &str = "autopiercam-preview-v1";
+pub const MAX_PREVIEW_METADATA_SIZE: usize = 4 * 1024;
+pub const MAX_PREVIEW_JPEG_SIZE: usize = 4 * 1024 * 1024;
+pub const PREVIEW_MAX_DIMENSION: u32 = 1_280;
+pub const PREVIEW_MAX_PIXELS: u64 = 1_638_400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Method {
@@ -283,6 +289,172 @@ pub struct RevisionConflictDetails {
     pub current_revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PreviewContentType {
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewMode {
+    Unknown,
+    Day,
+    Night,
+}
+
+/// Metadata attached to one encoded preview image.
+///
+/// Exposure and gain are required wire fields whose values may be null when
+/// the camera did not provide reliable telemetry for that frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PreviewMetadata {
+    pub version: u16,
+    pub session_generation: u64,
+    pub sequence: u64,
+    pub captured_at_unix_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub exposure_us: Option<i64>,
+    pub gain: Option<i64>,
+    pub content_type: PreviewContentType,
+    pub mode: PreviewMode,
+    pub dropped_frames: u64,
+}
+
+impl PreviewMetadata {
+    pub fn validate(&self) -> Result<(), PreviewValidationError> {
+        if self.version != PREVIEW_PROTOCOL_VERSION {
+            return Err(PreviewValidationError::UnsupportedVersion {
+                found: self.version,
+                expected: PREVIEW_PROTOCOL_VERSION,
+            });
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(PreviewValidationError::ZeroDimensions);
+        }
+        if self.width > PREVIEW_MAX_DIMENSION || self.height > PREVIEW_MAX_DIMENSION {
+            return Err(PreviewValidationError::DimensionsTooLarge {
+                width: self.width,
+                height: self.height,
+                max: PREVIEW_MAX_DIMENSION,
+            });
+        }
+        let pixels = u64::from(self.width) * u64::from(self.height);
+        if pixels > PREVIEW_MAX_PIXELS {
+            return Err(PreviewValidationError::PixelCountTooLarge {
+                pixels,
+                max: PREVIEW_MAX_PIXELS,
+            });
+        }
+        if self.exposure_us.is_some_and(|exposure| exposure <= 0) {
+            return Err(PreviewValidationError::InvalidExposure);
+        }
+        if self.gain.is_some_and(|gain| gain < 0) {
+            return Err(PreviewValidationError::InvalidGain);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PreviewMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PreviewMetadataWire::deserialize(deserializer)?;
+        let exposure_us = match wire.exposure_us {
+            Present::Value(value) => value,
+            Present::Missing => return Err(serde::de::Error::missing_field("exposure_us")),
+        };
+        let gain = match wire.gain {
+            Present::Value(value) => value,
+            Present::Missing => return Err(serde::de::Error::missing_field("gain")),
+        };
+        Ok(Self {
+            version: wire.version,
+            session_generation: wire.session_generation,
+            sequence: wire.sequence,
+            captured_at_unix_ms: wire.captured_at_unix_ms,
+            width: wire.width,
+            height: wire.height,
+            exposure_us,
+            gain,
+            content_type: wire.content_type,
+            mode: wire.mode,
+            dropped_frames: wire.dropped_frames,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewMetadataWire {
+    version: u16,
+    session_generation: u64,
+    sequence: u64,
+    captured_at_unix_ms: u64,
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    exposure_us: Present<Option<i64>>,
+    #[serde(default)]
+    gain: Present<Option<i64>>,
+    content_type: PreviewContentType,
+    mode: PreviewMode,
+    dropped_frames: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewFrame {
+    pub metadata: PreviewMetadata,
+    pub jpeg: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum PreviewValidationError {
+    #[error("unsupported preview protocol version {found}; expected {expected}")]
+    UnsupportedVersion { found: u16, expected: u16 },
+    #[error("preview dimensions must both be greater than zero")]
+    ZeroDimensions,
+    #[error("preview dimensions {width}x{height} exceed the {max}-pixel edge limit")]
+    DimensionsTooLarge { width: u32, height: u32, max: u32 },
+    #[error("preview contains {pixels} pixels; maximum is {max}")]
+    PixelCountTooLarge { pixels: u64, max: u64 },
+    #[error("preview exposure must be positive when present")]
+    InvalidExposure,
+    #[error("preview gain must not be negative when present")]
+    InvalidGain,
+}
+
+#[derive(Debug, Error)]
+pub enum PreviewFrameError {
+    #[error("I/O error while transferring a preview frame: {0}")]
+    Io(#[source] io::Error),
+    #[error("preview metadata length prefix ended after {received} of 4 bytes")]
+    TruncatedMetadataLength { received: usize },
+    #[error("preview JPEG length prefix ended after {received} of 4 bytes")]
+    TruncatedJpegLength { received: usize },
+    #[error("preview metadata length must not be zero")]
+    ZeroMetadataLength,
+    #[error("preview JPEG length must not be zero")]
+    ZeroJpegLength,
+    #[error("preview metadata size {size} exceeds the {max} byte limit")]
+    MetadataTooLarge { size: usize, max: usize },
+    #[error("preview JPEG size {size} exceeds the {max} byte limit")]
+    JpegTooLarge { size: usize, max: usize },
+    #[error("preview metadata ended after {received} of {expected} bytes")]
+    TruncatedMetadata { expected: usize, received: usize },
+    #[error("preview JPEG ended after {received} of {expected} bytes")]
+    TruncatedJpeg { expected: usize, received: usize },
+    #[error("preview metadata is not valid UTF-8 JSON: {0}")]
+    MetadataJson(#[source] serde_json::Error),
+    #[error("invalid preview metadata: {0}")]
+    MetadataValidation(#[from] PreviewValidationError),
+    #[error("preview payload does not have JPEG start and end markers")]
+    InvalidJpegMarkers,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ValidationError {
     #[error("unsupported protocol version {found}; expected {expected}")]
@@ -376,6 +548,158 @@ pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> Result<(
 
 pub fn read_response<R: Read>(reader: &mut R) -> Result<Option<Response>, FrameError> {
     read_frame(reader)
+}
+
+/// Writes one preview frame as metadata length, metadata JSON, JPEG length,
+/// and JPEG bytes. Both lengths are unsigned little-endian 32-bit integers.
+pub fn write_preview_frame<W: Write>(
+    writer: &mut W,
+    metadata: &PreviewMetadata,
+    jpeg: &[u8],
+) -> Result<(), PreviewFrameError> {
+    metadata.validate()?;
+    let encoded_metadata = serde_json::to_vec(metadata).map_err(PreviewFrameError::MetadataJson)?;
+    if encoded_metadata.is_empty() {
+        return Err(PreviewFrameError::ZeroMetadataLength);
+    }
+    if encoded_metadata.len() > MAX_PREVIEW_METADATA_SIZE {
+        return Err(PreviewFrameError::MetadataTooLarge {
+            size: encoded_metadata.len(),
+            max: MAX_PREVIEW_METADATA_SIZE,
+        });
+    }
+    validate_preview_jpeg(jpeg)?;
+
+    let metadata_length =
+        u32::try_from(encoded_metadata.len()).expect("the preview metadata limit fits in u32");
+    let jpeg_length = u32::try_from(jpeg.len()).expect("the preview JPEG limit fits in u32");
+    writer
+        .write_all(&metadata_length.to_le_bytes())
+        .map_err(PreviewFrameError::Io)?;
+    writer
+        .write_all(&encoded_metadata)
+        .map_err(PreviewFrameError::Io)?;
+    writer
+        .write_all(&jpeg_length.to_le_bytes())
+        .map_err(PreviewFrameError::Io)?;
+    writer.write_all(jpeg).map_err(PreviewFrameError::Io)
+}
+
+/// Reads one preview frame. `Ok(None)` means EOF before any metadata-prefix
+/// byte; EOF anywhere else is a truncation error.
+pub fn read_preview_frame<R: Read>(
+    reader: &mut R,
+) -> Result<Option<PreviewFrame>, PreviewFrameError> {
+    let Some(metadata_prefix) = read_preview_length_prefix(reader, PreviewPart::Metadata)? else {
+        return Ok(None);
+    };
+    let metadata_length = u32::from_le_bytes(metadata_prefix) as usize;
+    if metadata_length == 0 {
+        return Err(PreviewFrameError::ZeroMetadataLength);
+    }
+    if metadata_length > MAX_PREVIEW_METADATA_SIZE {
+        return Err(PreviewFrameError::MetadataTooLarge {
+            size: metadata_length,
+            max: MAX_PREVIEW_METADATA_SIZE,
+        });
+    }
+    let mut encoded_metadata = vec![0_u8; metadata_length];
+    read_preview_payload(reader, &mut encoded_metadata, PreviewPart::Metadata)?;
+    let metadata = serde_json::from_slice::<PreviewMetadata>(&encoded_metadata)
+        .map_err(PreviewFrameError::MetadataJson)?;
+    metadata.validate()?;
+
+    let jpeg_prefix = read_preview_length_prefix(reader, PreviewPart::Jpeg)?
+        .expect("JPEG length EOF is always reported as truncation");
+    let jpeg_length = u32::from_le_bytes(jpeg_prefix) as usize;
+    if jpeg_length == 0 {
+        return Err(PreviewFrameError::ZeroJpegLength);
+    }
+    if jpeg_length > MAX_PREVIEW_JPEG_SIZE {
+        return Err(PreviewFrameError::JpegTooLarge {
+            size: jpeg_length,
+            max: MAX_PREVIEW_JPEG_SIZE,
+        });
+    }
+    let mut jpeg = vec![0_u8; jpeg_length];
+    read_preview_payload(reader, &mut jpeg, PreviewPart::Jpeg)?;
+    validate_preview_jpeg(&jpeg)?;
+    Ok(Some(PreviewFrame { metadata, jpeg }))
+}
+
+pub fn validate_preview_jpeg(jpeg: &[u8]) -> Result<(), PreviewFrameError> {
+    if jpeg.is_empty() {
+        return Err(PreviewFrameError::ZeroJpegLength);
+    }
+    if jpeg.len() > MAX_PREVIEW_JPEG_SIZE {
+        return Err(PreviewFrameError::JpegTooLarge {
+            size: jpeg.len(),
+            max: MAX_PREVIEW_JPEG_SIZE,
+        });
+    }
+    if !jpeg.starts_with(&[0xff, 0xd8]) || !jpeg.ends_with(&[0xff, 0xd9]) {
+        return Err(PreviewFrameError::InvalidJpegMarkers);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PreviewPart {
+    Metadata,
+    Jpeg,
+}
+
+fn read_preview_length_prefix<R: Read>(
+    reader: &mut R,
+    part: PreviewPart,
+) -> Result<Option<[u8; 4]>, PreviewFrameError> {
+    let mut prefix = [0_u8; 4];
+    let mut received = 0;
+    while received < prefix.len() {
+        match reader.read(&mut prefix[received..]) {
+            Ok(0) if received == 0 && matches!(part, PreviewPart::Metadata) => return Ok(None),
+            Ok(0) => {
+                return Err(match part {
+                    PreviewPart::Metadata => {
+                        PreviewFrameError::TruncatedMetadataLength { received }
+                    }
+                    PreviewPart::Jpeg => PreviewFrameError::TruncatedJpegLength { received },
+                });
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(PreviewFrameError::Io(error)),
+        }
+    }
+    Ok(Some(prefix))
+}
+
+fn read_preview_payload<R: Read>(
+    reader: &mut R,
+    payload: &mut [u8],
+    part: PreviewPart,
+) -> Result<(), PreviewFrameError> {
+    let mut received = 0;
+    while received < payload.len() {
+        match reader.read(&mut payload[received..]) {
+            Ok(0) => {
+                return Err(match part {
+                    PreviewPart::Metadata => PreviewFrameError::TruncatedMetadata {
+                        expected: payload.len(),
+                        received,
+                    },
+                    PreviewPart::Jpeg => PreviewFrameError::TruncatedJpeg {
+                        expected: payload.len(),
+                        received,
+                    },
+                });
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(PreviewFrameError::Io(error)),
+        }
+    }
+    Ok(())
 }
 
 fn empty_object() -> Value {
@@ -488,6 +812,31 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
+
+    fn preview_metadata() -> PreviewMetadata {
+        PreviewMetadata {
+            version: PREVIEW_PROTOCOL_VERSION,
+            session_generation: 2,
+            sequence: 42,
+            captured_at_unix_ms: 1_725_000_000_123,
+            width: 1_280,
+            height: 960,
+            exposure_us: Some(12_500),
+            gain: Some(120),
+            content_type: PreviewContentType::Jpeg,
+            mode: PreviewMode::Night,
+            dropped_frames: 3,
+        }
+    }
+
+    fn preview_wire(metadata: &[u8], jpeg: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        wire.extend_from_slice(metadata);
+        wire.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+        wire.extend_from_slice(jpeg);
+        wire
+    }
 
     #[test]
     fn request_golden_json_uses_v1_method_names_and_default_payload() {
@@ -713,5 +1062,217 @@ mod tests {
                 .to_string()
                 .contains("config.nested.leaf")
         );
+    }
+
+    #[test]
+    fn preview_metadata_has_a_strict_golden_v1_shape() {
+        let metadata = preview_metadata();
+        assert_eq!(
+            serde_json::to_string(&metadata).unwrap(),
+            "{\"version\":1,\"session_generation\":2,\"sequence\":42,\"captured_at_unix_ms\":1725000000123,\"width\":1280,\"height\":960,\"exposure_us\":12500,\"gain\":120,\"content_type\":\"image/jpeg\",\"mode\":\"night\",\"dropped_frames\":3}"
+        );
+        metadata.validate().unwrap();
+
+        let nullable = serde_json::to_value(&metadata).unwrap();
+        let mut nullable = nullable.as_object().unwrap().clone();
+        nullable.insert("exposure_us".to_owned(), Value::Null);
+        nullable.insert("gain".to_owned(), Value::Null);
+        let decoded: PreviewMetadata =
+            serde_json::from_value(Value::Object(nullable.clone())).unwrap();
+        assert_eq!(decoded.exposure_us, None);
+        assert_eq!(decoded.gain, None);
+
+        nullable.remove("exposure_us");
+        assert!(serde_json::from_value::<PreviewMetadata>(Value::Object(nullable)).is_err());
+
+        let mut unknown = serde_json::to_value(metadata).unwrap();
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<PreviewMetadata>(unknown).is_err());
+    }
+
+    #[test]
+    fn preview_frame_roundtrips_with_little_endian_lengths() {
+        let metadata = preview_metadata();
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9];
+        let encoded_metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut wire = Vec::new();
+        write_preview_frame(&mut wire, &metadata, &jpeg).unwrap();
+
+        assert_eq!(&wire[..4], &(encoded_metadata.len() as u32).to_le_bytes());
+        let jpeg_prefix = 4 + encoded_metadata.len();
+        assert_eq!(
+            &wire[jpeg_prefix..jpeg_prefix + 4],
+            &(jpeg.len() as u32).to_le_bytes()
+        );
+
+        let mut cursor = Cursor::new(wire);
+        assert_eq!(
+            read_preview_frame(&mut cursor).unwrap(),
+            Some(PreviewFrame {
+                metadata,
+                jpeg: jpeg.to_vec(),
+            })
+        );
+        assert_eq!(read_preview_frame(&mut cursor).unwrap(), None);
+    }
+
+    #[test]
+    fn preview_metadata_validation_rejects_unsafe_values() {
+        let mut metadata = preview_metadata();
+        metadata.version += 1;
+        assert!(matches!(
+            metadata.validate(),
+            Err(PreviewValidationError::UnsupportedVersion { .. })
+        ));
+
+        metadata = preview_metadata();
+        metadata.width = 0;
+        assert_eq!(
+            metadata.validate(),
+            Err(PreviewValidationError::ZeroDimensions)
+        );
+
+        metadata = preview_metadata();
+        metadata.width = PREVIEW_MAX_DIMENSION + 1;
+        assert!(matches!(
+            metadata.validate(),
+            Err(PreviewValidationError::DimensionsTooLarge { .. })
+        ));
+
+        metadata = preview_metadata();
+        metadata.exposure_us = Some(0);
+        assert_eq!(
+            metadata.validate(),
+            Err(PreviewValidationError::InvalidExposure)
+        );
+
+        metadata = preview_metadata();
+        metadata.gain = Some(-1);
+        assert_eq!(
+            metadata.validate(),
+            Err(PreviewValidationError::InvalidGain)
+        );
+    }
+
+    #[test]
+    fn preview_lengths_are_bounded_before_payload_allocation() {
+        let error = read_preview_frame(&mut Cursor::new(0_u32.to_le_bytes())).unwrap_err();
+        assert!(matches!(error, PreviewFrameError::ZeroMetadataLength));
+
+        let oversized_metadata = ((MAX_PREVIEW_METADATA_SIZE + 1) as u32).to_le_bytes();
+        let error = read_preview_frame(&mut Cursor::new(oversized_metadata)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::MetadataTooLarge {
+                size,
+                max: MAX_PREVIEW_METADATA_SIZE
+            } if size == MAX_PREVIEW_METADATA_SIZE + 1
+        ));
+
+        let encoded_metadata = serde_json::to_vec(&preview_metadata()).unwrap();
+        let mut zero_jpeg = Vec::new();
+        zero_jpeg.extend_from_slice(&(encoded_metadata.len() as u32).to_le_bytes());
+        zero_jpeg.extend_from_slice(&encoded_metadata);
+        zero_jpeg.extend_from_slice(&0_u32.to_le_bytes());
+        let error = read_preview_frame(&mut Cursor::new(zero_jpeg)).unwrap_err();
+        assert!(matches!(error, PreviewFrameError::ZeroJpegLength));
+
+        let mut oversized_jpeg = Vec::new();
+        oversized_jpeg.extend_from_slice(&(encoded_metadata.len() as u32).to_le_bytes());
+        oversized_jpeg.extend_from_slice(&encoded_metadata);
+        oversized_jpeg.extend_from_slice(&((MAX_PREVIEW_JPEG_SIZE + 1) as u32).to_le_bytes());
+        let error = read_preview_frame(&mut Cursor::new(oversized_jpeg)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::JpegTooLarge {
+                size,
+                max: MAX_PREVIEW_JPEG_SIZE
+            } if size == MAX_PREVIEW_JPEG_SIZE + 1
+        ));
+
+        let mut destination = Vec::new();
+        let error = write_preview_frame(&mut destination, &preview_metadata(), &[]).unwrap_err();
+        assert!(matches!(error, PreviewFrameError::ZeroJpegLength));
+        assert!(destination.is_empty());
+
+        let oversized_jpeg = vec![0_u8; MAX_PREVIEW_JPEG_SIZE + 1];
+        let error = write_preview_frame(&mut destination, &preview_metadata(), &oversized_jpeg)
+            .unwrap_err();
+        assert!(matches!(error, PreviewFrameError::JpegTooLarge { .. }));
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn preview_reader_distinguishes_truncation_and_invalid_payloads() {
+        assert_eq!(
+            read_preview_frame(&mut Cursor::new(Vec::<u8>::new())).unwrap(),
+            None
+        );
+
+        let error = read_preview_frame(&mut Cursor::new(vec![1, 0])).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::TruncatedMetadataLength { received: 2 }
+        ));
+
+        let mut truncated_metadata = 3_u32.to_le_bytes().to_vec();
+        truncated_metadata.push(b'{');
+        let error = read_preview_frame(&mut Cursor::new(truncated_metadata)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::TruncatedMetadata {
+                expected: 3,
+                received: 1
+            }
+        ));
+
+        let malformed_json = preview_wire(b"{", &[0xff, 0xd8, 0xff, 0xd9]);
+        let error = read_preview_frame(&mut Cursor::new(malformed_json)).unwrap_err();
+        assert!(matches!(error, PreviewFrameError::MetadataJson(_)));
+
+        let encoded_metadata = serde_json::to_vec(&preview_metadata()).unwrap();
+        let mut invalid_metadata = serde_json::to_value(preview_metadata()).unwrap();
+        invalid_metadata["version"] = json!(PREVIEW_PROTOCOL_VERSION + 1);
+        let invalid_metadata = serde_json::to_vec(&invalid_metadata).unwrap();
+        let invalid_metadata = preview_wire(&invalid_metadata, &[0xff, 0xd8, 0xff, 0xd9]);
+        let error = read_preview_frame(&mut Cursor::new(invalid_metadata)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::MetadataValidation(
+                PreviewValidationError::UnsupportedVersion { .. }
+            )
+        ));
+
+        let mut truncated_jpeg_prefix = Vec::new();
+        truncated_jpeg_prefix.extend_from_slice(&(encoded_metadata.len() as u32).to_le_bytes());
+        truncated_jpeg_prefix.extend_from_slice(&encoded_metadata);
+        truncated_jpeg_prefix.extend_from_slice(&[4, 0]);
+        let error = read_preview_frame(&mut Cursor::new(truncated_jpeg_prefix)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::TruncatedJpegLength { received: 2 }
+        ));
+
+        let truncated_jpeg = preview_wire(&encoded_metadata, &[0xff, 0xd8]);
+        let mut truncated_jpeg = truncated_jpeg[..truncated_jpeg.len() - 1].to_vec();
+        // Restore the declared JPEG size after slicing a payload byte.
+        let jpeg_prefix = 4 + encoded_metadata.len();
+        truncated_jpeg[jpeg_prefix..jpeg_prefix + 4].copy_from_slice(&2_u32.to_le_bytes());
+        let error = read_preview_frame(&mut Cursor::new(truncated_jpeg)).unwrap_err();
+        assert!(matches!(
+            error,
+            PreviewFrameError::TruncatedJpeg {
+                expected: 2,
+                received: 1
+            }
+        ));
+
+        let invalid_jpeg = preview_wire(&encoded_metadata, b"not-a-jpeg");
+        let error = read_preview_frame(&mut Cursor::new(invalid_jpeg)).unwrap_err();
+        assert!(matches!(error, PreviewFrameError::InvalidJpegMarkers));
+        assert!(matches!(
+            write_preview_frame(&mut Vec::new(), &preview_metadata(), b"not-a-jpeg"),
+            Err(PreviewFrameError::InvalidJpegMarkers)
+        ));
     }
 }
