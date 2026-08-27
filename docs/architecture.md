@@ -192,5 +192,7 @@ an unattended pier machine.
 7. FFmpeg segmented recording, recovery, retention, and packaging.
 
 The repository has completed item 1 plus the reusable-buffer, bounded-writer,
-and auto-settling portion of item 2. It has also established a buildable WinUI
-shell and the configuration/protocol seams needed by the remaining work.
+auto-settling, host-control, and live-status portions of item 2. Item 3 now has
+a real tray host and secured protocol-v1 status/capture controls; configuration
+persistence and reconnect policy remain. Item 4 has a live WinUI status and
+capture-now client, while preview transport and editable configuration remain.

@@ -1,5 +1,6 @@
 /target/
 /captures/
+/autopiercam.toml
 /ASI_Camera_SDK/
 **/.DS_Store
 **/bin/

@@ -5,7 +5,7 @@ planetary cameras. It is intended to live in the system tray, adapt between
 bright days and dark nights, save debayered stills, maintain short security
 video segments, and optionally upload completed artifacts.
 
-The repository currently contains the first hardware-validated vertical slice:
+The repository now contains a hardware-validated background capture slice:
 
 - dynamic loading of the bundled ZWO ASI SDK 1.41;
 - checked C ABI layouts and safe camera lifecycle/control wrappers;
@@ -16,7 +16,10 @@ The repository currently contains the first hardware-validated vertical slice:
 - a validated, forward-looking TOML configuration model;
 - a continuous camera drain loop with auto-exposure settling and a bounded
   still-writer queue;
-- a buildable unpackaged WinUI 3 viewer/settings shell.
+- a Windows notification-area host that owns and supervises the camera worker;
+- a current-user-only, remote-rejected named pipe with versioned JSON control;
+- a buildable unpackaged WinUI 3 viewer that shows live status and can request
+  an immediate capture.
 
 ## Quick start
 
@@ -26,9 +29,15 @@ From a 64-bit Windows Rust toolchain:
     cargo run -p autopiercam -- list
     cargo run -p autopiercam -- probe --camera-id 0
     cargo run --release -p autopiercam -- snapshot --camera-id 0 --output captures/test.jpg
-    Copy-Item autopiercam.example.toml autopiercam.local.toml
-    cargo run --release -p autopiercam -- run --config autopiercam.local.toml
+    Copy-Item autopiercam.example.toml autopiercam.toml
+    cargo run --release -p autopiercam-tray -- --config autopiercam.toml
     dotnet build apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj
+    dotnet run --project apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj
+
+The tray also accepts `AUTOPIERCAM_CONFIG` and `AUTOPIERCAM_ASI_SDK_PATH`.
+Its menu can open the built Viewer, pause/resume scheduled stills, capture one
+frame immediately, and perform an ordered shutdown. `autopiercam run` remains
+available for a console-only installation or capture test.
 
 Set AUTOPIERCAM_ASI_SDK_PATH or pass --sdk when the SDK DLL is not in the
 bundled location. The x64 runtime DLL is expected at:
@@ -42,8 +51,10 @@ camera driver is installed separately.
 
 - crates/autopiercam-asi: dynamically loaded ASICamera2 wrapper.
 - crates/autopiercam-core: portable configuration and image processing.
-- crates/autopiercam: diagnostic CLI and hardware smoke-test path.
-- apps/AutoPierCam.Viewer: unpackaged WinUI 3 viewer/settings shell.
+- crates/autopiercam-protocol: protocol-v1 envelopes, status types, and framing.
+- crates/autopiercam: reusable capture engine plus diagnostic CLI.
+- crates/autopiercam-tray: Windows notification-area host and named-pipe server.
+- apps/AutoPierCam.Viewer: unpackaged WinUI 3 status/settings application.
 - docs/architecture.md: target agent, UI, storage, video, and upload design.
 - autopiercam.example.toml: initial configuration contract.
 
@@ -52,7 +63,9 @@ camera driver is installed separately.
 SDK enumeration found one ZWO ASI676MC at camera id 0: 3552 by 3552, RG Bayer,
 12-bit ADC, 2.0 micrometre pixels, USB3, with RAW8/RGB24/Y8/RAW16 support.
 The snapshot command captured, debayered, encoded, and closed the camera
-successfully.
+successfully. The tray was also exercised end to end against this camera:
+status, pause, resume, capture-now-while-paused, repeated pipe reconnects, and
+protocol-driven ordered shutdown all completed successfully.
 
 ## Important constraints
 
@@ -65,3 +78,6 @@ successfully.
   documentation calls control 11 microseconds, while the ASI676MC exposes
   AutoExpMaxExpMS. The implementation detects the runtime control name and
   converts accordingly.
+- Viewer configuration controls and preview are intentionally read-only or
+  placeholder UI in this checkpoint. HTTP upload and security video remain
+  designed seams, not active sinks yet.
