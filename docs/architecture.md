@@ -66,15 +66,21 @@ mock camera backend.
 
 The agent is a normal per-user background executable. On Windows its primary
 thread owns the notification icon and event loop. A supervisor owns cancellation,
-camera reconnect state, sink worker health, config revisions, and IPC.
+camera reconnect state, config-driven restarts, and IPC. Camera startup and
+runtime faults are retried with a bounded 1/2/5/10/30-second backoff; a healthy
+capture session resets the delay.
 
-The tray menu will expose Status, Open AutoPierCam, Pause/Resume capture, Capture
+The tray menu exposes Status, Open AutoPierCam, Pause/Resume capture, Capture
 now, and Exit. Exit performs an ordered shutdown rather than terminating the
 process abruptly.
 
 ### WinUI application
 
-The C#/XAML WinUI 3 app is deliberately thin. It displays:
+The C#/XAML WinUI 3 app is deliberately thin. The current application displays
+agent/camera state, frame counters, and the most recent artifact; it can request
+an immediate still and edit max exposure, max gain, still cadence, HTTP upload,
+and video enablement. It preserves all hidden configuration fields when it
+writes a complete replacement. Planned additions include:
 
 - current preview and capture timestamp;
 - connection, exposure, gain, temperature, queue, and disk status;
@@ -83,7 +89,8 @@ The C#/XAML WinUI 3 app is deliberately thin. It displays:
 - recent artifacts and recoverable errors.
 
 Configuration writes include the revision the UI read. The agent validates and
-atomically persists a replacement only when that revision still matches.
+atomically persists a replacement only when that revision still matches, then
+schedules a controlled camera restart. Revision conflicts force a refresh.
 
 ## Frame pipeline and backpressure
 
@@ -176,10 +183,11 @@ Ordered shutdown:
 5. Commit database and upload checkpoints.
 6. Remove the tray icon and exit its event loop.
 
-Startup reconciles database rows with the spool, quarantines incomplete stills,
-validates recoverable video segments, resumes upload attempts, and begins camera
-reconnect. An at-logon Scheduled Task with restart-on-failure is appropriate for
-an unattended pier machine.
+The implemented startup path validates configuration, begins camera connection,
+and automatically retries startup or runtime faults. Future startup work will
+reconcile database rows with the spool, quarantine incomplete stills, validate
+recoverable video segments, and resume upload attempts. An at-logon Scheduled
+Task with restart-on-failure is appropriate for an unattended pier machine.
 
 ## Delivery sequence
 
@@ -191,8 +199,9 @@ an unattended pier machine.
 6. Atomic still spool and durable HTTP upload queue.
 7. FFmpeg segmented recording, recovery, retention, and packaging.
 
-The repository has completed item 1 plus the reusable-buffer, bounded-writer,
-auto-settling, host-control, and live-status portions of item 2. Item 3 now has
-a real tray host and secured protocol-v1 status/capture controls; configuration
-persistence and reconnect policy remain. Item 4 has a live WinUI status and
-capture-now client, while preview transport and editable configuration remain.
+The repository has completed item 1 and the reusable-buffer, bounded-writer,
+auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
+real tray host, secured one-request protocol-v1 control, atomic revisioned
+configuration persistence, and restart application. Item 4 has a live WinUI
+status, capture-now, and configuration client; preview transport and artifact
+browsing remain.

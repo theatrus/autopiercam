@@ -18,7 +18,10 @@ creates it with a protected DACL granting the current logon SID access and sets
 `PIPE_REJECT_REMOTE_CLIENTS`. It also requests the first pipe instance so a
 second tray process cannot silently claim the same endpoint. A fresh listening
 instance is created before each connected client is serviced, allowing
-short-lived Viewer requests to reconnect without a gap.
+short-lived Viewer requests to reconnect without a gap. Protocol v1 serves one
+request per connection, and disconnects a client that does not finish sending
+that request within five seconds so an idle connection cannot monopolize the
+control endpoint.
 
 Implemented methods:
 
@@ -26,13 +29,13 @@ Implemented methods:
 - capture.pause
 - capture.resume
 - capture.now
+- config.get
+- config.replace
 - agent.shutdown
 
 Reserved methods currently return a structured `not_implemented` error:
 
 - cameras.list
-- config.get
-- config.replace
 - artifacts.list
 
 `status.get` returns:
@@ -51,12 +54,39 @@ The Viewer opens one pipe connection per request and serializes its requests.
 It enforces a 2-second connection timeout, 30-second response timeout, matching
 request ids, protocol version 1, and the result/error exclusivity rule.
 
-## Planned configuration and preview methods
+## Configuration methods
 
-config.replace carries expected_revision and a complete configuration document.
-The agent validates first, writes a temporary file, atomically replaces the
-previous file, increments the revision, and then applies changes through the
-camera state machine.
+`config.get` returns a content-derived revision and the complete validated
+configuration document:
+
+    {
+      "revision": 11968056021619285017,
+      "config": {
+        "camera": { "...": "..." },
+        "capture": { "...": "..." },
+        "upload": { "...": "..." },
+        "video": { "...": "..." },
+        "api": { "...": "..." }
+      }
+    }
+
+`config.replace` carries `expected_revision` and a complete configuration
+document. Complete means every field emitted by the current schema is present,
+including optional fields whose value is null; unknown fields are rejected.
+The agent validates the document and expected revision, syncs a unique temporary
+file, atomically replaces the TOML file, and schedules a controlled camera
+restart. Success is precise about those two completed/accepted steps:
+
+    { "revision": 42, "saved": true, "restart_scheduled": true }
+
+The revision is derived from canonical configuration content, so a no-op save
+can retain the same revision. A stale write returns `revision_conflict` with
+`expected_revision` and `current_revision` details. If persistence succeeds but
+the worker has already stopped, the response is the structured
+`config_saved_agent_stopped` error with the persisted revision; clients must
+refresh before another edit.
+
+## Planned preview method
 
 The separate preview pipe will emit:
 

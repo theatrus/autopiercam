@@ -16,10 +16,13 @@ The repository now contains a hardware-validated background capture slice:
 - a validated, forward-looking TOML configuration model;
 - a continuous camera drain loop with auto-exposure settling and a bounded
   still-writer queue;
+- a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
+  backoff;
 - a Windows notification-area host that owns and supervises the camera worker;
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
-- a buildable unpackaged WinUI 3 viewer that shows live status and can request
-  an immediate capture.
+- atomic, content-revisioned configuration replacement through that pipe;
+- a buildable unpackaged WinUI 3 viewer that shows live status, requests an
+  immediate capture, and edits the supported live configuration fields.
 
 ## Quick start
 
@@ -65,7 +68,13 @@ SDK enumeration found one ZWO ASI676MC at camera id 0: 3552 by 3552, RG Bayer,
 The snapshot command captured, debayered, encoded, and closed the camera
 successfully. The tray was also exercised end to end against this camera:
 status, pause, resume, capture-now-while-paused, repeated pipe reconnects, and
-protocol-driven ordered shutdown all completed successfully.
+protocol-driven ordered shutdown all completed successfully. A later recovery
+test deliberately selected a nonexistent camera, observed the fault, restored
+the configuration in the same tray process, and returned to capture without
+counter regression. It also verified stale-revision rejection, two distinct
+manual still requests, and the five-second bound imposed on an idle pipe
+client. The WinUI Viewer then saved the complete configuration, scheduled a
+camera restart, and refreshed back to the capturing state.
 
 ## Important constraints
 
@@ -78,6 +87,7 @@ protocol-driven ordered shutdown all completed successfully.
   documentation calls control 11 microseconds, while the ASI676MC exposes
   AutoExpMaxExpMS. The implementation detects the runtime control name and
   converts accordingly.
-- Viewer configuration controls and preview are intentionally read-only or
-  placeholder UI in this checkpoint. HTTP upload and security video remain
-  designed seams, not active sinks yet.
+- The Viewer preview and camera selector remain placeholders. Max exposure,
+  max gain, still interval, upload endpoint/enable, and video enable are backed
+  by versioned configuration replacement. HTTP upload and security video can
+  be configured but remain designed seams rather than active sinks.
