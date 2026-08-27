@@ -1,15 +1,28 @@
+using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Graphics;
 
 namespace AutoPierCam.Viewer;
 
 public sealed partial class MainWindow : Window
 {
+    private static readonly TimeSpan PreviewStaleAfter = TimeSpan.FromSeconds(5);
+
     private readonly AgentPipeClient _agentClient = new();
+    private readonly PreviewPipeClient _previewClient = new();
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly DispatcherQueueTimer _previewFreshnessTimer;
     private AgentConfigurationSnapshot? _configurationSnapshot;
+    private Task? _previewTask;
+    private string _lastPreviewDetail = "Waiting for preview stream";
+    private ulong _activePreviewConnectionEpoch;
+    private long _lastPreviewArrivalTimestamp;
+    private bool _hasPreviewFrame;
+    private bool _previewFrameError;
     private bool _configurationNeedsRefresh = true;
     private bool _initialRefreshStarted;
     private bool _operationInProgress;
@@ -20,6 +33,10 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         Title = "AutoPierCam";
         AppWindow.Resize(new SizeInt32(1180, 760));
+        _previewFreshnessTimer = DispatcherQueue.CreateTimer();
+        _previewFreshnessTimer.Interval = TimeSpan.FromSeconds(1);
+        _previewFreshnessTimer.IsRepeating = true;
+        _previewFreshnessTimer.Tick += PreviewFreshnessTimer_Tick;
         Closed += MainWindow_Closed;
     }
 
@@ -31,9 +48,269 @@ public sealed partial class MainWindow : Window
         }
 
         _initialRefreshStarted = true;
+        _previewFreshnessTimer.Start();
+        _previewTask = RunPreviewLoopAsync(_lifetime.Token);
         await RunUiOperationAsync(
             "Connecting to the local capture agent…",
             RefreshStatusAndConfigurationAsync);
+    }
+
+    private async Task RunPreviewLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _previewClient.RunAsync(
+                    ApplyPreviewFrameAsync,
+                    ApplyPreviewStateAsync,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunOnDispatcherAsync(
+                        () =>
+                        {
+                            ShowPreviewFrameError(
+                                $"Preview client stopped unexpectedly: {Compact(exception.Message)}");
+                            return Task.CompletedTask;
+                        },
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // The dispatcher may already be shutting down with the window.
+            }
+        }
+    }
+
+    private Task ApplyPreviewStateAsync(
+        PreviewStreamState state,
+        CancellationToken cancellationToken)
+    {
+        return RunOnDispatcherAsync(
+            () =>
+            {
+                ApplyPreviewState(state);
+                return Task.CompletedTask;
+            },
+            cancellationToken);
+    }
+
+    private Task ApplyPreviewFrameAsync(
+        PreviewFrame frame,
+        CancellationToken cancellationToken)
+    {
+        return RunOnDispatcherAsync(
+            () => DecodeAndApplyPreviewFrameAsync(frame),
+            cancellationToken);
+    }
+
+    private void ApplyPreviewState(PreviewStreamState state)
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        if (state.Phase == PreviewStreamPhase.Connecting)
+        {
+            if (_activePreviewConnectionEpoch != 0 &&
+                state.ConnectionEpoch <= _activePreviewConnectionEpoch)
+            {
+                return;
+            }
+
+            _activePreviewConnectionEpoch = state.ConnectionEpoch;
+            ClearPreviewImage();
+            PreviewStatusText.Text = "CONNECTING";
+            PreviewDetailText.Text =
+                $@"Connecting to \\.\pipe\{_previewClient.PipeName}";
+            return;
+        }
+
+        if (state.ConnectionEpoch != _activePreviewConnectionEpoch)
+        {
+            return;
+        }
+
+        switch (state.Phase)
+        {
+            case PreviewStreamPhase.WaitingForFrame:
+                ClearPreviewImage();
+                PreviewStatusText.Text = "WAITING";
+                PreviewDetailText.Text = "Connected; waiting for the newest camera frame";
+                break;
+            case PreviewStreamPhase.Reconnecting:
+                ClearPreviewImage();
+                PreviewStatusText.Text = "RECONNECTING";
+                string retry = state.RetryDelay is TimeSpan retryDelay
+                    ? $" Retrying in {retryDelay.TotalSeconds:0.##} seconds."
+                    : string.Empty;
+                PreviewDetailText.Text = $"{Compact(state.Detail ?? "Preview stream disconnected.")}{retry}";
+                break;
+            case PreviewStreamPhase.Live:
+                // A successfully decoded frame owns the LIVE presentation.
+                // Do not overwrite FRAME ERROR if valid wire bytes failed decoding.
+                break;
+            case PreviewStreamPhase.Connecting:
+            default:
+                break;
+        }
+    }
+
+    private async Task DecodeAndApplyPreviewFrameAsync(PreviewFrame frame)
+    {
+        if (_closed || frame.ConnectionEpoch != _activePreviewConnectionEpoch)
+        {
+            return;
+        }
+
+        try
+        {
+            using var jpegStream = new MemoryStream(frame.Jpeg, writable: false);
+            using var randomAccessStream = jpegStream.AsRandomAccessStream();
+            var bitmap = new BitmapImage();
+            await bitmap.SetSourceAsync(randomAccessStream);
+
+            if (_closed || frame.ConnectionEpoch != _activePreviewConnectionEpoch)
+            {
+                return;
+            }
+
+            if (bitmap.PixelWidth != frame.Metadata.Width ||
+                bitmap.PixelHeight != frame.Metadata.Height)
+            {
+                throw new InvalidDataException(
+                    $"Decoded JPEG dimensions {bitmap.PixelWidth}x{bitmap.PixelHeight} do not match metadata {frame.Metadata.Width}x{frame.Metadata.Height}.");
+            }
+
+            PreviewImage.Source = bitmap;
+            PreviewImage.Visibility = Visibility.Visible;
+            PreviewImage.Opacity = 1;
+            PreviewPlaceholder.Visibility = Visibility.Collapsed;
+            PreviewStatusText.Text = "LIVE";
+
+            ExposureValueText.Text = FormatExposure(frame.Metadata.ExposureUs);
+            GainValueText.Text = frame.Metadata.Gain is long gain ? gain.ToString("N0") : "—";
+            ModeValueText.Text = FormatPreviewMode(frame.Metadata.Mode);
+
+            _lastPreviewDetail = FormatPreviewDetail(frame.Metadata);
+            PreviewDetailText.Text = _lastPreviewDetail;
+            _lastPreviewArrivalTimestamp = Stopwatch.GetTimestamp();
+            _hasPreviewFrame = true;
+            _previewFrameError = false;
+        }
+        catch (Exception exception)
+        {
+            if (!_closed && frame.ConnectionEpoch == _activePreviewConnectionEpoch)
+            {
+                ShowPreviewFrameError($"Could not decode preview frame: {Compact(exception.Message)}");
+            }
+        }
+    }
+
+    private void PreviewFreshnessTimer_Tick(DispatcherQueueTimer sender, object args)
+    {
+        if (_closed || !_hasPreviewFrame || _previewFrameError)
+        {
+            return;
+        }
+
+        TimeSpan age = Stopwatch.GetElapsedTime(_lastPreviewArrivalTimestamp);
+        if (age < PreviewStaleAfter)
+        {
+            return;
+        }
+
+        PreviewStatusText.Text = "STALE";
+        PreviewImage.Opacity = 0.45;
+        PreviewDetailText.Text =
+            $"No new preview for {age.TotalSeconds:0} seconds · {_lastPreviewDetail}";
+    }
+
+    private void ShowPreviewFrameError(string detail)
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        _previewFrameError = true;
+        PreviewStatusText.Text = "FRAME ERROR";
+        PreviewImage.Opacity = 0.45;
+        PreviewDetailText.Text = Compact(detail);
+    }
+
+    private void ClearPreviewImage()
+    {
+        PreviewImage.Source = null;
+        PreviewImage.Visibility = Visibility.Collapsed;
+        PreviewImage.Opacity = 1;
+        PreviewPlaceholder.Visibility = Visibility.Visible;
+        ExposureValueText.Text = "—";
+        GainValueText.Text = "—";
+        ModeValueText.Text = "—";
+        _lastPreviewArrivalTimestamp = 0;
+        _hasPreviewFrame = false;
+        _previewFrameError = false;
+        _lastPreviewDetail = "Waiting for preview stream";
+    }
+
+    private Task RunOnDispatcherAsync(
+        Func<Task> operation,
+        CancellationToken cancellationToken)
+    {
+        if (_closed)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            return operation();
+        }
+
+        var completion = new TaskCompletionSource<object?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        bool queued = DispatcherQueue.TryEnqueue(async () =>
+        {
+            if (_closed)
+            {
+                completion.TrySetResult(null);
+                return;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                completion.TrySetCanceled(cancellationToken);
+                return;
+            }
+
+            try
+            {
+                await operation();
+                completion.TrySetResult(null);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                completion.TrySetCanceled(cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        });
+
+        if (!queued)
+        {
+            completion.TrySetException(
+                new InvalidOperationException("The Viewer dispatcher is no longer available."));
+        }
+
+        return completion.Task;
     }
 
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -290,8 +567,6 @@ public sealed partial class MainWindow : Window
             : $"{Compact(status.Camera.Name)} (id {status.Camera.Id})";
 
         StatusText.Text = $"{state} · {cameraSummary}";
-        PreviewStatusText.Text = state.ToUpperInvariant();
-        ModeValueText.Text = state;
         FrameCountsText.Text =
             $"{status.FramesCaptured:N0} captured · {status.FramesSaved:N0} saved";
         LastArtifactText.Text = string.IsNullOrWhiteSpace(status.LastArtifact)
@@ -340,8 +615,6 @@ public sealed partial class MainWindow : Window
         _configurationNeedsRefresh = true;
         StatusText.Text =
             $"Offline — {Compact(detail)} Start the AutoPierCam agent, then select Refresh.";
-        PreviewStatusText.Text = "OFFLINE";
-        ModeValueText.Text = "Offline";
         AgentConnectionText.Text =
             $"Rust agent: disconnected · {PipeDisplayName}";
         FrameCountsText.Text = "No live agent status available";
@@ -367,8 +640,6 @@ public sealed partial class MainWindow : Window
         _configurationNeedsRefresh = true;
         StatusText.Text =
             $"Agent response timed out — {Compact(detail)} Select Refresh before retrying Capture now.";
-        PreviewStatusText.Text = "UNKNOWN";
-        ModeValueText.Text = "Unknown";
         AgentConnectionText.Text = "Rust agent: response timed out";
         AgentLastErrorText.Text =
             "The request may have completed. Refresh status before sending another capture request.";
@@ -387,8 +658,6 @@ public sealed partial class MainWindow : Window
         }
 
         StatusText.Text = Compact(detail);
-        PreviewStatusText.Text = "ERROR";
-        ModeValueText.Text = "Error";
         AgentConnectionText.Text = "Rust agent: connected, request failed";
         AgentLastErrorText.Text = Compact(detail);
         AgentLastErrorText.Visibility = Visibility.Visible;
@@ -524,6 +793,53 @@ public sealed partial class MainWindow : Window
         return trimmed.Length == 0 ? null : trimmed;
     }
 
+    private static string FormatExposure(long? exposureUs)
+    {
+        return exposureUs switch
+        {
+            null => "—",
+            >= 1_000_000 => $"{exposureUs.Value / 1_000_000.0:0.###} s",
+            >= 1_000 => $"{exposureUs.Value / 1_000.0:0.###} ms",
+            _ => $"{exposureUs.Value:N0} µs",
+        };
+    }
+
+    private static string FormatPreviewMode(string mode)
+    {
+        return mode switch
+        {
+            "day" => "Day",
+            "night" => "Night",
+            _ => "Unknown",
+        };
+    }
+
+    private static string FormatPreviewDetail(PreviewFrameMetadata metadata)
+    {
+        string capturedAt = FormatCaptureTime(metadata.CapturedAtUnixMs);
+        return $"{capturedAt} · {metadata.Width:N0}×{metadata.Height:N0} · frame {metadata.Sequence:N0} · {metadata.DroppedFrames:N0} dropped";
+    }
+
+    private static string FormatCaptureTime(ulong capturedAtUnixMs)
+    {
+        if (capturedAtUnixMs > long.MaxValue)
+        {
+            return "Unknown capture time";
+        }
+
+        try
+        {
+            return DateTimeOffset
+                .FromUnixTimeMilliseconds((long)capturedAtUnixMs)
+                .ToLocalTime()
+                .ToString("G");
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return "Unknown capture time";
+        }
+    }
+
     private static string FormatAgentError(AgentRequestException exception)
     {
         string message = $"{exception.Code}: {exception.Message}";
@@ -556,10 +872,16 @@ public sealed partial class MainWindow : Window
     private async void MainWindow_Closed(object sender, WindowEventArgs args)
     {
         _closed = true;
+        _previewFreshnessTimer.Stop();
         _lifetime.Cancel();
         try
         {
-            await _agentClient.DisposeAsync();
+            if (_previewTask is not null)
+            {
+                await _previewTask.ConfigureAwait(false);
+            }
+
+            await _agentClient.DisposeAsync().ConfigureAwait(false);
         }
         catch
         {

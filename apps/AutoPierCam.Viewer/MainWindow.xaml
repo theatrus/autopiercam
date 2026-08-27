@@ -71,7 +71,15 @@
                     BorderThickness="1"
                     CornerRadius="8">
                     <Grid>
+                        <Image
+                            x:Name="PreviewImage"
+                            HorizontalAlignment="Stretch"
+                            VerticalAlignment="Stretch"
+                            Opacity="1"
+                            Stretch="Uniform"
+                            Visibility="Collapsed" />
                         <StackPanel
+                            x:Name="PreviewPlaceholder"
                             HorizontalAlignment="Center"
                             VerticalAlignment="Center"
                             Spacing="10">
@@ -99,7 +107,20 @@
                                 x:Name="PreviewStatusText"
                                 FontSize="12"
                                 Foreground="White"
-                                Text="OFFLINE" />
+                                Text="CONNECTING" />
+                        </Border>
+                        <Border
+                            Margin="12"
+                            Padding="10,6"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Bottom"
+                            Background="#CC1E293B"
+                            CornerRadius="4">
+                            <TextBlock
+                                x:Name="PreviewDetailText"
+                                FontSize="12"
+                                Foreground="White"
+                                Text="Waiting for preview stream" />
                         </Border>
                     </Grid>
                 </Border>
