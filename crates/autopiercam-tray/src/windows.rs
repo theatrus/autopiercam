@@ -1,5 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
+use autopiercam_protocol::{AgentState, AgentStatus};
 use tao::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -11,7 +12,10 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::worker::{TrayCommand, WorkerEvent, WorkerStatus, start_placeholder_worker};
+use crate::{
+    Options,
+    worker::{TrayCommand, WorkerEvent, WorkerOptions, start_capture_worker},
+};
 
 const VIEWER_FILE_NAME: &str = "AutoPierCam.Viewer.exe";
 const VIEWER_DEV_RELATIVE_PATH: &str = concat!(
@@ -25,7 +29,7 @@ enum UserEvent {
     Worker(WorkerEvent),
 }
 
-pub(crate) fn run() {
+pub(crate) fn run(options: Options) {
     init_tracing();
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -35,15 +39,21 @@ pub(crate) fn run() {
     }));
 
     let worker_proxy = event_loop.create_proxy();
-    let worker = match start_placeholder_worker(move |event| {
+    let worker_options = WorkerOptions {
+        config_path: options.config,
+        sdk_path: options.sdk,
+    };
+    let worker = match start_capture_worker(worker_options, move |event| {
         let _ = worker_proxy.send_event(UserEvent::Worker(event));
     }) {
         Ok(worker) => worker,
         Err(error) => {
-            error!(%error, "failed to start the placeholder capture worker");
+            error!(%error, "failed to start the capture worker supervisor");
             return;
         }
     };
+    let _agent_monitor = worker.monitor();
+    let _agent_control = worker.control();
 
     let menu = Menu::new();
     let open_viewer = MenuItem::new("Open viewer", true, None);
@@ -154,17 +164,47 @@ fn init_tracing() {
 }
 
 fn apply_worker_status(
-    status: &WorkerStatus,
+    status: &AgentStatus,
     pause_capture: &CheckMenuItem,
     tray: &Option<tray_icon::TrayIcon>,
     worker_paused: &mut bool,
     status_summary: &mut String,
 ) {
-    info!(paused = status.paused, status = %status.summary, "capture worker status changed");
-    *worker_paused = status.paused;
-    pause_capture.set_checked(status.paused);
-    status_summary.clone_from(&status.summary);
+    let paused = status.state == AgentState::Paused;
+    let summary = status_summary_text(status);
+    info!(paused, state = ?status.state, status = %summary, "capture worker status changed");
+    *worker_paused = paused;
+    pause_capture.set_checked(paused);
+    status_summary.clone_from(&summary);
     set_tooltip(tray, &tray_tooltip(status_summary));
+}
+
+fn status_summary_text(status: &AgentStatus) -> String {
+    let camera = status
+        .camera
+        .as_ref()
+        .map(|camera| camera.name.as_str())
+        .unwrap_or("no camera");
+    match status.state {
+        AgentState::Starting => format!("starting — {camera}"),
+        AgentState::Idle => format!("idle — {camera}"),
+        AgentState::Capturing => format!("capturing — {camera}"),
+        AgentState::Paused => format!("paused — {camera}"),
+        AgentState::Stopping => "stopping".to_owned(),
+        AgentState::Faulted => status
+            .last_error
+            .as_deref()
+            .map(compact_tooltip_error)
+            .unwrap_or_else(|| "capture fault".to_owned()),
+    }
+}
+
+fn compact_tooltip_error(error: &str) -> String {
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 80 {
+        return compact;
+    }
+    compact.chars().take(79).collect::<String>() + "…"
 }
 
 fn set_tooltip(tray: &Option<tray_icon::TrayIcon>, tooltip: &str) {

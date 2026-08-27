@@ -100,6 +100,17 @@ impl AgentMonitor {
         }
     }
 
+    /// Publish a host-level startup or transport failure before camera setup.
+    pub fn report_fault(&self, message: impl Into<String>) {
+        let mut status = self.write();
+        status.state = AgentState::Faulted;
+        status.last_error = Some(message.into());
+    }
+
+    pub fn mark_stopping(&self) {
+        self.set_state(AgentState::Stopping);
+    }
+
     fn write(&self) -> RwLockWriteGuard<'_, AgentStatus> {
         match self.inner.write() {
             Ok(status) => status,
@@ -139,9 +150,7 @@ impl AgentMonitor {
     }
 
     fn fault(&self, error: &anyhow::Error) {
-        let mut status = self.write();
-        status.state = AgentState::Faulted;
-        status.last_error = Some(format!("{error:#}"));
+        self.report_fault(format!("{error:#}"));
     }
 }
 

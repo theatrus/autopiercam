@@ -148,6 +148,10 @@ dependencies = [
 name = "autopiercam-tray"
 version = "0.1.0"
 dependencies = [
+ "autopiercam",
+ "autopiercam-asi",
+ "autopiercam-protocol",
+ "clap",
  "tao",
  "tracing",
  "tracing-subscriber",

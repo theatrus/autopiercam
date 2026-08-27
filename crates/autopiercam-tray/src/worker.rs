@@ -1,108 +1,198 @@
 use std::{
-    io,
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::mpsc::{self, Receiver, SendError, Sender},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, TryRecvError},
+    },
     thread,
+    time::Duration,
 };
 
-/// Commands emitted by the tray UI for the capture worker or its future IPC adapter.
-#[derive(Debug)]
+use autopiercam::{AgentControl, AgentMonitor, run_agent_with_monitor};
+use autopiercam_asi::Sdk;
+use autopiercam_protocol::AgentStatus;
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerOptions {
+    pub(crate) config_path: PathBuf,
+    pub(crate) sdk_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum TrayCommand {
     SetPaused(bool),
     CaptureNow,
     Shutdown,
 }
 
-/// Worker-owned state suitable for showing in the tray and configuration UI.
-#[derive(Clone, Debug)]
-pub(crate) struct WorkerStatus {
-    pub(crate) paused: bool,
-    pub(crate) summary: String,
-}
-
-/// Events emitted by either the in-process placeholder or a future IPC transport.
 #[derive(Debug)]
 pub(crate) enum WorkerEvent {
-    StatusChanged(WorkerStatus),
+    StatusChanged(AgentStatus),
     WorkerStopped,
 }
 
-/// UI-facing command transport. Its implementation can later become a named-pipe client
-/// without changing tray menu or event-loop code.
 #[derive(Clone)]
 pub(crate) struct WorkerClient {
-    commands: Sender<TrayCommand>,
+    control: AgentControl,
+    monitor: AgentMonitor,
+    stopped: Arc<AtomicBool>,
 }
 
 impl WorkerClient {
-    pub(crate) fn send(&self, command: TrayCommand) -> Result<(), SendError<TrayCommand>> {
-        self.commands.send(command)
+    pub(crate) fn send(&self, command: TrayCommand) -> Result<(), WorkerStopped> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(WorkerStopped);
+        }
+        match command {
+            TrayCommand::SetPaused(true) => self.control.pause(),
+            TrayCommand::SetPaused(false) => self.control.resume(),
+            TrayCommand::CaptureNow => self.control.capture_now(),
+            TrayCommand::Shutdown => {
+                self.monitor.mark_stopping();
+                self.control.shutdown();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn monitor(&self) -> AgentMonitor {
+        self.monitor.clone()
+    }
+
+    pub(crate) fn control(&self) -> AgentControl {
+        self.control.clone()
     }
 }
 
-/// Starts the checkpoint's local worker stand-in. Replace only this constructor when the
-/// background capture process exposes its IPC endpoint.
-pub(crate) fn start_placeholder_worker<F>(emit: F) -> io::Result<WorkerClient>
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WorkerStopped;
+
+impl fmt::Display for WorkerStopped {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("capture worker has already stopped")
+    }
+}
+
+impl std::error::Error for WorkerStopped {}
+
+/// Starts a supervisor around the camera-owning thread. A startup fault remains
+/// inspectable through the tray and IPC until the user explicitly quits.
+pub(crate) fn start_capture_worker<F>(
+    options: WorkerOptions,
+    emit: F,
+) -> std::io::Result<WorkerClient>
 where
     F: Fn(WorkerEvent) + Send + 'static,
 {
-    let (commands, receiver) = mpsc::channel();
+    let control = AgentControl::new();
+    let monitor = AgentMonitor::new();
+    let stopped = Arc::new(AtomicBool::new(false));
+
+    let supervisor_control = control.clone();
+    let supervisor_monitor = monitor.clone();
+    let supervisor_stopped = Arc::clone(&stopped);
     thread::Builder::new()
-        .name("autopiercam-placeholder-worker".to_owned())
+        .name("autopiercam-supervisor".to_owned())
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                placeholder_worker(receiver, &emit);
+                supervise_camera(options, &supervisor_control, &supervisor_monitor, &emit);
             }));
             if result.is_err() {
-                emit(WorkerEvent::StatusChanged(WorkerStatus {
-                    paused: false,
-                    summary: "Capture worker failed".to_owned(),
-                }));
+                supervisor_monitor.report_fault("capture supervisor panicked");
+                emit(WorkerEvent::StatusChanged(supervisor_monitor.snapshot()));
             }
-            // Tao exits the process rather than returning from EventLoop::run. Always let the
-            // tray observe worker cleanup before it selects ControlFlow::Exit.
+            supervisor_stopped.store(true, Ordering::Release);
             emit(WorkerEvent::WorkerStopped);
         })?;
-    Ok(WorkerClient { commands })
+
+    Ok(WorkerClient {
+        control,
+        monitor,
+        stopped,
+    })
 }
 
-fn placeholder_worker<F>(commands: Receiver<TrayCommand>, emit: &F)
-where
+fn supervise_camera<F>(
+    options: WorkerOptions,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+    emit: &F,
+) where
     F: Fn(WorkerEvent),
 {
-    let mut paused = false;
-    emit_status(emit, paused, "Capture running (placeholder)");
+    let camera_control = control.clone();
+    let camera_monitor = monitor.clone();
+    let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+    let camera_thread = thread::Builder::new()
+        .name("autopiercam-camera".to_owned())
+        .spawn(move || {
+            let result = run_camera(options, &camera_control, &camera_monitor);
+            if let Err(error) = &result {
+                camera_monitor.report_fault(error.clone());
+            }
+            let _ = finished_tx.send(result);
+        });
 
-    while let Ok(command) = commands.recv() {
-        match command {
-            TrayCommand::SetPaused(value) => {
-                paused = value;
-                let summary = if paused {
-                    "Capture paused (placeholder)"
-                } else {
-                    "Capture running (placeholder)"
-                };
-                emit_status(emit, paused, summary);
-            }
-            TrayCommand::CaptureNow => {
-                emit_status(emit, paused, "Capture-now requested (placeholder)");
-            }
-            TrayCommand::Shutdown => {
-                emit_status(emit, paused, "Stopping capture worker");
-                break;
-            }
+    let camera_thread = match camera_thread {
+        Ok(handle) => handle,
+        Err(error) => {
+            monitor.report_fault(format!("failed to start camera thread: {error}"));
+            emit(WorkerEvent::StatusChanged(monitor.snapshot()));
+            wait_for_shutdown(control);
+            return;
         }
-    }
+    };
 
-    // The real worker closes the ASI camera and drains bounded artifact queues here.
+    let mut last_status = None;
+    let camera_result = loop {
+        let status = monitor.snapshot();
+        if last_status.as_ref() != Some(&status) {
+            emit(WorkerEvent::StatusChanged(status.clone()));
+            last_status = Some(status);
+        }
+
+        match finished_rx.try_recv() {
+            Ok(result) => break Some(result),
+            Err(TryRecvError::Disconnected) => break None,
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    if camera_thread.join().is_err() {
+        monitor.report_fault("camera owner thread panicked");
+    } else if let Some(Err(error)) = camera_result {
+        monitor.report_fault(error);
+    }
+    emit(WorkerEvent::StatusChanged(monitor.snapshot()));
+
+    if !control.is_shutdown() {
+        wait_for_shutdown(control);
+    }
+    monitor.mark_stopping();
+    emit(WorkerEvent::StatusChanged(monitor.snapshot()));
 }
 
-fn emit_status<F>(emit: &F, paused: bool, summary: &str)
-where
-    F: Fn(WorkerEvent),
-{
-    emit(WorkerEvent::StatusChanged(WorkerStatus {
-        paused,
-        summary: summary.to_owned(),
-    }));
+fn run_camera(
+    options: WorkerOptions,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+) -> Result<(), String> {
+    let sdk = match options.sdk_path {
+        Some(path) => Sdk::load(&path),
+        None => Sdk::load_default(),
+    }
+    .map(Arc::new)
+    .map_err(|error| format!("loading ZWO ASI SDK: {error}"))?;
+
+    run_agent_with_monitor(&sdk, &options.config_path, None, control, monitor)
+        .map_err(|error| format!("capture worker failed: {error:#}"))
+}
+
+fn wait_for_shutdown(control: &AgentControl) {
+    while !control.is_shutdown() {
+        thread::sleep(Duration::from_millis(100));
+    }
 }

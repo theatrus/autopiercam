@@ -7,6 +7,10 @@ rust-version.workspace = true
 description = "Windows notification-area host for AutoPierCam"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+autopiercam = { path = "../autopiercam" }
+autopiercam-asi = { path = "../autopiercam-asi" }
+autopiercam-protocol = { path = "../autopiercam-protocol" }
+clap.workspace = true
 tao = { version = "=0.34.4", default-features = false }
 tracing.workspace = true
 tracing-subscriber.workspace = true
