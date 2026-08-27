@@ -1,0 +1,31 @@
+[camera]
+# camera_id = 0
+# name_contains = "ASI676MC"
+bin = 1
+min_exposure_us = 100
+max_exposure_us = 5000000
+max_gain = 300
+target_brightness = 100
+settle_frames = 6
+
+[capture]
+directory = "captures"
+interval_ms = 10000
+jpeg_quality = 88
+writer_queue_capacity = 2
+keep_latest = true
+retention_days = 14
+
+[upload]
+enabled = false
+# endpoint = "https://example.test/camera/latest"
+# bearer_token_env = "AUTOPIERCAM_UPLOAD_TOKEN"
+queue_capacity = 32
+
+[video]
+enabled = false
+segment_seconds = 300
+frames_per_second = 4
+
+[api]
+listen = "127.0.0.1:4762"

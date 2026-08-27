@@ -1,0 +1,7 @@
+/target/
+/captures/
+/ASI_Camera_SDK/
+**/.DS_Store
+**/bin/
+**/obj/
+*.local.toml
