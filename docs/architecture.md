@@ -109,7 +109,8 @@ continuously. Consumers have independent policies:
   75. Replaced work increments the session's dropped-frame counter.
 - Stills: bounded scheduled queue; a missed deadline is observable.
 - Video: sample at configured output fps before conversion/encoding.
-- Upload: accepts only durable completed files, never a borrowed frame buffer.
+- Upload: a bounded nonblocking queue accepts only atomically published files,
+  never a borrowed frame buffer; one dedicated thread performs HTTP.
 
 No filesystem, HTTP, database, UI, or encoder operation runs on the camera
 thread.
@@ -145,16 +146,36 @@ added behind the same interface.
 
 Writers create a unique temporary file in the destination directory, explicitly
 flush and sync it, and atomically publish it without replacing an existing
-artifact. Only finalized artifacts enter the upload queue.
+artifact. Only then does the writer make a nonblocking attempt to enqueue its
+path for HTTP upload. A full queue leaves the file untouched and never delays
+the camera or still writer.
 
-Security video starts with an FFmpeg child process receiving sampled raw or RGB
-frames. It writes short H.264 Matroska segments because each completed segment
-is independently usable after a crash. A segment is finalized and validated
-before it is renamed and queued. Optional MP4 remuxing happens after close.
+The implemented uploader is best-effort and process-local. Its dedicated thread
+opens and streams the finalized file with `PUT` to the validated endpoint after
+standard URL normalization, explicit JPEG content type and length, filename and
+stable idempotency headers, and optional bearer authorization loaded from a
+named environment variable. It never appends a filename. Redirects are
+disabled. HTTPS uses the platform certificate verifier; bearer authentication
+requires HTTPS. Connect and total request timeouts are five and fifteen seconds.
 
-SQLite records artifacts, upload attempts, acknowledgements, retention, and
-stable idempotency keys. One thread owns database writes. Upload retries use
-bounded exponential backoff with jitter and never delay capture.
+Transport failures, HTTP 408/425/429, and 5xx responses retry with bounded
+deterministic jitter; numeric `Retry-After` seconds act as a capped lower bound.
+Other non-2xx responses are permanent for that in-memory intent. Retryable
+failures continue at the capped delay until success, a permanent response, or
+shutdown. Neither a permanent failure nor a full queue removes the local
+artifact. During shutdown, the active bounded request finishes, retry waits are
+interrupted, and queued in-memory intents are abandoned.
+
+Planned security video starts with an FFmpeg child process receiving sampled
+raw or RGB frames. It writes short H.264 Matroska segments because each
+completed segment is independently usable after a crash. A segment is finalized
+and validated before it is renamed and queued. Optional MP4 remuxing happens
+after close.
+
+The next upload milestone adds SQLite records for artifacts, attempts,
+acknowledgements, retention, and recovery after restart. One thread will own
+database writes. The current stable idempotency key makes retries safe but does
+not by itself make the process-local queue durable.
 
 Retention is enforced by both age and disk quota. When space is critically low,
 new recording pauses before it can fill the volume; an explicit health error is
@@ -178,9 +199,9 @@ process-wide sequence, and dropped-frame metadata describe resets, ordering,
 and producer loss; clearing an established session stream causes a bounded
 Viewer reconnect.
 
-Upload bearer material is never written into TOML. Configuration holds a
-credential reference or environment-variable name; packaged Windows builds
-will use Credential Manager or DPAPI.
+Upload bearer material is never written into TOML. Configuration names the
+environment variable from which the current worker loads it; packaged Windows
+builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
 
@@ -188,10 +209,13 @@ Ordered shutdown:
 
 1. Stop accepting work and set cancellation.
 2. Stop and close the camera on its owner thread.
-3. Close sink queues.
-4. Finish the current still and video segment.
-5. Commit database and upload checkpoints.
-6. Remove the tray icon and exit its event loop.
+3. Drain and close the still writer.
+4. Finish the active bounded HTTP request and abandon pending in-memory upload
+   intents.
+5. Close local IPC, remove the tray icon, and exit its event loop.
+
+Future durable video/upload work will also finalize the current video segment
+and commit database checkpoints before exit.
 
 The implemented startup path validates configuration, begins camera connection,
 and automatically retries startup or runtime faults. Future startup work will
@@ -214,4 +238,5 @@ auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
 real tray host, secured one-request protocol-v1 control, atomic revisioned
 configuration persistence, and restart application. Item 4 now has a live
 WinUI preview, status, capture-now, and configuration client; artifact browsing
-remains.
+remains. Item 6 has atomic still publication and a bounded best-effort HTTP
+uploader; durable SQLite recovery, acknowledgements, and retention remain.

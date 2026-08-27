@@ -17,9 +17,18 @@ keep_latest = true
 retention_days = 14
 
 [upload]
+# Upload starts only after a JPEG is flushed, synced, and atomically published.
+# The current queue is best-effort and process-local; files remain on disk when
+# the queue is full or delivery fails.
 enabled = false
+# PUT uses this endpoint after standard URL normalization; no filename is
+# appended and redirects are off.
+# Use HTTPS. Bearer authentication requires it.
 # endpoint = "https://example.test/camera/latest"
+# This is the name of an environment variable, not the token itself.
 # bearer_token_env = "AUTOPIERCAM_UPLOAD_TOKEN"
+# Enqueue is nonblocking; capacity must be positive. Pending entries are not
+# recovered after restart yet.
 queue_capacity = 32
 
 [video]

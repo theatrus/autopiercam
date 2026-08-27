@@ -22,6 +22,8 @@ The repository now contains a hardware-validated background capture slice:
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
 - a separate secured, outbound-only preview pipe backed by a bounded latest-frame
   producer;
+- a bounded best-effort HTTP worker that uploads atomically published JPEGs
+  without delaying capture;
 - atomic, content-revisioned configuration replacement through that pipe;
 - a buildable unpackaged WinUI 3 viewer that shows live status, requests an
   immediate capture, renders the latest JPEG preview, and edits the supported
@@ -62,6 +64,7 @@ camera driver is installed separately.
 - crates/autopiercam-tray: Windows notification-area host and named-pipe server.
 - apps/AutoPierCam.Viewer: unpackaged WinUI 3 status/settings application.
 - docs/architecture.md: target agent, UI, storage, video, and upload design.
+- docs/upload.md: implemented HTTP request, retry, and durability contract.
 - autopiercam.example.toml: initial configuration contract.
 
 ## Current hardware result
@@ -77,7 +80,11 @@ the configuration in the same tray process, and returned to capture without
 counter regression. It also verified stale-revision rejection, two distinct
 manual still requests, and the five-second bound imposed on an idle pipe
 client. The WinUI Viewer then saved the complete configuration, scheduled a
-camera restart, and refreshed back to the capturing state.
+camera restart, cleared its old preview, and recovered to a new live preview
+session without reopening. A loopback upload test then returned HTTP 503 with a
+three-second `Retry-After`; the agent retried the identical 2,211,675-byte JPEG,
+idempotency key, and SHA-256 before receiving HTTP 204 while capture remained
+healthy.
 
 ## Important constraints
 
@@ -86,6 +93,9 @@ camera restart, and refreshed back to the capturing state.
 - Frame reads always use checked buffer sizes and finite timeouts.
 - Slow writers, preview clients, encoders, and uploads may drop or queue their
   own work, but must never block the SDK drain loop.
+- HTTP upload is currently best-effort and process-local. A full queue or
+  permanent failure leaves the finalized JPEG on disk, but restart recovery and
+  acknowledged delivery require the planned durable SQLite queue.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
   off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.
@@ -96,5 +106,6 @@ camera restart, and refreshed back to the capturing state.
 - The Viewer renders the live preview and marks it stale after five seconds
   without a new frame. Its camera selector remains read-only. Max exposure,
   max gain, still interval, upload endpoint/enable, and video enable are backed
-  by versioned configuration replacement. HTTP upload and security video can
-  be configured but remain designed seams rather than active sinks.
+  by versioned configuration replacement. HTTP JPEG upload is active with the
+  best-effort limits above; security video remains a designed seam rather than
+  an active sink.
