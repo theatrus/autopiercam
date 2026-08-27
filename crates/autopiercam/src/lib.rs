@@ -4,7 +4,7 @@ use autopiercam_asi::{
     ImageType, Roi, Sdk,
 };
 use autopiercam_core::{
-    config::{CameraConfig, Config, UploadConfig},
+    config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
 use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera};
@@ -751,7 +751,8 @@ fn start_upload_worker(config: &UploadConfig) -> Result<Option<(UploadWorker, Up
         .endpoint
         .as_deref()
         .context("upload endpoint is missing despite validated configuration")?;
-    let endpoint = endpoint
+    let endpoint = normalize_upload_endpoint(endpoint)
+        .context("normalizing validated upload endpoint")?
         .parse::<ureq::http::Uri>()
         .context("parsing validated upload endpoint")?;
     let authorization = config

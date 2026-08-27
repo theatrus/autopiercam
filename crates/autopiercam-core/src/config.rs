@@ -111,6 +111,13 @@ fn validate_upload_endpoint(endpoint: &str) -> Result<url::Url, ConfigError> {
     Ok(parsed)
 }
 
+/// Return the validated endpoint in the canonical ASCII form consumed by HTTP
+/// transports. This keeps configuration validation and runtime URI parsing on
+/// one URL grammar, including internationalized hosts and escaped paths.
+pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> {
+    Ok(validate_upload_endpoint(endpoint)?.into())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
@@ -273,6 +280,14 @@ mod tests {
 
         config.upload.endpoint = Some("https://example.test/camera/latest".to_owned());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn upload_endpoint_normalization_is_ascii_and_transport_safe() {
+        let normalized = normalize_upload_endpoint("https://例え.テスト/snow camera").unwrap();
+        assert!(normalized.is_ascii());
+        assert!(normalized.starts_with("https://xn--"));
+        assert!(normalized.ends_with("/snow%20camera"));
     }
 
     #[test]
