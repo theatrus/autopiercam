@@ -48,13 +48,64 @@ impl Config {
                 "capture.writer_queue_capacity must be greater than zero",
             ));
         }
+        if self.upload.queue_capacity == 0 {
+            return Err(ConfigError::Validation(
+                "upload.queue_capacity must be greater than zero",
+            ));
+        }
         if self.upload.enabled && self.upload.endpoint.is_none() {
             return Err(ConfigError::Validation(
                 "upload.endpoint is required when upload.enabled is true",
             ));
         }
+        let upload_endpoint = self
+            .upload
+            .endpoint
+            .as_deref()
+            .map(validate_upload_endpoint)
+            .transpose()?;
+        if let Some(variable) = self.upload.bearer_token_env.as_deref() {
+            if variable.is_empty() || variable.trim() != variable || variable.contains(['=', '\0'])
+            {
+                return Err(ConfigError::Validation(
+                    "upload.bearer_token_env must be a valid nonblank environment-variable name",
+                ));
+            }
+            if upload_endpoint.is_some_and(|endpoint| endpoint.scheme() != "https") {
+                return Err(ConfigError::Validation(
+                    "upload bearer authentication requires an HTTPS endpoint",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_upload_endpoint(endpoint: &str) -> Result<url::Url, ConfigError> {
+    if endpoint.is_empty() || endpoint.trim() != endpoint {
+        return Err(ConfigError::Validation(
+            "upload.endpoint must be a nonblank absolute HTTP or HTTPS URL",
+        ));
+    }
+    let parsed = url::Url::parse(endpoint).map_err(|_| {
+        ConfigError::Validation("upload.endpoint must be a nonblank absolute HTTP or HTTPS URL")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(ConfigError::Validation(
+            "upload.endpoint must be a nonblank absolute HTTP or HTTPS URL",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::Validation(
+            "upload.endpoint must not contain embedded credentials",
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(ConfigError::Validation(
+            "upload.endpoint must not contain a URL fragment",
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -199,6 +250,43 @@ mod tests {
     fn uncharacterized_color_binning_is_rejected() {
         let mut config = Config::default();
         config.camera.bin = 2;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_upload_requires_a_bounded_http_endpoint() {
+        let mut config = Config::default();
+        config.upload.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.upload.endpoint = Some("ftp://example.test/frame.jpg".to_owned());
+        assert!(config.validate().is_err());
+
+        config.upload.endpoint = Some("https://example.test/camera/latest#secret".to_owned());
+        assert!(config.validate().is_err());
+
+        config.upload.endpoint = Some("https://user:secret@example.test/camera/latest".to_owned());
+        assert!(config.validate().is_err());
+
+        config.upload.endpoint = Some("https://example.test/camera/latest".to_owned());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn upload_queue_and_bearer_reference_are_validated() {
+        let mut config = Config::default();
+        config.upload.queue_capacity = 0;
+        assert!(config.validate().is_err());
+
+        config.upload.queue_capacity = 1;
+        config.upload.endpoint = Some("https://example.test/camera/latest".to_owned());
+        config.upload.bearer_token_env = Some(" AUTOPIERCAM_TOKEN".to_owned());
+        assert!(config.validate().is_err());
+
+        config.upload.bearer_token_env = Some("AUTOPIERCAM_TOKEN".to_owned());
+        config.validate().unwrap();
+
+        config.upload.endpoint = Some("http://127.0.0.1:4762/camera/latest".to_owned());
         assert!(config.validate().is_err());
     }
 }

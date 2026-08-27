@@ -27,6 +27,8 @@ tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "time"] }
 toml = "0.9.8"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+ureq = { version = "3.4.0", default-features = false, features = ["platform-verifier", "rustls"] }
+url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
