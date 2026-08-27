@@ -118,8 +118,11 @@ impl AgentMonitor {
         }
     }
 
-    fn reset(&self) {
-        *self.write() = AgentStatus::new(AgentState::Starting);
+    fn begin_attempt(&self) {
+        let mut status = self.write();
+        status.state = AgentState::Starting;
+        status.camera = None;
+        status.last_error = None;
     }
 
     fn set_camera(&self, info: &CameraInfo) {
@@ -320,7 +323,7 @@ pub fn run_agent_with_monitor(
     control: &AgentControl,
     monitor: &AgentMonitor,
 ) -> Result<()> {
-    monitor.reset();
+    monitor.begin_attempt();
     let result = run_agent_inner(sdk, config_path, max_frames, control, monitor);
     match &result {
         Ok(()) => monitor.set_state(AgentState::Idle),
@@ -984,6 +987,19 @@ mod tests {
         assert_eq!(status.frames_captured, 1);
         assert_eq!(status.frames_saved, 1);
         assert_eq!(status.last_artifact.as_deref(), Some("captures/test.jpg"));
+
+        monitor.report_fault("camera disconnected");
+        monitor.begin_attempt();
+        let retry_status = monitor.snapshot();
+        assert_eq!(retry_status.state, AgentState::Starting);
+        assert!(retry_status.camera.is_none());
+        assert!(retry_status.last_error.is_none());
+        assert_eq!(retry_status.frames_captured, 1);
+        assert_eq!(retry_status.frames_saved, 1);
+        assert_eq!(
+            retry_status.last_artifact.as_deref(),
+            Some("captures/test.jpg")
+        );
     }
 
     #[test]
