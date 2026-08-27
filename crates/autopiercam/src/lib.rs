@@ -403,6 +403,10 @@ fn run_agent_inner(
         bail!("--max-frames must be greater than zero");
     }
     let config = Config::load(config_path)?;
+    let (upload_worker, upload_sink) = match start_upload_worker(&config.upload)? {
+        Some((worker, sink)) => (Some(worker), Some(sink)),
+        None => (None, None),
+    };
     let info = select_configured_camera(sdk, &config.camera)?;
     monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
@@ -447,10 +451,6 @@ fn run_agent_inner(
     std::fs::create_dir_all(&capture_directory)
         .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
 
-    let (upload_worker, upload_sink) = match start_upload_worker(&config.upload)? {
-        Some((worker, sink)) => (Some(worker), Some(sink)),
-        None => (None, None),
-    };
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
