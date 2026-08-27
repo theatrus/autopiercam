@@ -26,6 +26,53 @@ use tracing::{info, warn};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Thread-safe controls shared by the tray, local IPC server, and camera owner.
+///
+/// The camera loop deliberately polls atomics instead of receiving commands on
+/// a blocking channel: an IPC thread can request shutdown even while the SDK is
+/// in a bounded frame wait or automatic-exposure settling pass.
+#[derive(Clone, Debug, Default)]
+pub struct AgentControl {
+    shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    capture_generation: Arc<AtomicU64>,
+}
+
+impl AgentControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Queue one still from the next available frame, including while paused.
+    pub fn capture_now(&self) {
+        self.capture_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    fn capture_generation(&self) -> u64 {
+        self.capture_generation.load(Ordering::Acquire)
+    }
+}
+
 pub fn list_cameras(sdk: &Arc<Sdk>, as_json: bool) -> Result<()> {
     let cameras = sdk.cameras()?;
     if as_json {
@@ -165,6 +212,22 @@ struct AutoLimits {
 }
 
 pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) -> Result<()> {
+    let control = AgentControl::new();
+    let handler_control = control.clone();
+    ctrlc::set_handler(move || handler_control.shutdown()).context("installing Ctrl-C handler")?;
+    run_agent_with_control(sdk, config_path, max_frames, &control)
+}
+
+/// Run the camera-owning worker with controls supplied by a tray or host.
+///
+/// Unlike [`run_agent`], this function does not install a process-wide Ctrl-C
+/// handler, so GUI hosts can own their shutdown policy and event loop.
+pub fn run_agent_with_control(
+    sdk: &Arc<Sdk>,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+) -> Result<()> {
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
     }
@@ -212,11 +275,6 @@ pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) ->
     std::fs::create_dir_all(&capture_directory)
         .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let handler_shutdown = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || handler_shutdown.store(true, Ordering::SeqCst))
-        .context("installing Ctrl-C handler")?;
-
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
@@ -238,7 +296,7 @@ pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) ->
         &config,
         &capture_directory,
         max_frames,
-        &shutdown,
+        control,
         &writer_tx,
     );
     drop(writer_tx);
@@ -259,7 +317,7 @@ fn capture_loop(
     config: &Config,
     capture_directory: &Path,
     max_frames: Option<u64>,
-    shutdown: &AtomicBool,
+    control: &AgentControl,
     writer: &SyncSender<CaptureJob>,
 ) -> Result<()> {
     camera.start_video()?;
@@ -270,7 +328,7 @@ fn capture_loop(
             config.camera.settle_frames,
             auto_limits,
             &mut frame_buffer,
-            Some(shutdown),
+            Some(control),
         )?
         .is_none()
         {
@@ -279,8 +337,9 @@ fn capture_loop(
         let interval = Duration::from_millis(config.capture.interval_ms);
         let mut next_capture = Instant::now();
         let mut queued = 0_u64;
+        let mut seen_capture_generation = control.capture_generation();
 
-        while !shutdown.load(Ordering::Relaxed) {
+        while !control.is_shutdown() {
             let exposure_us = camera
                 .control_value(ControlType::EXPOSURE)
                 .map(|value| value.value)
@@ -291,12 +350,16 @@ fn capture_loop(
                 Err(error) if error.is_timeout() => continue,
                 Err(error) => return Err(error.into()),
             };
-            if shutdown.load(Ordering::Relaxed) {
+            if control.is_shutdown() {
                 break;
             }
 
             let now = Instant::now();
-            if now < next_capture {
+            let capture_generation = control.capture_generation();
+            let capture_requested = capture_generation != seen_capture_generation;
+            seen_capture_generation = capture_generation;
+            let periodic_capture_due = !control.is_paused() && now >= next_capture;
+            if !capture_requested && !periodic_capture_due {
                 continue;
             }
             let output = capture_directory.join(capture_filename(queued));
@@ -321,7 +384,9 @@ fn capture_loop(
                     bail!("still writer stopped unexpectedly");
                 }
             }
-            next_capture = now + interval;
+            if periodic_capture_due {
+                next_capture = now + interval;
+            }
             if max_frames.is_some_and(|limit| queued >= limit) {
                 break;
             }
@@ -337,7 +402,7 @@ fn wait_for_auto_settle(
     minimum_frames: u32,
     limits: AutoLimits,
     frame_buffer: &mut Vec<u8>,
-    shutdown: Option<&AtomicBool>,
+    control: Option<&AgentControl>,
 ) -> Result<Option<FrameMeta>> {
     let max_exposure_us = u64::try_from(limits.max_exposure_us.max(1)).unwrap_or(u64::MAX / 8);
     let overall_limit = Duration::from_micros(max_exposure_us.saturating_mul(4))
@@ -349,7 +414,7 @@ fn wait_for_auto_settle(
     let mut received = 0_u32;
 
     loop {
-        if shutdown.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if control.is_some_and(AgentControl::is_shutdown) {
             return Ok(None);
         }
         let wait_exposure = camera
@@ -360,14 +425,14 @@ fn wait_for_auto_settle(
         let meta = match camera.next_video_frame_into(frame_buffer, timeout_ms) {
             Ok(meta) => meta,
             Err(error) if error.is_timeout() && started.elapsed() < overall_limit => {
-                if shutdown.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                if control.is_some_and(AgentControl::is_shutdown) {
                     return Ok(None);
                 }
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
-        if shutdown.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if control.is_some_and(AgentControl::is_shutdown) {
             return Ok(None);
         }
         received = received.saturating_add(1);
@@ -749,6 +814,26 @@ fn camera_json(camera: &CameraInfo) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_control_tracks_pause_capture_and_shutdown_requests() {
+        let control = AgentControl::new();
+        let worker_view = control.clone();
+
+        assert!(!worker_view.is_paused());
+        control.pause();
+        assert!(worker_view.is_paused());
+        control.resume();
+        assert!(!worker_view.is_paused());
+
+        let generation = worker_view.capture_generation();
+        control.capture_now();
+        assert_ne!(worker_view.capture_generation(), generation);
+
+        assert!(!worker_view.is_shutdown());
+        control.shutdown();
+        assert!(worker_view.is_shutdown());
+    }
 
     #[test]
     fn artifact_publish_is_atomic_and_never_overwrites() {
