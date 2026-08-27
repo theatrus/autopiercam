@@ -14,6 +14,7 @@ use tray_icon::{
 
 use crate::{
     Options,
+    ipc::ControlServer,
     worker::{TrayCommand, WorkerEvent, WorkerOptions, start_capture_worker},
 };
 
@@ -52,8 +53,18 @@ pub(crate) fn run(options: Options) {
             return;
         }
     };
-    let _agent_monitor = worker.monitor();
-    let _agent_control = worker.control();
+    let agent_monitor = worker.monitor();
+    let agent_control = worker.control();
+    let mut control_server = match ControlServer::start(agent_control.clone(), agent_monitor) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            error!(%error, "failed to start the local control pipe");
+            // Failure often means another tray instance owns the well-known
+            // first pipe. Do not leave a second camera owner running headless.
+            agent_control.shutdown();
+            None
+        }
+    };
 
     let menu = Menu::new();
     let open_viewer = MenuItem::new("Open viewer", true, None);
@@ -147,6 +158,11 @@ pub(crate) fn run(options: Options) {
             }
             Event::UserEvent(UserEvent::Worker(WorkerEvent::WorkerStopped)) => {
                 info!("capture worker stopped; exiting tray process");
+                if let Some(mut server) = control_server.take()
+                    && let Err(error) = server.stop_and_join()
+                {
+                    error!(%error, "failed to stop the local control pipe cleanly");
+                }
                 tray.take();
                 *control_flow = ControlFlow::Exit;
             }
