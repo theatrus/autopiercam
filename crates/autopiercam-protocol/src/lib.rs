@@ -208,6 +208,30 @@ impl AgentStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSnapshot<T> {
+    pub revision: u64,
+    pub config: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigReplace<T> {
+    pub expected_revision: u64,
+    pub config: T,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigApplied {
+    pub revision: u64,
+    pub applied: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionConflictDetails {
+    pub expected_revision: u64,
+    pub current_revision: u64,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ValidationError {
     #[error("unsupported protocol version {found}; expected {expected}")]
@@ -554,5 +578,30 @@ mod tests {
         assert_eq!(encoded["result"]["camera"]["id"], 0);
         assert_eq!(encoded["result"]["frames_captured"], 42);
         assert!(encoded["result"].get("last_error").is_none());
+    }
+
+    #[test]
+    fn typed_configuration_messages_preserve_revision_contract() {
+        let replacement = ConfigReplace {
+            expected_revision: 41,
+            config: json!({"camera": {"bin": 1}}),
+        };
+        let payload = serde_json::to_value(&replacement).unwrap();
+        assert_eq!(payload["expected_revision"], 41);
+        assert_eq!(payload["config"]["camera"]["bin"], 1);
+
+        let applied = ConfigApplied {
+            revision: 42,
+            applied: true,
+        };
+        assert_eq!(
+            serde_json::to_value(applied).unwrap(),
+            json!({"revision": 42, "applied": true})
+        );
+        let conflict = RevisionConflictDetails {
+            expected_revision: 40,
+            current_revision: 41,
+        };
+        assert_eq!(conflict.current_revision, 41);
     }
 }
