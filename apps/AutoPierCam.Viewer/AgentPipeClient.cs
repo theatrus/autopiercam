@@ -473,7 +473,8 @@ internal sealed record AgentConfiguration
             if (string.IsNullOrWhiteSpace(bearerEnvironment) ||
                 bearerEnvironment.Trim() != bearerEnvironment ||
                 bearerEnvironment.Contains('=') ||
-                bearerEnvironment.Contains('\0'))
+                bearerEnvironment.Contains('\0') ||
+                bearerEnvironment.Any(char.IsControl))
             {
                 throw new AgentProtocolException(
                     $"{method} returned an invalid bearer-token environment reference.");
