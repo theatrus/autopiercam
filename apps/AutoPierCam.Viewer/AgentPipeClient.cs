@@ -439,10 +439,51 @@ internal sealed record AgentConfiguration
                 $"{method} returned invalid capture timing, JPEG quality, or writer capacity.");
         }
 
-        if (Upload.Enabled && string.IsNullOrWhiteSpace(Upload.Endpoint))
+        if (Upload.QueueCapacity == 0)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned a zero upload queue capacity.");
+        }
+
+        Uri? uploadEndpoint = null;
+        if (Upload.Endpoint is string endpoint)
+        {
+            if (string.IsNullOrWhiteSpace(endpoint) ||
+                endpoint.Trim() != endpoint ||
+                !Uri.TryCreate(endpoint, UriKind.Absolute, out uploadEndpoint) ||
+                (uploadEndpoint.Scheme != Uri.UriSchemeHttp &&
+                 uploadEndpoint.Scheme != Uri.UriSchemeHttps) ||
+                string.IsNullOrWhiteSpace(uploadEndpoint.Host) ||
+                uploadEndpoint.UserInfo.Length != 0 ||
+                uploadEndpoint.Fragment.Length != 0)
+            {
+                throw new AgentProtocolException(
+                    $"{method} returned an invalid upload endpoint.");
+            }
+        }
+
+        if (Upload.Enabled && uploadEndpoint is null)
         {
             throw new AgentProtocolException(
                 $"{method} enabled upload without an endpoint.");
+        }
+
+        if (Upload.BearerTokenEnvironment is string bearerEnvironment)
+        {
+            if (string.IsNullOrWhiteSpace(bearerEnvironment) ||
+                bearerEnvironment.Trim() != bearerEnvironment ||
+                bearerEnvironment.Contains('=') ||
+                bearerEnvironment.Contains('\0'))
+            {
+                throw new AgentProtocolException(
+                    $"{method} returned an invalid bearer-token environment reference.");
+            }
+
+            if (uploadEndpoint is not null && uploadEndpoint.Scheme != Uri.UriSchemeHttps)
+            {
+                throw new AgentProtocolException(
+                    $"{method} configured bearer authentication over a non-HTTPS upload endpoint.");
+            }
         }
     }
 }

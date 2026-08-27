@@ -508,21 +508,31 @@ public sealed partial class MainWindow : Window
         }
 
         string? endpoint = NormalizeOptionalText(UploadEndpointTextBox.Text);
-        if (UploadEnabledToggle.IsOn)
+        Uri? endpointUri = null;
+        if (endpoint is not null &&
+            (!Uri.TryCreate(endpoint, UriKind.Absolute, out endpointUri) ||
+             (endpointUri.Scheme != Uri.UriSchemeHttp &&
+              endpointUri.Scheme != Uri.UriSchemeHttps) ||
+             string.IsNullOrWhiteSpace(endpointUri.Host) ||
+             endpointUri.UserInfo.Length != 0 ||
+             endpointUri.Fragment.Length != 0))
         {
-            if (endpoint is null)
-            {
-                throw new UserInputException(
-                    "Upload endpoint is required when HTTP upload is enabled.");
-            }
+            throw new UserInputException(
+                "Upload endpoint must be an absolute HTTP or HTTPS URL without credentials or a fragment.");
+        }
 
-            if (!Uri.TryCreate(endpoint, UriKind.Absolute, out Uri? endpointUri) ||
-                (endpointUri.Scheme != Uri.UriSchemeHttp &&
-                 endpointUri.Scheme != Uri.UriSchemeHttps))
-            {
-                throw new UserInputException(
-                    "Upload endpoint must be an absolute HTTP or HTTPS URL.");
-            }
+        if (UploadEnabledToggle.IsOn && endpointUri is null)
+        {
+            throw new UserInputException(
+                "Upload endpoint is required when HTTP upload is enabled.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(original.Upload.BearerTokenEnvironment) &&
+            endpointUri is not null &&
+            endpointUri.Scheme != Uri.UriSchemeHttps)
+        {
+            throw new UserInputException(
+                "Bearer-authenticated uploads require an HTTPS endpoint.");
         }
 
         return original with
