@@ -16,6 +16,7 @@ use tray_icon::{
 use crate::{
     Options,
     ipc::ControlServer,
+    preview::PreviewServer,
     worker::{TrayCommand, WorkerEvent, WorkerOptions, start_capture_worker},
 };
 
@@ -76,6 +77,21 @@ pub(crate) fn run(options: Options) {
             return;
         }
     };
+    let mut preview_server = match PreviewServer::start(worker.preview()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            error!(%error, "failed to start the local preview pipe");
+            if let Some(mut server) = control_server.take()
+                && let Err(stop_error) = server.stop_and_join()
+            {
+                error!(%stop_error, "failed to stop the local control pipe after preview startup failure");
+            }
+            if let Err(shutdown_error) = worker.shutdown_and_join() {
+                error!(%shutdown_error, "failed to stop the capture worker after preview startup failure");
+            }
+            return;
+        }
+    };
 
     let menu = Menu::new();
     let open_viewer = MenuItem::new("Open viewer", true, None);
@@ -90,6 +106,11 @@ pub(crate) fn run(options: Options) {
         &quit,
     ]) {
         error!(%error, "failed to construct the tray menu");
+        if let Some(mut server) = preview_server.take()
+            && let Err(stop_error) = server.stop_and_join()
+        {
+            error!(%stop_error, "failed to stop the local preview pipe after menu failure");
+        }
         if let Some(mut server) = control_server.take()
             && let Err(stop_error) = server.stop_and_join()
         {
@@ -176,6 +197,11 @@ pub(crate) fn run(options: Options) {
             }
             Event::UserEvent(UserEvent::Worker(WorkerEvent::WorkerStopped)) => {
                 info!("capture worker stopped; exiting tray process");
+                if let Some(mut server) = preview_server.take()
+                    && let Err(error) = server.stop_and_join()
+                {
+                    error!(%error, "failed to stop the local preview pipe cleanly");
+                }
                 if let Some(mut server) = control_server.take()
                     && let Err(error) = server.stop_and_join()
                 {

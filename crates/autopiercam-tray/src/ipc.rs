@@ -79,7 +79,7 @@ impl ControlServer {
                 };
 
                 runtime.block_on(async move {
-                    let server = match create_current_user_pipe(true) {
+                    let server = match create_control_pipe(true) {
                         Ok(server) => server,
                         Err(error) => {
                             let _ = ready_tx.send(Err(error));
@@ -149,7 +149,7 @@ async fn serve(
         // Always publish the next instance before servicing this client. A
         // client can connect to it before ConnectNamedPipe is awaited, which
         // avoids a stale/broken connection between one-shot Viewer requests.
-        server = create_current_user_pipe(false)?;
+        server = create_control_pipe(false)?;
         let connection_result =
             serve_connection(&mut connected_client, worker, monitor, config_store, stop).await;
         drop(connected_client);
@@ -509,8 +509,32 @@ fn stopping_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "control server is stopping")
 }
 
-fn create_current_user_pipe(first_instance: bool) -> io::Result<NamedPipeServer> {
+fn create_control_pipe(first_instance: bool) -> io::Result<NamedPipeServer> {
     debug_assert_eq!(PIPE_NAME, "autopiercam-control-v1");
+    create_current_user_pipe(
+        CONTROL_PIPE_PATH,
+        first_instance,
+        PipeAccess::Duplex,
+        MAX_FRAME_SIZE as u32,
+        MAX_FRAME_SIZE as u32,
+        None,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipeAccess {
+    Duplex,
+    Outbound,
+}
+
+pub(crate) fn create_current_user_pipe(
+    path: &str,
+    first_instance: bool,
+    access: PipeAccess,
+    in_buffer_size: u32,
+    out_buffer_size: u32,
+    max_instances: Option<usize>,
+) -> io::Result<NamedPipeServer> {
     let descriptor = current_user_security_descriptor()?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
@@ -522,15 +546,21 @@ fn create_current_user_pipe(first_instance: bool) -> io::Result<NamedPipeServer>
     options
         .first_pipe_instance(first_instance)
         .reject_remote_clients(true)
-        .in_buffer_size(MAX_FRAME_SIZE as u32)
-        .out_buffer_size(MAX_FRAME_SIZE as u32);
+        .in_buffer_size(in_buffer_size)
+        .out_buffer_size(out_buffer_size);
+    if access == PipeAccess::Outbound {
+        options.access_inbound(false);
+    }
+    if let Some(max_instances) = max_instances {
+        options.max_instances(max_instances);
+    }
 
     // SAFETY: attributes and its LocalAlloc-owned descriptor remain valid for
     // the entire CreateNamedPipeW call. Windows copies the descriptor into the
     // new kernel object before this function returns.
     unsafe {
         options.create_with_security_attributes_raw(
-            CONTROL_PIPE_PATH,
+            path,
             (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
         )
     }

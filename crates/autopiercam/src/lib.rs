@@ -25,6 +25,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+mod preview;
+
+use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
+pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
+
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Thread-safe controls shared by the tray, local IPC server, and camera owner.
@@ -340,8 +345,38 @@ pub fn run_agent_with_monitor(
     control: &AgentControl,
     monitor: &AgentMonitor,
 ) -> Result<()> {
+    run_agent_with_optional_preview(sdk, config_path, max_frames, control, monitor, None)
+}
+
+/// Run the worker while publishing bounded, latest-only preview frames.
+pub fn run_agent_with_monitor_and_preview(
+    sdk: &Arc<Sdk>,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+    preview: &PreviewSession,
+) -> Result<()> {
+    run_agent_with_optional_preview(
+        sdk,
+        config_path,
+        max_frames,
+        control,
+        monitor,
+        Some(preview),
+    )
+}
+
+fn run_agent_with_optional_preview(
+    sdk: &Arc<Sdk>,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+    preview: Option<&PreviewSession>,
+) -> Result<()> {
     monitor.begin_attempt();
-    let result = run_agent_inner(sdk, config_path, max_frames, control, monitor);
+    let result = run_agent_inner(sdk, config_path, max_frames, control, monitor, preview);
     publish_attempt_result(&result, control, monitor);
     result
 }
@@ -360,6 +395,7 @@ fn run_agent_inner(
     max_frames: Option<u64>,
     control: &AgentControl,
     monitor: &AgentMonitor,
+    preview: Option<&PreviewSession>,
 ) -> Result<()> {
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
@@ -415,6 +451,8 @@ fn run_agent_inner(
         .name("autopiercam-writer".to_owned())
         .spawn(move || writer_loop(writer_rx, &writer_monitor))
         .context("starting still writer")?;
+    let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
+    let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
 
     info!(
         camera = %info.name,
@@ -434,14 +472,19 @@ fn run_agent_inner(
         control,
         monitor,
         &writer_tx,
+        preview_sink.as_ref(),
     );
     monitor.set_state(AgentState::Stopping);
     drop(writer_tx);
     let writer_result = writer
         .join()
-        .map_err(|_| anyhow!("still-writer thread panicked"))?;
+        .map_err(|_| anyhow!("still-writer thread panicked"));
+    let preview_result = preview_encoder
+        .map(PreviewEncoder::stop_and_join)
+        .unwrap_or(Ok(()));
     capture_result?;
-    writer_result?;
+    writer_result??;
+    preview_result?;
     info!("continuous capture worker stopped cleanly");
     Ok(())
 }
@@ -457,6 +500,7 @@ fn capture_loop(
     control: &AgentControl,
     monitor: &AgentMonitor,
     writer: &SyncSender<CaptureJob>,
+    preview: Option<&PreviewSink>,
 ) -> Result<()> {
     camera.start_video()?;
     let result = (|| {
@@ -482,6 +526,7 @@ fn capture_loop(
         });
         let interval = Duration::from_millis(config.capture.interval_ms);
         let mut next_capture = Instant::now();
+        let mut next_preview = Instant::now();
         let mut queued = 0_u64;
 
         while !control.is_shutdown() {
@@ -501,6 +546,26 @@ fn capture_loop(
             monitor.frame_captured(control.is_paused());
 
             let now = Instant::now();
+            if let Some(preview) = preview
+                && now >= next_preview
+            {
+                let gain = camera
+                    .control_value(ControlType::GAIN)
+                    .map(|value| value.value)
+                    .unwrap_or(0);
+                let captured_at_unix_ms = unix_time_millis();
+                let _ = preview.try_publish(|dropped_frames| PreviewJob {
+                    width: meta.width,
+                    height: meta.height,
+                    bayer,
+                    data: frame_buffer.clone(),
+                    captured_at_unix_ms,
+                    exposure_us,
+                    gain,
+                    dropped_frames,
+                });
+                next_preview = now + PREVIEW_INTERVAL;
+            }
             let capture_generation = control.capture_generation();
             let capture_requested = capture_generation != seen_capture_generation;
             if capture_requested {
@@ -696,6 +761,13 @@ fn capture_filename(sequence: u64) -> String {
         elapsed.as_secs(),
         elapsed.subsec_millis()
     )
+}
+
+fn unix_time_millis() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn select_camera(sdk: &Arc<Sdk>, camera_id: Option<i32>) -> Result<CameraInfo> {

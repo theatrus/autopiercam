@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use autopiercam::{AgentControl, AgentMonitor, run_agent_with_monitor};
+use autopiercam::{AgentControl, AgentMonitor, PreviewHub, run_agent_with_monitor_and_preview};
 use autopiercam_asi::Sdk;
 use autopiercam_protocol::{AgentState, AgentStatus};
 
@@ -49,6 +49,7 @@ pub(crate) enum WorkerEvent {
 pub(crate) struct WorkerClient {
     commands: Arc<Mutex<Sender<TrayCommand>>>,
     monitor: AgentMonitor,
+    preview: PreviewHub,
     signals: Arc<WorkerSignals>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -95,6 +96,10 @@ impl WorkerClient {
         self.monitor.clone()
     }
 
+    pub(crate) fn preview(&self) -> PreviewHub {
+        self.preview.clone()
+    }
+
     pub(crate) fn join(&self) -> std::io::Result<()> {
         let thread = self
             .thread
@@ -137,9 +142,11 @@ where
 {
     let (commands, receiver) = mpsc::channel();
     let monitor = AgentMonitor::new();
+    let preview = PreviewHub::new();
     let signals = Arc::new(WorkerSignals::default());
 
     let supervisor_monitor = monitor.clone();
+    let supervisor_preview = preview.clone();
     let supervisor_signals = Arc::clone(&signals);
     let thread = thread::Builder::new()
         .name("autopiercam-supervisor".to_owned())
@@ -151,6 +158,7 @@ where
                     receiver,
                     &supervisor_signals,
                     &supervisor_monitor,
+                    &supervisor_preview,
                     &emit,
                     &mut last_status,
                 );
@@ -169,6 +177,7 @@ where
     Ok(WorkerClient {
         commands: Arc::new(Mutex::new(commands)),
         monitor,
+        preview,
         signals,
         thread: Arc::new(Mutex::new(Some(thread))),
     })
@@ -179,6 +188,7 @@ fn supervise_camera<F>(
     commands: Receiver<TrayCommand>,
     signals: &WorkerSignals,
     monitor: &AgentMonitor,
+    preview: &PreviewHub,
     emit: &F,
     last_status: &mut Option<AgentStatus>,
 ) where
@@ -250,7 +260,7 @@ fn supervise_camera<F>(
             if signals.stopping.load(Ordering::Acquire) {
                 continue;
             }
-            match CameraSession::start(&options, monitor, intent.paused) {
+            match CameraSession::start(&options, monitor, preview, intent.paused) {
                 Ok(camera) => session = Some(camera),
                 Err(error) => {
                     monitor.report_fault(format!("failed to start camera thread: {error}"));
@@ -472,6 +482,7 @@ impl CameraSession {
     fn start(
         options: &WorkerOptions,
         monitor: &AgentMonitor,
+        preview: &PreviewHub,
         paused: bool,
     ) -> std::io::Result<Self> {
         let control = AgentControl::new();
@@ -481,10 +492,18 @@ impl CameraSession {
         let camera_options = options.clone();
         let camera_control = control.clone();
         let camera_monitor = monitor.clone();
+        let camera_preview = preview.clone();
         let started_capturing_generation = monitor.capturing_generation();
         let thread = thread::Builder::new()
             .name("autopiercam-camera".to_owned())
-            .spawn(move || run_camera(camera_options, &camera_control, &camera_monitor))?;
+            .spawn(move || {
+                run_camera(
+                    camera_options,
+                    &camera_control,
+                    &camera_monitor,
+                    &camera_preview,
+                )
+            })?;
         Ok(Self {
             control,
             thread: Some(thread),
@@ -617,7 +636,11 @@ fn run_camera(
     options: WorkerOptions,
     control: &AgentControl,
     monitor: &AgentMonitor,
+    preview: &PreviewHub,
 ) -> Result<(), String> {
+    // Starting an attempt clears any image from the previous camera session,
+    // even if SDK loading or enumeration fails before capture begins.
+    let preview_session = preview.begin_session();
     let sdk = match options.sdk_path {
         Some(path) => Sdk::load(&path),
         None => Sdk::load_default(),
@@ -625,8 +648,15 @@ fn run_camera(
     .map(Arc::new)
     .map_err(|error| format!("loading ZWO ASI SDK: {error}"))?;
 
-    run_agent_with_monitor(&sdk, &options.config_path, None, control, monitor)
-        .map_err(|error| format!("capture worker failed: {error:#}"))
+    run_agent_with_monitor_and_preview(
+        &sdk,
+        &options.config_path,
+        None,
+        control,
+        monitor,
+        &preview_session,
+    )
+    .map_err(|error| format!("capture worker failed: {error:#}"))
 }
 
 #[cfg(test)]
@@ -680,6 +710,7 @@ mod tests {
         let client = WorkerClient {
             commands: Arc::new(Mutex::new(sender)),
             monitor: AgentMonitor::new(),
+            preview: PreviewHub::new(),
             signals: Arc::new(WorkerSignals::default()),
             thread: Arc::new(Mutex::new(None)),
         };
@@ -697,6 +728,7 @@ mod tests {
         let client = WorkerClient {
             commands: Arc::new(Mutex::new(sender)),
             monitor: AgentMonitor::new(),
+            preview: PreviewHub::new(),
             signals: Arc::clone(&signals),
             thread: Arc::new(Mutex::new(None)),
         };

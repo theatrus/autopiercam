@@ -6,6 +6,8 @@
 #[cfg(target_os = "windows")]
 mod ipc;
 #[cfg(target_os = "windows")]
+mod preview;
+#[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 mod worker;
