@@ -18,6 +18,8 @@ use tracing::warn;
 const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_WAKE_CAPACITY: usize = 1;
+const MAX_RETENTION_ERROR_MESSAGES: usize = 8;
+const MAX_RETENTION_ERROR_MESSAGE_BYTES: usize = 1_024;
 
 pub(crate) type GeneratedFrameNameParser = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync + 'static>;
 pub(crate) type RetentionObserver = Arc<dyn Fn(RetentionTelemetry) + Send + Sync + 'static>;
@@ -291,9 +293,53 @@ impl RetentionTelemetry {
             } else {
                 RetentionPressure::CleanupNeeded
             },
-            error: Some(error.into()),
+            error: Some(bounded_error_message(error.into())),
         }
     }
+}
+
+#[derive(Default)]
+struct RetentionErrors {
+    messages: Vec<String>,
+    omitted: usize,
+}
+
+impl RetentionErrors {
+    fn push(&mut self, message: impl Into<String>) {
+        if self.messages.len() == MAX_RETENTION_ERROR_MESSAGES {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        self.messages.push(bounded_error_message(message.into()));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.omitted == 0
+    }
+
+    fn finish(mut self) -> Option<String> {
+        if self.omitted != 0 {
+            self.messages.push(format!(
+                "{} additional retention error(s) omitted",
+                self.omitted
+            ));
+        }
+        (!self.messages.is_empty()).then(|| self.messages.join("; "))
+    }
+}
+
+fn bounded_error_message(mut message: String) -> String {
+    if message.len() <= MAX_RETENTION_ERROR_MESSAGE_BYTES {
+        return message;
+    }
+    let suffix = "…";
+    let mut end = MAX_RETENTION_ERROR_MESSAGE_BYTES.saturating_sub(suffix.len());
+    while !message.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    message.truncate(end);
+    message.push_str(suffix);
+    message
 }
 
 /// Result from the platform deleter. `AlreadyAbsent` is safe but is not
@@ -471,30 +517,41 @@ fn system_available_bytes(_directory: &Path) -> io::Result<u64> {
 }
 
 #[cfg(windows)]
-fn system_delete_exact(
-    candidate: &RetentionCandidate,
-    expectation: RetentionAuthorization,
-) -> Result<ExactDeleteOutcome, RetentionDeleteError> {
+fn open_exact_delete_handle(path: &Path) -> io::Result<fs::File> {
     use std::fs::OpenOptions;
-    use std::io::Read;
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::fs::OpenOptionsExt;
 
-    use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE};
+    use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FileDispositionInfo, SetFileInformationByHandle,
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
 
     let mut options = OpenOptions::new();
     options
         .access_mode(GENERIC_READ | DELETE)
-        // Excluding FILE_SHARE_WRITE makes the identity check stable through
-        // the delete disposition. Existing upload readers that deny delete
-        // sharing also make this open fail safely.
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        // Deny both write and delete sharing so pathname replacement, rename,
+        // and deletion cannot race the identity check or disposition.
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let mut file = match options.open(&candidate.path) {
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn system_delete_exact(
+    candidate: &RetentionCandidate,
+    expectation: RetentionAuthorization,
+) -> Result<ExactDeleteOutcome, RetentionDeleteError> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FileDispositionInfo,
+        SetFileInformationByHandle,
+    };
+
+    let mut file = match open_exact_delete_handle(&candidate.path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ExactDeleteOutcome::AlreadyAbsent);
@@ -761,7 +818,7 @@ fn sweep_retention(
         );
     }
 
-    let mut errors = Vec::new();
+    let mut errors = RetentionErrors::default();
     if let Some(error) = free_space_error {
         errors.push(error);
     }
@@ -826,12 +883,20 @@ fn sweep_retention(
 
     let free_bytes = match platform.available_bytes(directory) {
         Ok(bytes) => Some(bytes),
+        Err(error) if policy.needs_free_space() => {
+            errors.push(format!(
+                "verifying free space for {} after retention failed: {error}",
+                directory.display()
+            ));
+            None
+        }
         Err(_) => initial_free_bytes.map(|bytes| bytes.saturating_add(reclaimed_bytes)),
     };
     let blocked_pressure = !quotas_satisfied(policy, managed_bytes, free_bytes);
+    let has_errors = !errors.is_empty();
     let pressure = if blocked_pressure {
         RetentionPressure::Blocked
-    } else if unresolved_deletions != 0 || (deletion_count == 0 && !errors.is_empty()) {
+    } else if unresolved_deletions != 0 || (deletion_count == 0 && has_errors) {
         RetentionPressure::CleanupNeeded
     } else {
         RetentionPressure::Ok
@@ -847,7 +912,7 @@ fn sweep_retention(
         reclaimed_bytes,
         blocked_pressure,
         pressure,
-        error: (!errors.is_empty()).then(|| errors.join("; ")),
+        error: errors.finish(),
     }
 }
 
@@ -970,6 +1035,10 @@ impl RetentionWorker {
         let thread = thread::Builder::new()
             .name("autopiercam-retention".to_owned())
             .spawn(move || {
+                let _stop_on_exit = RetentionStopOnDrop {
+                    stop: Arc::clone(&worker_stop),
+                    capture_suspended: Arc::clone(&worker_capture_suspended),
+                };
                 retention_loop(
                     wake_receiver,
                     &worker_stop,
@@ -983,8 +1052,6 @@ impl RetentionWorker {
                     observer.as_ref(),
                     sweep_interval,
                 );
-                worker_capture_suspended.store(true, Ordering::Release);
-                worker_stop.store(true, Ordering::Release);
             })
             .map_err(RetentionWorkerError::ThreadStart)?;
 
@@ -1028,6 +1095,18 @@ impl Drop for RetentionWorker {
     }
 }
 
+struct RetentionStopOnDrop {
+    stop: Arc<AtomicBool>,
+    capture_suspended: Arc<AtomicBool>,
+}
+
+impl Drop for RetentionStopOnDrop {
+    fn drop(&mut self) {
+        self.capture_suspended.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 fn publish_retention_telemetry(
     capture_suspended: &AtomicBool,
     observer: &dyn Fn(RetentionTelemetry),
@@ -1063,6 +1142,7 @@ fn retention_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+        let stopping_before_sweep = stop.load(Ordering::Acquire);
         publish_retention_telemetry(
             capture_suspended,
             observer,
@@ -1076,6 +1156,22 @@ fn retention_loop(
             ),
         );
         if stop.load(Ordering::Acquire) {
+            // A stop arriving during a sweep can follow the writer's final
+            // publication. Start one final inventory after that stop request.
+            if !stopping_before_sweep {
+                publish_retention_telemetry(
+                    capture_suspended,
+                    observer,
+                    sweep_retention(
+                        policy,
+                        directory,
+                        parse_generated_name,
+                        authority,
+                        platform,
+                        clock,
+                    ),
+                );
+            }
             break;
         }
     }
@@ -1084,7 +1180,7 @@ fn retention_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::AtomicU64};
 
     fn candidate(name: &str, captured_at_unix_ms: u64, bytes: u64) -> RetentionCandidate {
         RetentionCandidate {
@@ -1287,6 +1383,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingVerificationPlatform {
+        probes: AtomicU64,
+        deleted: Mutex<Vec<PathBuf>>,
+    }
+
+    impl RetentionPlatform for FailingVerificationPlatform {
+        fn available_bytes(&self, _directory: &Path) -> io::Result<u64> {
+            if self.probes.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(8)
+            } else {
+                Err(io::Error::other("injected post-delete probe failure"))
+            }
+        }
+
+        fn delete_exact(
+            &self,
+            candidate: &RetentionCandidate,
+            _expectation: RetentionAuthorization,
+        ) -> Result<ExactDeleteOutcome, RetentionDeleteError> {
+            self.deleted.lock().unwrap().push(candidate.path.clone());
+            Ok(ExactDeleteOutcome::Deleted)
+        }
+    }
+
     #[test]
     fn sweep_reports_reclaimed_and_protected_bytes() {
         let directory = tempfile::tempdir().unwrap();
@@ -1319,6 +1440,51 @@ mod tests {
             *platform.deleted.lock().unwrap(),
             vec![directory.path().join("frame-100.jpg")]
         );
+    }
+
+    #[test]
+    fn failed_post_delete_free_space_probe_stays_blocked() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("frame-100.jpg"), b"old").unwrap();
+        let platform = FailingVerificationPlatform {
+            probes: AtomicU64::new(0),
+            deleted: Mutex::new(Vec::new()),
+        };
+        let telemetry = sweep_retention(
+            RetentionPolicy {
+                min_free_bytes: Some(10),
+                ..policy()
+            },
+            directory.path(),
+            &parse_test_frame_name,
+            &LocalOnlyRetentionAuthority,
+            &platform,
+            &FixedClock(175),
+        );
+
+        assert_eq!(telemetry.reclaimed_file_count, 1);
+        assert_eq!(telemetry.free_bytes, None);
+        assert!(telemetry.blocked_pressure);
+        assert_eq!(telemetry.pressure, RetentionPressure::Blocked);
+        assert!(
+            telemetry
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("post-delete probe failure"))
+        );
+    }
+
+    #[test]
+    fn retention_errors_are_bounded_and_report_omissions() {
+        let mut errors = RetentionErrors::default();
+        for index in 0..20 {
+            errors.push(format!("error {index}: {}", "x".repeat(4_096)));
+        }
+        let error = errors.finish().unwrap();
+
+        assert!(error.len() < 10_000);
+        assert!(error.contains("12 additional retention error(s) omitted"));
+        assert!(error.contains('…'));
     }
 
     struct ProtectNewestAuthority;
@@ -1516,6 +1682,17 @@ mod tests {
             free_bytes: 1_000,
             deleted: Mutex::new(Vec::new()),
         });
+        let calls = Arc::new(AtomicU64::new(0));
+        let observer_calls = Arc::clone(&calls);
+        let (sweep_entered_sender, sweep_entered_receiver) = mpsc::channel();
+        let (release_sweep_sender, release_sweep_receiver) = mpsc::channel();
+        let release_sweep_receiver = Mutex::new(release_sweep_receiver);
+        let observer: RetentionObserver = Arc::new(move |_| {
+            if observer_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                sweep_entered_sender.send(()).unwrap();
+                release_sweep_receiver.lock().unwrap().recv().unwrap();
+            }
+        });
         let (worker, sink) = RetentionWorker::start_with_runtime(
             RetentionPolicy {
                 max_managed_bytes: Some(1),
@@ -1524,20 +1701,73 @@ mod tests {
             directory.path().to_path_buf(),
             Arc::new(parse_test_frame_name),
             Arc::new(LocalOnlyRetentionAuthority),
-            Arc::new(|_| {}),
+            observer,
             platform.clone(),
             Arc::new(FixedClock(300)),
             Duration::from_secs(60),
         )
         .unwrap();
+        assert_eq!(sink.try_wake(), RetentionWakeResult::Queued);
+        sweep_entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        // This artifact appears after the in-flight sweep's inventory. A stop
+        // requested now must force a new, post-stop inventory.
         let artifact = directory.path().join("frame-100.jpg");
         fs::write(&artifact, b"artifact").unwrap();
-        assert_eq!(sink.try_wake(), RetentionWakeResult::Queued);
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let stop_thread = thread::spawn(move || {
+            stopped_sender.send(worker.stop_and_join()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !sink.is_stopped() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        release_sweep_sender.send(()).unwrap();
 
-        worker.stop_and_join().unwrap();
+        stopped_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        stop_thread.join().unwrap();
 
         assert!(sink.is_stopped());
         assert_eq!(*platform.deleted.lock().unwrap(), [artifact]);
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn observer_panic_stops_and_suspends_retention_health() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let observer_calls = Arc::clone(&calls);
+        let observer: RetentionObserver = Arc::new(move |_| {
+            if observer_calls.fetch_add(1, Ordering::AcqRel) != 0 {
+                panic!("injected retention observer panic");
+            }
+        });
+        let (worker, sink) = RetentionWorker::start(
+            policy(),
+            directory.path().to_path_buf(),
+            Arc::new(parse_test_frame_name),
+            Arc::new(LocalOnlyRetentionAuthority),
+            observer,
+        )
+        .unwrap();
+        assert_eq!(sink.try_wake(), RetentionWakeResult::Queued);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !sink.is_stopped() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(sink.capture_suspended());
+        assert!(matches!(
+            worker.stop_and_join(),
+            Err(RetentionWorkerError::WorkerPanicked)
+        ));
     }
 
     #[test]
@@ -1564,6 +1794,22 @@ mod tests {
 
         assert!(sink.capture_suspended());
         worker.stop_and_join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_delete_handle_fences_path_rename_until_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frame-100.jpg");
+        let renamed = directory.path().join("frame-101.jpg");
+        fs::write(&path, b"artifact").unwrap();
+        let file = open_exact_delete_handle(&path).unwrap();
+
+        assert!(fs::rename(&path, &renamed).is_err());
+        assert!(path.exists());
+        drop(file);
+        fs::rename(&path, &renamed).unwrap();
+        assert!(renamed.exists());
     }
 
     #[cfg(windows)]
