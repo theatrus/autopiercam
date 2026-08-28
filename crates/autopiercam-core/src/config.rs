@@ -48,6 +48,16 @@ impl Config {
                 "capture.writer_queue_capacity must be greater than zero",
             ));
         }
+        if self.capture.retention_max_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "capture.retention_max_bytes must be greater than zero when set",
+            ));
+        }
+        if self.capture.retention_min_free_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "capture.retention_min_free_bytes must be greater than zero when set",
+            ));
+        }
         if self.upload.queue_capacity == 0 {
             return Err(ConfigError::Validation(
                 "upload.queue_capacity must be greater than zero",
@@ -158,6 +168,11 @@ pub struct CaptureConfig {
     pub jpeg_quality: u8,
     pub writer_queue_capacity: usize,
     pub keep_latest: bool,
+    /// Maximum managed capture bytes to retain. `None` disables this limit.
+    pub retention_max_bytes: Option<u64>,
+    /// Minimum free bytes to preserve on the capture volume. `None` disables this limit.
+    pub retention_min_free_bytes: Option<u64>,
+    /// Maximum capture age in days. Zero disables age-based deletion.
     pub retention_days: u32,
 }
 
@@ -169,6 +184,8 @@ impl Default for CaptureConfig {
             jpeg_quality: 88,
             writer_queue_capacity: 2,
             keep_latest: true,
+            retention_max_bytes: None,
+            retention_min_free_bytes: None,
             retention_days: 14,
         }
     }
@@ -247,7 +264,65 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        Config::default().validate().unwrap();
+        let config = Config::default();
+        config.validate().unwrap();
+        assert_eq!(config.capture.retention_max_bytes, None);
+        assert_eq!(config.capture.retention_min_free_bytes, None);
+    }
+
+    #[test]
+    fn retention_limits_round_trip_and_zero_days_disable_the_age_rule() {
+        let mut config = Config::default();
+        config.capture.retention_days = 0;
+        config.capture.retention_max_bytes = Some(50_000_000_000);
+        config.capture.retention_min_free_bytes = Some(5_000_000_000);
+        config.validate().unwrap();
+
+        let serialized = toml::to_string(&config).unwrap();
+        let round_trip: Config = toml::from_str(&serialized).unwrap();
+        round_trip.validate().unwrap();
+        assert_eq!(round_trip.capture.retention_days, 0);
+        assert_eq!(round_trip.capture.retention_max_bytes, Some(50_000_000_000));
+        assert_eq!(
+            round_trip.capture.retention_min_free_bytes,
+            Some(5_000_000_000)
+        );
+    }
+
+    #[test]
+    fn omitted_retention_byte_limits_default_to_none() {
+        let config: Config = toml::from_str(
+            r#"
+            [capture]
+            retention_days = 0
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.capture.retention_days, 0);
+        assert_eq!(config.capture.retention_max_bytes, None);
+        assert_eq!(config.capture.retention_min_free_bytes, None);
+    }
+
+    #[test]
+    fn zero_retention_byte_limits_are_rejected() {
+        let mut config = Config::default();
+        config.capture.retention_max_bytes = Some(0);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation(
+                "capture.retention_max_bytes must be greater than zero when set"
+            ))
+        ));
+
+        config.capture.retention_max_bytes = Some(1);
+        config.capture.retention_min_free_bytes = Some(0);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation(
+                "capture.retention_min_free_bytes must be greater than zero when set"
+            ))
+        ));
     }
 
     #[test]
