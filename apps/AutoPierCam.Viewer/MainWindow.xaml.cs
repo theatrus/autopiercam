@@ -17,6 +17,7 @@ public sealed partial class MainWindow : Window
     private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherQueueTimer _previewFreshnessTimer;
     private AgentConfigurationSnapshot? _configurationSnapshot;
+    private AgentStatus? _latestAgentStatus;
     private Task? _previewTask;
     private string _lastPreviewDetail = "Waiting for preview stream";
     private ulong _activePreviewConnectionEpoch;
@@ -373,7 +374,9 @@ public sealed partial class MainWindow : Window
             Revision = result.Revision,
             Config = updatedConfiguration,
         };
+        _latestAgentStatus = null;
         _configurationNeedsRefresh = false;
+        ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
         ConfigInfoBar.Title = $"Configuration revision {result.Revision:N0}";
         ConfigInfoBar.Message = "Saved; a camera restart was scheduled.";
         ConfigInfoBar.Severity = InfoBarSeverity.Success;
@@ -473,6 +476,7 @@ public sealed partial class MainWindow : Window
 
         _configurationSnapshot = snapshot;
         _configurationNeedsRefresh = false;
+        ApplyUploadActivity(_latestAgentStatus?.Upload, configuration.Upload.Enabled);
         ConfigInfoBar.Title = $"Configuration revision {snapshot.Revision:N0}";
         ConfigInfoBar.Message =
             "Loaded from the capture agent. Hidden settings are preserved when saving.";
@@ -584,6 +588,11 @@ public sealed partial class MainWindow : Window
             : $"Last artifact: {Compact(status.LastArtifact)}";
         AgentConnectionText.Text =
             $"Rust agent: connected · {PipeDisplayName}";
+        _latestAgentStatus = status;
+        bool? uploadEnabled = _configurationNeedsRefresh
+            ? null
+            : _configurationSnapshot?.Config.Upload.Enabled;
+        ApplyUploadActivity(status.Upload, uploadEnabled);
 
         CameraComboBox.Items.Clear();
         if (status.Camera is null)
@@ -631,6 +640,7 @@ public sealed partial class MainWindow : Window
         LastArtifactText.Text = "Last artifact: unavailable while offline";
         AgentLastErrorText.Text = "Start or restart the local capture agent and select Refresh.";
         AgentLastErrorText.Visibility = Visibility.Visible;
+        ClearUploadActivity("Unavailable", "Reconnect and refresh to load upload activity.");
         CameraComboBox.Items.Clear();
         CameraComboBox.SelectedIndex = -1;
         CameraComboBox.PlaceholderText = "Agent offline";
@@ -654,6 +664,7 @@ public sealed partial class MainWindow : Window
         AgentLastErrorText.Text =
             "The request may have completed. Refresh status before sending another capture request.";
         AgentLastErrorText.Visibility = Visibility.Visible;
+        ClearUploadActivity("Unavailable", "Refresh to confirm current upload activity.");
         ConfigInfoBar.Title = "Refresh required";
         ConfigInfoBar.Message =
             "The timed-out request may have changed agent state. Refresh before saving configuration.";
@@ -671,6 +682,7 @@ public sealed partial class MainWindow : Window
         AgentConnectionText.Text = "Rust agent: connected, request failed";
         AgentLastErrorText.Text = Compact(detail);
         AgentLastErrorText.Visibility = Visibility.Visible;
+        ClearUploadActivity("Unavailable", "Refresh to reload upload activity after the request error.");
     }
 
     private void ShowRevisionConflict(AgentRequestException exception)
@@ -692,6 +704,7 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Severity = InfoBarSeverity.Error;
         AgentLastErrorText.Text = message;
         AgentLastErrorText.Visibility = Visibility.Visible;
+        ClearUploadActivity("Unavailable", "Refresh to reload upload activity after the revision conflict.");
     }
 
     private void ShowSavedWithoutRestart(AgentRequestException exception)
@@ -710,6 +723,7 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Severity = InfoBarSeverity.Warning;
         AgentLastErrorText.Text = Compact(message);
         AgentLastErrorText.Visibility = Visibility.Visible;
+        ClearUploadActivity("Unavailable", "Refresh after restarting to load upload activity.");
     }
 
     private void ShowConfigurationValidationFailure(string detail)
@@ -724,6 +738,75 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Title = "Check configuration values";
         ConfigInfoBar.Message = message;
         ConfigInfoBar.Severity = InfoBarSeverity.Error;
+        ClearUploadActivity("Unavailable", "Refresh to reload upload activity after correcting the settings.");
+    }
+
+    private void ApplyUploadActivity(AgentUploadStatus? upload, bool? uploadEnabled)
+    {
+        if (upload is null)
+        {
+            if (uploadEnabled == false)
+            {
+                SetUploadActivityUnavailable(
+                    "Disabled",
+                    "HTTP upload is disabled in the current configuration.");
+            }
+            else
+            {
+                string detail = uploadEnabled == true
+                    ? "HTTP upload is enabled, but this agent reported no activity telemetry."
+                    : "No upload activity telemetry is available.";
+                SetUploadActivityUnavailable("Unavailable", detail);
+            }
+
+            return;
+        }
+
+        UploadActivityStateText.Text = upload.Active switch
+        {
+            0 => "No active transfer",
+            1 => "1 active transfer",
+            _ => $"{upload.Active:N0} active transfers",
+        };
+        UploadActivityCountsText.Text =
+            $"{upload.Pending:N0} pending · {upload.Retrying:N0} retrying";
+        UploadActivityTotalsText.Text =
+            $"{upload.Completed:N0} completed · {upload.PermanentlyFailed:N0} permanently failed";
+        UploadActivityTotalsText.Visibility = Visibility.Visible;
+
+        UploadLastSuccessText.Text = upload.LastSuccessUnixMs is ulong lastSuccess
+            ? $"Latest success: {FormatUnixTimeMilliseconds(lastSuccess)}"
+            : "Latest success: none";
+        UploadLastSuccessText.Visibility = Visibility.Visible;
+
+        string failureTime = upload.LastFailureUnixMs is ulong lastFailure
+            ? FormatUnixTimeMilliseconds(lastFailure)
+            : "none";
+        string? lastError = string.IsNullOrWhiteSpace(upload.LastError)
+            ? null
+            : Compact(upload.LastError);
+        UploadLastFailureText.Text = lastError is null
+            ? $"Last failure: {failureTime}"
+            : $"Last failure: {failureTime} · {lastError}";
+        UploadLastFailureText.Visibility = Visibility.Visible;
+    }
+
+    private void ClearUploadActivity(string state, string detail)
+    {
+        _latestAgentStatus = null;
+        SetUploadActivityUnavailable(state, detail);
+    }
+
+    private void SetUploadActivityUnavailable(string state, string detail)
+    {
+        UploadActivityStateText.Text = state;
+        UploadActivityCountsText.Text = detail;
+        UploadActivityTotalsText.Text = string.Empty;
+        UploadActivityTotalsText.Visibility = Visibility.Collapsed;
+        UploadLastSuccessText.Text = string.Empty;
+        UploadLastSuccessText.Visibility = Visibility.Collapsed;
+        UploadLastFailureText.Text = string.Empty;
+        UploadLastFailureText.Visibility = Visibility.Collapsed;
     }
 
     private void SetControlsForOperation(bool inProgress)
@@ -832,21 +915,30 @@ public sealed partial class MainWindow : Window
 
     private static string FormatCaptureTime(ulong capturedAtUnixMs)
     {
-        if (capturedAtUnixMs > long.MaxValue)
+        return FormatUnixTimeMilliseconds(capturedAtUnixMs, "Unknown capture time");
+    }
+
+    private static string FormatUnixTimeMilliseconds(
+        ulong unixTimeMilliseconds,
+        string invalidValue = "Invalid timestamp")
+    {
+        ulong maxUnixTimeMilliseconds =
+            (ulong)DateTimeOffset.MaxValue.ToUnixTimeMilliseconds();
+        if (unixTimeMilliseconds > maxUnixTimeMilliseconds)
         {
-            return "Unknown capture time";
+            return invalidValue;
         }
 
         try
         {
             return DateTimeOffset
-                .FromUnixTimeMilliseconds((long)capturedAtUnixMs)
+                .FromUnixTimeMilliseconds((long)unixTimeMilliseconds)
                 .ToLocalTime()
                 .ToString("G");
         }
         catch (ArgumentOutOfRangeException)
         {
-            return "Unknown capture time";
+            return invalidValue;
         }
     }
 

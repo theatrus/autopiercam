@@ -193,6 +193,39 @@
                                 Visibility="Collapsed" />
                         </StackPanel>
                     </Border>
+                    <Border Padding="12" Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="4">
+                            <TextBlock
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Upload activity" />
+                            <TextBlock
+                                x:Name="UploadActivityStateText"
+                                Text="Unavailable" />
+                            <TextBlock
+                                x:Name="UploadActivityCountsText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="No upload telemetry loaded"
+                                TextWrapping="Wrap" />
+                            <TextBlock
+                                x:Name="UploadActivityTotalsText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Visibility="Collapsed" />
+                            <TextBlock
+                                x:Name="UploadLastSuccessText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Visibility="Collapsed" />
+                            <TextBlock
+                                x:Name="UploadLastFailureText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                TextWrapping="Wrap"
+                                Visibility="Collapsed" />
+                        </StackPanel>
+                    </Border>
                     <Grid ColumnSpacing="10">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />

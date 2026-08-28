@@ -616,6 +616,9 @@ internal sealed record AgentStatus
 
     [JsonPropertyName("last_error")]
     public string? LastError { get; init; }
+
+    [JsonPropertyName("upload")]
+    public AgentUploadStatus? Upload { get; init; }
 }
 
 internal sealed record AgentCameraStatus
@@ -627,6 +630,38 @@ internal sealed record AgentCameraStatus
     [JsonPropertyName("name")]
     [JsonRequired]
     public string Name { get; init; } = string.Empty;
+}
+
+internal sealed record AgentUploadStatus
+{
+    [JsonPropertyName("pending")]
+    [JsonRequired]
+    public ulong Pending { get; init; }
+
+    [JsonPropertyName("active")]
+    [JsonRequired]
+    public ulong Active { get; init; }
+
+    [JsonPropertyName("retrying")]
+    [JsonRequired]
+    public ulong Retrying { get; init; }
+
+    [JsonPropertyName("completed")]
+    [JsonRequired]
+    public ulong Completed { get; init; }
+
+    [JsonPropertyName("permanently_failed")]
+    [JsonRequired]
+    public ulong PermanentlyFailed { get; init; }
+
+    [JsonPropertyName("last_success_unix_ms")]
+    public ulong? LastSuccessUnixMs { get; init; }
+
+    [JsonPropertyName("last_failure_unix_ms")]
+    public ulong? LastFailureUnixMs { get; init; }
+
+    [JsonPropertyName("last_error")]
+    public string? LastError { get; init; }
 }
 
 internal abstract class AgentClientException : Exception
