@@ -1407,7 +1407,10 @@ mod tests {
         assert_eq!(failed_job.last_error.as_deref(), Some(PERMANENT_HTTP_ERROR));
 
         worker.stop_and_join().unwrap();
-        manual_clock.set(41_000);
+        // Wall time can move backward between the failure and an operator
+        // action. The durable mutation must still have a representable,
+        // successful response rather than committing and returning an error.
+        manual_clock.set(30_000);
         let requeued = admin
             .requeue(&ProtocolUploadRequeueRequest {
                 ledger_id: failed.ledger_id.clone(),
@@ -1419,7 +1422,8 @@ mod tests {
         assert_eq!(requeued.job.state, UploadJobState::Pending);
         assert_eq!(requeued.job.job_revision, failed_job.job_revision + 1);
         assert_eq!(requeued.job.requeue_count, 1);
-        assert_eq!(requeued.job.last_requeued_at_unix_ms, Some(41_000));
+        assert_eq!(requeued.job.last_requeued_at_unix_ms, Some(30_000));
+        assert!(requeued.job.updated_at_unix_ms < requeued.job.created_at_unix_ms);
         assert_eq!(requeued.job.last_http_status, Some(400));
         assert_eq!(
             requeued.job.last_error.as_deref(),

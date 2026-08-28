@@ -399,37 +399,10 @@ impl UploadJobSummary {
             return Err(UploadAdminValidationError::ZeroJobRevision);
         }
         validate_upload_filename(&self.filename)?;
-        if self.updated_at_unix_ms < self.created_at_unix_ms {
-            return Err(UploadAdminValidationError::TimestampBeforeCreation(
-                "updated_at_unix_ms",
-            ));
-        }
-        validate_upload_history_timestamp(
-            "completed_at_unix_ms",
-            self.completed_at_unix_ms,
-            self.created_at_unix_ms,
-            self.updated_at_unix_ms,
-        )?;
-        validate_upload_history_timestamp(
-            "last_failure_at_unix_ms",
-            self.last_failure_at_unix_ms,
-            self.created_at_unix_ms,
-            self.updated_at_unix_ms,
-        )?;
-        validate_upload_history_timestamp(
-            "last_requeued_at_unix_ms",
-            self.last_requeued_at_unix_ms,
-            self.created_at_unix_ms,
-            self.updated_at_unix_ms,
-        )?;
-        if self
-            .next_attempt_at_unix_ms
-            .is_some_and(|next| next < self.updated_at_unix_ms)
-        {
-            return Err(UploadAdminValidationError::TimestampBeforeUpdate(
-                "next_attempt_at_unix_ms",
-            ));
-        }
+        // These are wall-clock observations, not a monotonic clock. NTP or an
+        // operator can move system time backward between durable mutations,
+        // so ordering relationships between otherwise valid timestamps must
+        // not make a committed job impossible to represent on the wire.
         if (self.state == UploadJobState::Retrying) != self.next_attempt_at_unix_ms.is_some() {
             return Err(UploadAdminValidationError::InvalidNextAttemptForState);
         }
@@ -550,12 +523,6 @@ pub enum UploadAdminValidationError {
     ZeroJobRevision,
     #[error("invalid upload filename: {0}")]
     InvalidFilename(String),
-    #[error("{0} must not be earlier than created_at_unix_ms")]
-    TimestampBeforeCreation(&'static str),
-    #[error("{0} must not be earlier than updated_at_unix_ms")]
-    TimestampBeforeUpdate(&'static str),
-    #[error("{0} must not be later than updated_at_unix_ms")]
-    TimestampAfterUpdate(&'static str),
     #[error("next_attempt_at_unix_ms must be present exactly for retrying jobs")]
     InvalidNextAttemptForState,
     #[error("completed_at_unix_ms must be present exactly for completed jobs")]
@@ -641,23 +608,6 @@ where
         Some(reason) => Err(error(format!("{field} {reason}"))),
         None => Ok(()),
     }
-}
-
-fn validate_upload_history_timestamp(
-    field: &'static str,
-    value: Option<u64>,
-    created_at_unix_ms: u64,
-    updated_at_unix_ms: u64,
-) -> Result<(), UploadAdminValidationError> {
-    if let Some(value) = value {
-        if value < created_at_unix_ms {
-            return Err(UploadAdminValidationError::TimestampBeforeCreation(field));
-        }
-        if value > updated_at_unix_ms {
-            return Err(UploadAdminValidationError::TimestampAfterUpdate(field));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1539,27 +1489,12 @@ mod tests {
     }
 
     #[test]
-    fn upload_job_summary_validation_enforces_state_and_timestamp_invariants() {
+    fn upload_job_summary_accepts_wall_clock_regressions_and_enforces_state_invariants() {
         let mut job = upload_job_summary();
         job.updated_at_unix_ms = job.created_at_unix_ms - 1;
-        assert!(matches!(
-            job.validate(),
-            Err(UploadAdminValidationError::TimestampBeforeCreation(
-                "updated_at_unix_ms"
-            ))
-        ));
-
-        job = upload_job_summary();
         job.last_failure_at_unix_ms = Some(job.created_at_unix_ms - 1);
-        assert!(job.validate().is_err());
-        job = upload_job_summary();
         job.last_requeued_at_unix_ms = Some(job.updated_at_unix_ms + 1);
-        assert!(matches!(
-            job.validate(),
-            Err(UploadAdminValidationError::TimestampAfterUpdate(
-                "last_requeued_at_unix_ms"
-            ))
-        ));
+        job.validate().unwrap();
 
         job = upload_job_summary();
         job.state = UploadJobState::Retrying;
