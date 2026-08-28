@@ -48,7 +48,8 @@ From a 64-bit Windows Rust toolchain:
     dotnet run --project apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj
 
 Offline upload-ledger maintenance does not load the camera SDK. Stop the agent
-first, then migrate an exact legacy v3 ledger (or verify v4) with:
+first—even when uploads are disabled—then migrate an exact legacy v3 ledger
+(or verify v4) with:
 
     cargo run --release -p autopiercam -- upload-ledger migrate --config autopiercam.toml
 

@@ -249,9 +249,10 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
 ## Offline ledger lifecycle
 
 Ledger maintenance is a camera-independent CLI path. Both commands dispatch
-before the ZWO SDK is loaded, but the tray/console agent must be stopped because
-the live store and maintenance commands take incompatible operating-system file
-leases:
+before the ZWO SDK is loaded, but the tray/console agent must be stopped. Every
+configured capture run holds a shared operating-system lifecycle lease through
+still-writer and retention shutdown, including when uploads are disabled;
+maintenance requires the incompatible exclusive lease:
 
     cargo run --release -p autopiercam -- upload-ledger migrate --config autopiercam.toml
     cargo run --release -p autopiercam -- upload-ledger archive --config autopiercam.toml --expected-ledger-id <32-lowercase-hex>
@@ -259,10 +260,14 @@ leases:
 `migrate` accepts only the exact released v3 schema or the exact current v4
 schema. An exact v3 ledger is transformed transactionally to v4, assigned a
 random immutable ledger ID, and given per-row delivery bindings and revisions.
-The complete v4 schema and derived fields are verified before that transaction
-can commit. V4 is a verified no-op that prints its existing ledger ID. Every
-other version, altered schema, aggregate mismatch, wrong capture root, unsafe
-database path, or failed integrity check is rejected without migration.
+Before schema changes and again on every v4 verification path, each persisted
+job and preactivation path is decoded against the same file-independent
+identity and state invariants used by the live store. Completed artifact bytes
+need not remain on disk. The complete v4 schema and derived fields are verified
+before the migration transaction can commit. V4 is a verified no-op that
+prints its existing ledger ID. Every other version, malformed row, altered
+schema, aggregate mismatch, wrong capture root, unsafe database path, or failed
+integrity check is rejected without migration.
 
 `archive` accepts exact v4 only and requires the operator to repeat the ledger
 ID shown by `migrate` or Manage outbox. It refuses to archive while any row is
@@ -288,9 +293,11 @@ Archive recovery is state-aware. If a verified archive exists beside the
 unchanged active ledger but retirement did not happen, rerunning the same
 command verifies their exact logical contents and finishes retirement. If both
 verified archive and retired files exist and the active file is absent, rerun
-is an idempotent verification. A changed active ledger, an orphan archive or
-retired file, or all three names existing is reported as an incomplete state
-and left untouched for inspection.
+is an idempotent verification; JPEGs captured after retirement belong to the
+next ledger lifecycle and do not invalidate that completed report. A changed
+active ledger, an orphan archive or retired file, any archive/retired SQLite
+WAL, SHM, or rollback-journal sidecar, or all three database names existing is
+reported as an incomplete state and left untouched for inspection.
 
 The persistent `<database>.maintenance.lock` file is only a coordination inode;
 the held shared/exclusive OS lock is authoritative. Leaving the unlocked file
