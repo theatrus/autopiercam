@@ -28,7 +28,8 @@ use crate::upload::upload_store::{
     CREATE_PREACTIVATION_ARTIFACTS, CREATE_UPDATE_AGGREGATE_TRIGGER, CREATE_UPLOAD_JOBS,
     DELIVERY_BINDING_DOMAIN, SCHEMA_SIGNATURE, SCHEMA_VERSION, UploadLedgerId, UploadStoreError,
     acquire_exclusive_ownership, is_generated_frame_filename, normalize_sql, read_ledger_id,
-    schema_version, verify_persisted_artifact_identities, verify_persisted_v4_rows, verify_schema,
+    schema_version, verify_canonical_upload_destination, verify_persisted_artifact_identities,
+    verify_persisted_v4_rows, verify_schema,
 };
 
 const V3_SCHEMA_VERSION: i64 = 3;
@@ -732,10 +733,13 @@ fn verify_v3(
     if signature != V3_SCHEMA_SIGNATURE {
         return Err(LedgerMaintenanceError::InvalidV3Schema);
     }
+    verify_canonical_upload_destination(&destination)?;
     if Path::new(&capture_root) != configured_capture_root {
         return Err(LedgerMaintenanceError::CaptureRootMismatch);
     }
+    verify_metadata_telemetry(connection)?;
     verify_aggregate_counts(connection, true)?;
+    verify_v3_job_decoding(connection)?;
     verify_persisted_artifact_identities(connection, configured_capture_root)?;
     Ok(LedgerIdentity {
         capture_root,
@@ -750,6 +754,7 @@ fn migrate_v3_to_v4(
 ) -> Result<(), LedgerMaintenanceError> {
     let ledger_id = UploadLedgerId::random()?;
     let delivery_binding = delivery_binding(&identity.destination, &identity.authorization);
+    let legacy_failed_binding = legacy_failed_delivery_binding(delivery_binding);
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         r#"
@@ -801,12 +806,16 @@ fn migrate_v3_to_v4(
             last_requeued_at_ms
         )
         SELECT id, artifact_path, filename, idempotency_key, file_size, sha256,
-               ?1, state, attempt_count, next_attempt_at_ms,
+               CASE WHEN state = 'permanently_failed' THEN ?2 ELSE ?1 END,
+               state, attempt_count, next_attempt_at_ms,
                last_http_status, last_error, created_at_ms, updated_at_ms,
                completed_at_ms, last_failure_at_ms, 1, 0, NULL
         FROM upload_jobs_v3 ORDER BY id
         "#,
-        [delivery_binding.as_slice()],
+        params![
+            delivery_binding.as_slice(),
+            legacy_failed_binding.as_slice()
+        ],
     )?;
     transaction.execute_batch(CREATE_DUE_INDEX)?;
     transaction.execute_batch(CREATE_INSERT_AGGREGATE_TRIGGER)?;
@@ -827,15 +836,24 @@ fn migrate_v3_to_v4(
     // Verify the exact target schema and all derived migration fields while
     // the transformation is still rollback-able.
     verify_schema(&transaction, &identity.capture_root, &identity.destination)?;
+    verify_metadata_telemetry(&transaction)?;
     verify_aggregate_counts(&transaction, false)?;
+    verify_persisted_v4_rows(&transaction, Path::new(&identity.capture_root))?;
     let stored_ledger_id: Vec<u8> = transaction.query_row(
         "SELECT ledger_id FROM upload_metadata WHERE singleton = 1",
         [],
         |row| row.get(0),
     )?;
     let invalid_binding_count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM upload_jobs WHERE delivery_binding_sha256 <> ?1",
-        [delivery_binding.as_slice()],
+        r#"
+        SELECT COUNT(*) FROM upload_jobs
+        WHERE (state = 'permanently_failed' AND delivery_binding_sha256 <> ?2)
+           OR (state <> 'permanently_failed' AND delivery_binding_sha256 <> ?1)
+        "#,
+        params![
+            delivery_binding.as_slice(),
+            legacy_failed_binding.as_slice()
+        ],
         |row| row.get(0),
     )?;
     if stored_ledger_id.as_slice() != ledger_id.as_slice() || invalid_binding_count != 0 {
@@ -861,10 +879,12 @@ fn verify_v4(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    verify_canonical_upload_destination(&destination)?;
     if Path::new(&capture_root) != configured_capture_root {
         return Err(LedgerMaintenanceError::CaptureRootMismatch);
     }
     verify_schema(connection, &capture_root, &destination)?;
+    verify_metadata_telemetry(connection)?;
     verify_aggregate_counts(connection, false)?;
     verify_persisted_v4_rows(connection, configured_capture_root)?;
     Ok(read_ledger_id(connection)?)
@@ -877,6 +897,54 @@ fn verify_integrity(connection: &Connection) -> Result<(), LedgerMaintenanceErro
     } else {
         Err(LedgerMaintenanceError::Integrity(result))
     }
+}
+
+fn verify_metadata_telemetry(connection: &Connection) -> Result<(), LedgerMaintenanceError> {
+    connection.query_row(
+        r#"
+        SELECT last_success_at_ms, last_failure_at_ms, last_error
+        FROM upload_metadata WHERE singleton = 1
+        "#,
+        [],
+        |row| {
+            let _: Option<i64> = row.get(0)?;
+            let _: Option<i64> = row.get(1)?;
+            let _: Option<String> = row.get(2)?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+fn verify_v3_job_decoding(connection: &Connection) -> Result<(), LedgerMaintenanceError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, artifact_path, filename, idempotency_key, file_size, sha256,
+               state, attempt_count, next_attempt_at_ms, last_http_status,
+               last_error, created_at_ms, updated_at_ms, completed_at_ms,
+               last_failure_at_ms
+        FROM upload_jobs ORDER BY id
+        "#,
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let _: i64 = row.get(0)?;
+        let _: String = row.get(1)?;
+        let _: String = row.get(2)?;
+        let _: String = row.get(3)?;
+        let _: i64 = row.get(4)?;
+        let _: Vec<u8> = row.get(5)?;
+        let _: String = row.get(6)?;
+        let _: i64 = row.get(7)?;
+        let _: Option<i64> = row.get(8)?;
+        let _: Option<i64> = row.get(9)?;
+        let _: Option<String> = row.get(10)?;
+        let _: i64 = row.get(11)?;
+        let _: i64 = row.get(12)?;
+        let _: Option<i64> = row.get(13)?;
+        let _: Option<i64> = row.get(14)?;
+    }
+    Ok(())
 }
 
 fn verify_aggregate_counts(
@@ -936,6 +1004,16 @@ fn delivery_binding(destination: &str, authorization: &[u8; 32]) -> [u8; 32] {
     hasher.update(destination.as_bytes());
     hasher.update(authorization);
     hasher.finalize().into()
+}
+
+fn legacy_failed_delivery_binding(mut current: [u8; 32]) -> [u8; 32] {
+    // v3 had no per-row destination identity. A permanent failure may have
+    // been created before a drained-ledger authorization rotation, so it must
+    // never inherit the current identity and become requeueable during
+    // migration. Flipping a fixed bit is deterministic and guarantees that
+    // this sentinel differs from the migration-time binding.
+    current[0] ^= 0x80;
+    current
 }
 
 fn parse_expected_ledger_id(value: &str) -> Result<UploadLedgerId, LedgerMaintenanceError> {
@@ -1401,7 +1479,9 @@ impl Drop for TemporaryPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upload::upload_store::{UploadAuthorizationFingerprint, UploadStore};
+    use crate::upload::upload_store::{
+        RequeueUploadRequest, UploadAuthorizationFingerprint, UploadState, UploadStore,
+    };
 
     const DESTINATION: &str = "https://example.invalid/upload";
 
@@ -1530,8 +1610,39 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_v3_permanently_failed(
+        connection: &Connection,
+        artifact_path: &Path,
+        sha256: &[u8; 32],
+    ) {
+        let filename = artifact_path.file_name().unwrap().to_str().unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO upload_jobs (
+                    id, artifact_path, filename, idempotency_key, file_size,
+                    sha256, state, attempt_count, next_attempt_at_ms,
+                    last_http_status, last_error, created_at_ms, updated_at_ms,
+                    completed_at_ms, last_failure_at_ms
+                ) VALUES (1, ?1, ?2, ?3, 17, ?4, 'permanently_failed', 1,
+                          NULL, 422, 'operator action', 10, 11, NULL, 11)
+                "#,
+                params![
+                    artifact_path.to_str().unwrap(),
+                    filename,
+                    test_idempotency_key(filename, sha256),
+                    sha256.as_slice()
+                ],
+            )
+            .unwrap();
+    }
+
     fn assert_v3_rejected_without_schema_changes(environment: &TestEnvironment) {
         assert!(migrate_upload_ledger(&environment.config).is_err());
+        assert_v3_schema_unchanged(environment);
+    }
+
+    fn assert_v3_schema_unchanged(environment: &TestEnvironment) {
         let connection = Connection::open(&environment.database).unwrap();
         assert_eq!(schema_version(&connection).unwrap(), V3_SCHEMA_VERSION);
         let renamed_tables: i64 = connection
@@ -1542,6 +1653,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(renamed_tables, 0);
+    }
+
+    fn replace_current_authorization(environment: &TestEnvironment, value: [u8; 32]) {
+        let connection = Connection::open(&environment.database).unwrap();
+        connection
+            .execute("DROP TRIGGER upload_metadata_identity_immutable", [])
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                UPDATE upload_metadata
+                SET authorization_sha256 = ?1,
+                    ledger_revision = ledger_revision + 1
+                WHERE singleton = 1
+                "#,
+                [value.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute_batch(CREATE_IMMUTABLE_METADATA_TRIGGER)
+            .unwrap();
+    }
+
+    fn replace_stored_destination(environment: &TestEnvironment, destination: &str) {
+        let connection = Connection::open(&environment.database).unwrap();
+        connection
+            .execute("DROP TRIGGER upload_metadata_identity_immutable", [])
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                UPDATE upload_metadata
+                SET destination = ?1, ledger_revision = ledger_revision + 1
+                WHERE singleton = 1
+                "#,
+                [destination],
+            )
+            .unwrap();
+        connection
+            .execute_batch(CREATE_IMMUTABLE_METADATA_TRIGGER)
+            .unwrap();
+    }
+
+    fn assert_delivery_binding_mismatch<T: std::fmt::Debug>(
+        result: Result<T, LedgerMaintenanceError>,
+    ) {
+        match result {
+            Err(LedgerMaintenanceError::Store(message)) => {
+                assert!(
+                    message.contains("delivery binding inconsistent"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected delivery-binding mismatch, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_destination<T: std::fmt::Debug>(result: Result<T, LedgerMaintenanceError>) {
+        match result {
+            Err(LedgerMaintenanceError::Store(message)) => {
+                assert!(
+                    message.contains("canonical absolute HTTP or HTTPS URL"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected invalid stored destination, got {other:?}"),
+        }
     }
 
     fn permanently_fail(store: &mut UploadStore, artifact: &Path) {
@@ -1677,6 +1855,75 @@ mod tests {
     }
 
     #[test]
+    fn v3_permanent_failure_migrates_as_inspectable_but_not_requeueable() {
+        let environment = TestEnvironment::new();
+        let connection = create_v3(&environment);
+        let artifact = environment.artifact(48, b"legacy permanent failure");
+        let sha256 = [4_u8; 32];
+        insert_v3_permanently_failed(&connection, &artifact, &sha256);
+        let rotated_authorization =
+            UploadAuthorizationFingerprint::for_bearer_token("rotated-before-migration");
+        connection
+            .execute(
+                "UPDATE upload_metadata SET authorization_sha256 = ?1 WHERE singleton = 1",
+                [rotated_authorization.as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let report = migrate_upload_ledger(&environment.config).unwrap();
+        assert!(report.migrated);
+        let migrated = Connection::open(&environment.database).unwrap();
+        let stored_binding: Vec<u8> = migrated
+            .query_row(
+                "SELECT delivery_binding_sha256 FROM upload_jobs WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_binding = delivery_binding(
+            DESTINATION,
+            rotated_authorization.as_slice().try_into().unwrap(),
+        );
+        assert_eq!(
+            stored_binding,
+            legacy_failed_delivery_binding(current_binding)
+        );
+        assert_ne!(stored_binding, current_binding);
+        drop(migrated);
+
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            DESTINATION,
+            rotated_authorization,
+        )
+        .unwrap();
+        let page = store
+            .list_jobs(&[UploadState::PermanentlyFailed], 10, None)
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        let job = page.jobs.into_iter().next().unwrap();
+        assert_eq!(job.state, UploadState::PermanentlyFailed);
+        assert!(!job.delivery_binding_is_current);
+        let requeue_eligible =
+            job.state == UploadState::PermanentlyFailed && job.delivery_binding_is_current;
+        assert!(!requeue_eligible);
+        let ledger_id = store.ledger_id();
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id,
+                    job_id: job.job_id,
+                    expected_job_revision: job.job_revision,
+                },
+                12,
+            ),
+            Err(UploadStoreError::RequeueDeliveryBindingMismatch)
+        ));
+    }
+
+    #[test]
     fn migration_fails_closed_for_other_versions_and_tampered_v3() {
         let unsupported = TestEnvironment::new();
         let connection = Connection::open(&unsupported.database).unwrap();
@@ -1765,6 +2012,102 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_rejects_invalid_or_noncanonical_stored_destinations() {
+        let invalid_destinations = [
+            "not-an-http-endpoint",
+            "HTTPS://Example.Invalid:443/a/../upload",
+            "https://example.invalid/up\tload",
+        ];
+
+        for destination in invalid_destinations {
+            let legacy = TestEnvironment::new();
+            let connection = create_v3(&legacy);
+            connection
+                .execute(
+                    "UPDATE upload_metadata SET destination = ?1 WHERE singleton = 1",
+                    [destination],
+                )
+                .unwrap();
+            drop(connection);
+            assert_invalid_destination(migrate_upload_ledger(&legacy.config));
+            assert_v3_schema_unchanged(&legacy);
+
+            let current = TestEnvironment::new();
+            let store = current.open_v4();
+            let ledger_id = store.ledger_id().as_hex();
+            drop(store);
+            replace_stored_destination(&current, destination);
+            assert_invalid_destination(migrate_upload_ledger(&current.config));
+            assert_invalid_destination(archive_upload_ledger(&current.config, &ledger_id));
+        }
+    }
+
+    #[test]
+    fn maintenance_decodes_metadata_telemetry_before_migration_or_archive() {
+        let legacy = TestEnvironment::new();
+        let connection = create_v3(&legacy);
+        connection
+            .execute(
+                "UPDATE upload_metadata SET last_error = CAST(x'80' AS TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            migrate_upload_ledger(&legacy.config),
+            Err(LedgerMaintenanceError::Sqlite(_))
+        ));
+        assert_v3_schema_unchanged(&legacy);
+
+        let current = TestEnvironment::new();
+        let store = current.open_v4();
+        let ledger_id = store.ledger_id().as_hex();
+        drop(store);
+        let connection = Connection::open(&current.database).unwrap();
+        connection
+            .execute(
+                "UPDATE upload_metadata SET last_error = CAST(x'80' AS TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            migrate_upload_ledger(&current.config),
+            Err(LedgerMaintenanceError::Sqlite(_))
+        ));
+        assert!(matches!(
+            archive_upload_ledger(&current.config, &ledger_id),
+            Err(LedgerMaintenanceError::Sqlite(_))
+        ));
+    }
+
+    #[test]
+    fn migration_decodes_every_v3_job_column_before_ddl() {
+        let environment = TestEnvironment::new();
+        let connection = create_v3(&environment);
+        let artifact = environment.artifact(49, b"invalid legacy error text");
+        let filename = artifact.file_name().unwrap().to_str().unwrap();
+        let sha256 = [5_u8; 32];
+        insert_v3_completed(
+            &connection,
+            1,
+            &artifact,
+            filename,
+            &test_idempotency_key(filename, &sha256),
+            &sha256,
+        );
+        connection
+            .execute(
+                "UPDATE upload_jobs SET last_error = CAST(x'80' AS TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_v3_rejected_without_schema_changes(&environment);
+    }
+
+    #[test]
     fn current_schema_maintenance_validates_every_persisted_identity() {
         let zero_id = TestEnvironment::new();
         let zero_id_ledger = completed_ledger(&zero_id, 35);
@@ -1820,6 +2163,78 @@ mod tests {
         drop(connection);
         assert!(migrate_upload_ledger(&arbitrary_preactivation.config).is_err());
         assert!(archive_upload_ledger(&arbitrary_preactivation.config, &ledger_id).is_err());
+    }
+
+    #[test]
+    fn maintenance_rejects_stale_delivery_bindings_for_every_nonterminal_state() {
+        for (offset, state) in ["pending", "in_progress", "retrying"]
+            .into_iter()
+            .enumerate()
+        {
+            let environment = TestEnvironment::new();
+            let mut store = environment.open_v4();
+            let artifact = environment.artifact(43 + offset as u64, state.as_bytes());
+            store.record_artifact(&artifact, 10).unwrap();
+            if state != "pending" {
+                let claim = store.claim_due(10).unwrap().unwrap();
+                if state == "retrying" {
+                    store
+                        .mark_retrying(&claim, 11, 12, Some(503), Some("retry"))
+                        .unwrap();
+                }
+            }
+            let ledger_id = store.ledger_id().as_hex();
+            drop(store);
+            replace_current_authorization(&environment, [9_u8; 32]);
+
+            assert_delivery_binding_mismatch(migrate_upload_ledger(&environment.config));
+            assert_delivery_binding_mismatch(archive_upload_ledger(
+                &environment.config,
+                &ledger_id,
+            ));
+        }
+    }
+
+    #[test]
+    fn maintenance_allows_stale_delivery_bindings_for_terminal_history() {
+        let completed = TestEnvironment::new();
+        let completed_id = completed_ledger(&completed, 46);
+        drop(
+            UploadStore::open(
+                &completed.database,
+                &completed.capture,
+                DESTINATION,
+                UploadAuthorizationFingerprint::for_bearer_token("rotated-completed"),
+            )
+            .unwrap(),
+        );
+        let migration = migrate_upload_ledger(&completed.config).unwrap();
+        assert!(!migration.migrated);
+        assert_eq!(migration.ledger_id, completed_id);
+        assert!(archive_upload_ledger(&completed.config, &completed_id).is_ok());
+
+        let permanently_failed = TestEnvironment::new();
+        let mut store = permanently_failed.open_v4();
+        let artifact = permanently_failed.artifact(47, b"permanently failed");
+        permanently_fail(&mut store, &artifact);
+        let permanently_failed_id = store.ledger_id().as_hex();
+        drop(store);
+        drop(
+            UploadStore::open(
+                &permanently_failed.database,
+                &permanently_failed.capture,
+                DESTINATION,
+                UploadAuthorizationFingerprint::for_bearer_token("rotated-permanent"),
+            )
+            .unwrap(),
+        );
+        let migration = migrate_upload_ledger(&permanently_failed.config).unwrap();
+        assert!(!migration.migrated);
+        assert_eq!(migration.ledger_id, permanently_failed_id);
+        assert!(matches!(
+            archive_upload_ledger(&permanently_failed.config, &permanently_failed_id),
+            Err(LedgerMaintenanceError::PermanentFailures { count: 1 })
+        ));
     }
 
     #[test]

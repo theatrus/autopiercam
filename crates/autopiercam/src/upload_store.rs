@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use autopiercam_core::config::normalize_upload_endpoint;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -325,7 +326,7 @@ pub(crate) enum UploadStoreError {
     #[error("the upload ledger belongs to a different capture directory")]
     CaptureRootMismatch,
 
-    #[error("upload destination must be a non-empty normalized string")]
+    #[error("upload destination must be a canonical absolute HTTP or HTTPS URL")]
     InvalidDestination,
 
     #[error("the upload ledger belongs to a different upload destination")]
@@ -524,7 +525,7 @@ impl UploadAuthorizationFingerprint {
         Self(hasher.finalize().into())
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.0
     }
 }
@@ -2186,11 +2187,19 @@ fn canonical_capture_root(path: &Path) -> Result<PathBuf, UploadStoreError> {
 }
 
 fn normalize_destination(destination: &str) -> Result<String, UploadStoreError> {
-    let normalized = destination.trim();
-    if normalized.is_empty() || normalized.chars().any(char::is_control) {
-        return Err(UploadStoreError::InvalidDestination);
+    normalize_upload_endpoint(destination.trim()).map_err(|_| UploadStoreError::InvalidDestination)
+}
+
+pub(crate) fn verify_canonical_upload_destination(
+    destination: &str,
+) -> Result<(), UploadStoreError> {
+    let normalized =
+        normalize_upload_endpoint(destination).map_err(|_| UploadStoreError::InvalidDestination)?;
+    if normalized == destination {
+        Ok(())
+    } else {
+        Err(UploadStoreError::InvalidDestination)
     }
-    Ok(normalized.to_owned())
 }
 
 pub(crate) fn read_ledger_id(connection: &Connection) -> Result<UploadLedgerId, UploadStoreError> {
@@ -2671,7 +2680,17 @@ pub(crate) fn verify_persisted_v4_rows(
     )?;
     let rows = statement.query_map([], RawUploadJob::from_row)?;
     for row in rows {
-        row?.into_list_item(capture_root, current_delivery_binding)?;
+        let job = row?.into_list_item(capture_root, current_delivery_binding)?;
+        if !job.delivery_binding_is_current
+            && matches!(
+                job.state,
+                UploadState::Pending | UploadState::InProgress | UploadState::Retrying
+            )
+        {
+            return Err(UploadStoreError::UploadJobDeliveryBindingMismatch(
+                job.job_id,
+            ));
+        }
     }
     verify_persisted_preactivation_paths(connection, capture_root)
 }
