@@ -20,7 +20,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, RwLock, RwLockWriteGuard,
+    Arc, Condvar, Mutex, RwLock, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
@@ -124,26 +124,142 @@ pub struct AgentMonitor {
 #[derive(Clone, Debug)]
 struct RegisteredUploadAdmin {
     generation: u64,
+    session: Arc<UploadAdminSession>,
+}
+
+struct UploadAdminSession {
     admin: UploadAdmin,
+    state: Mutex<UploadAdminSessionState>,
+    idle: Condvar,
+}
+
+#[derive(Debug)]
+struct UploadAdminSessionState {
+    accepting: bool,
+    active: usize,
+}
+
+impl std::fmt::Debug for UploadAdminSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        formatter
+            .debug_struct("UploadAdminSession")
+            .field("admin", &self.admin)
+            .field("accepting", &state.accepting)
+            .field("active", &state.active)
+            .finish()
+    }
+}
+
+impl UploadAdminSession {
+    fn new(admin: UploadAdmin) -> Self {
+        Self {
+            admin,
+            state: Mutex::new(UploadAdminSessionState {
+                accepting: true,
+                active: 0,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<UploadAdminLease> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.accepting {
+            return None;
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("upload administration operation counter overflowed");
+        drop(state);
+        Some(UploadAdminLease {
+            session: Arc::clone(self),
+        })
+    }
+
+    fn revoke(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.accepting = false;
+    }
+
+    fn wait_until_idle(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.active != 0 {
+            state = match self.idle.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UploadAdminLease {
+    session: Arc<UploadAdminSession>,
+}
+
+impl UploadAdminLease {
+    fn admin(&self) -> &UploadAdmin {
+        &self.session.admin
+    }
+}
+
+impl Drop for UploadAdminLease {
+    fn drop(&mut self) {
+        let mut state = match self.session.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("upload administration operation counter underflowed");
+        if state.active == 0 {
+            self.session.idle.notify_all();
+        }
+    }
 }
 
 #[derive(Debug)]
 struct UploadAdminRegistration {
     registry: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
     generation: u64,
+    session: Arc<UploadAdminSession>,
 }
 
 impl Drop for UploadAdminRegistration {
     fn drop(&mut self) {
-        let mut registration = match self.registry.write() {
-            Ok(registration) => registration,
-            Err(poisoned) => poisoned.into_inner(),
+        let should_drain = {
+            let mut registration = match self.registry.write() {
+                Ok(registration) => registration,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if registration
+                .as_ref()
+                .is_some_and(|current| current.generation == self.generation)
+            {
+                self.session.revoke();
+                *registration = None;
+                true
+            } else {
+                false
+            }
         };
-        if registration
-            .as_ref()
-            .is_some_and(|current| current.generation == self.generation)
-        {
-            *registration = None;
+        if should_drain {
+            self.session.wait_until_idle();
         }
     }
 }
@@ -201,7 +317,7 @@ impl AgentMonitor {
         &self,
         request: &UploadListRequest,
     ) -> Result<UploadListResponse, UploadAdminError> {
-        self.current_upload_admin()?.list(request)
+        self.current_upload_admin()?.admin().list(request)
     }
 
     /// Requeue one revision-fenced terminal failure after verifying its exact
@@ -210,17 +326,17 @@ impl AgentMonitor {
         &self,
         request: &UploadRequeueRequest,
     ) -> Result<UploadRequeueResult, UploadAdminError> {
-        self.current_upload_admin()?.requeue(request)
+        self.current_upload_admin()?.admin().requeue(request)
     }
 
-    fn current_upload_admin(&self) -> Result<UploadAdmin, UploadAdminError> {
+    fn current_upload_admin(&self) -> Result<UploadAdminLease, UploadAdminError> {
         let registration = match self.upload_admin.read() {
             Ok(registration) => registration,
             Err(poisoned) => poisoned.into_inner(),
         };
         registration
             .as_ref()
-            .map(|registration| registration.admin.clone())
+            .and_then(|registration| registration.session.acquire())
             .ok_or(UploadAdminError::ServiceUnavailable)
     }
 
@@ -229,14 +345,29 @@ impl AgentMonitor {
             .upload_admin_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        let mut registration = match self.upload_admin.write() {
-            Ok(registration) => registration,
-            Err(poisoned) => poisoned.into_inner(),
+        let session = Arc::new(UploadAdminSession::new(admin));
+        let previous = {
+            let mut registration = match self.upload_admin.write() {
+                Ok(registration) => registration,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let previous = registration.take();
+            if let Some(previous) = &previous {
+                previous.session.revoke();
+            }
+            *registration = Some(RegisteredUploadAdmin {
+                generation,
+                session: Arc::clone(&session),
+            });
+            previous
         };
-        *registration = Some(RegisteredUploadAdmin { generation, admin });
+        if let Some(previous) = previous {
+            previous.session.wait_until_idle();
+        }
         UploadAdminRegistration {
             registry: Arc::clone(&self.upload_admin),
             generation,
+            session,
         }
     }
 
@@ -1490,6 +1621,59 @@ mod tests {
             Err(UploadAdminError::ServiceUnavailable)
         );
         worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn upload_registration_drains_inflight_leases_before_ledger_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("captures");
+        std::fs::create_dir(&capture).unwrap();
+        let database = root.path().join("upload.sqlite3");
+        let monitor = AgentMonitor::new();
+        let observer: UploadObserver = Arc::new(|_| {});
+        let (worker, sink) = UploadWorker::start(
+            UploadOptions::new(
+                ureq::http::Uri::from_static("http://127.0.0.1:9/upload"),
+                None,
+                1,
+            ),
+            &database,
+            &capture,
+            Arc::clone(&observer),
+        )
+        .unwrap();
+        let registration = monitor.register_upload_admin(sink.admin());
+        let lease = monitor.current_upload_admin().unwrap();
+
+        worker.stop_and_join().unwrap();
+        drop(sink);
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let drain = thread::spawn(move || {
+            drop(registration);
+            drained_tx.send(()).unwrap();
+        });
+        assert!(
+            drained_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "registration teardown ignored an in-flight operation"
+        );
+
+        drop(lease);
+        drained_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drain.join().unwrap();
+
+        let (replacement, replacement_sink) = UploadWorker::start(
+            UploadOptions::new(
+                ureq::http::Uri::from_static("http://127.0.0.1:9/upload"),
+                None,
+                1,
+            ),
+            &database,
+            &capture,
+            observer,
+        )
+        .unwrap();
+        replacement.stop_and_join().unwrap();
+        drop(replacement_sink);
     }
 
     #[test]
