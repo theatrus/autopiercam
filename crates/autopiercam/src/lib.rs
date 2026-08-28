@@ -29,10 +29,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+mod ledger_maintenance;
 mod preview;
 mod retention;
 mod upload;
 
+pub use ledger_maintenance::{
+    LedgerArchiveReport, LedgerMaintenanceError, LedgerMigrationReport, archive_upload_ledger,
+    migrate_upload_ledger,
+};
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
 use retention::{

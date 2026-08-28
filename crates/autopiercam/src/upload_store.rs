@@ -10,15 +10,17 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 4;
-const APPLICATION_ID: i64 = 0x4150_4355;
-const SCHEMA_SIGNATURE: &str =
+use crate::ledger_maintenance::{LedgerLease, LedgerLeaseError};
+
+pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const APPLICATION_ID: i64 = 0x4150_4355;
+pub(crate) const SCHEMA_SIGNATURE: &str =
     "autopiercam-upload-ledger-v4-operator-pagination-requeue-delivery-binding-revisions-20260828";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const IDEMPOTENCY_PREFIX: &str = "autopiercam-sha256-";
 const CAPTURE_SESSION_NONCE_HEX_LENGTH: usize = 32;
 const AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] = b"autopiercam-upload-authorization-identity-v1\0";
-const DELIVERY_BINDING_DOMAIN: &[u8] = b"autopiercam-upload-delivery-binding-v1\0";
+pub(crate) const DELIVERY_BINDING_DOMAIN: &[u8] = b"autopiercam-upload-delivery-binding-v1\0";
 const LIST_CURSOR_DOMAIN: &[u8] = b"autopiercam-upload-list-cursor-v1\0";
 const LIST_CURSOR_LEDGER_DOMAIN: &[u8] = b"autopiercam-upload-list-ledger-v1\0";
 const LIST_CURSOR_PREFIX: &str = "apcu1_";
@@ -29,7 +31,7 @@ const LIST_CURSOR_ENCODED_LENGTH: usize =
 const ALL_UPLOAD_STATE_FILTER_MASK: u8 = 0b1_1111;
 pub(crate) const MAX_UPLOAD_LIST_PAGE_SIZE: u16 = 100;
 
-const CREATE_METADATA: &str = r#"
+pub(crate) const CREATE_METADATA: &str = r#"
 CREATE TABLE upload_metadata (
     singleton                INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_signature         TEXT NOT NULL,
@@ -78,13 +80,13 @@ CREATE TABLE upload_metadata (
 ) STRICT
 "#;
 
-const CREATE_PREACTIVATION_ARTIFACTS: &str = r#"
+pub(crate) const CREATE_PREACTIVATION_ARTIFACTS: &str = r#"
 CREATE TABLE upload_preactivation_artifacts (
     artifact_path TEXT PRIMARY KEY CHECK (length(artifact_path) > 0)
 ) STRICT, WITHOUT ROWID
 "#;
 
-const CREATE_UPLOAD_JOBS: &str = r#"
+pub(crate) const CREATE_UPLOAD_JOBS: &str = r#"
 CREATE TABLE upload_jobs (
     id                     INTEGER PRIMARY KEY,
     artifact_path          TEXT NOT NULL UNIQUE,
@@ -144,13 +146,13 @@ CREATE TABLE upload_jobs (
 ) STRICT
 "#;
 
-const CREATE_DUE_INDEX: &str = r#"
+pub(crate) const CREATE_DUE_INDEX: &str = r#"
 CREATE INDEX upload_jobs_due
     ON upload_jobs (COALESCE(next_attempt_at_ms, created_at_ms), id)
     WHERE state IN ('pending', 'retrying')
 "#;
 
-const CREATE_INSERT_AGGREGATE_TRIGGER: &str = r#"
+pub(crate) const CREATE_INSERT_AGGREGATE_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_after_insert
 AFTER INSERT ON upload_jobs
 BEGIN
@@ -187,7 +189,7 @@ BEGIN
 END
 "#;
 
-const CREATE_UPDATE_AGGREGATE_TRIGGER: &str = r#"
+pub(crate) const CREATE_UPDATE_AGGREGATE_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_after_status_update
 AFTER UPDATE ON upload_jobs
 BEGIN
@@ -232,7 +234,7 @@ BEGIN
 END
 "#;
 
-const CREATE_JOB_REVISION_GUARD_TRIGGER: &str = r#"
+pub(crate) const CREATE_JOB_REVISION_GUARD_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_revision_guard
 BEFORE UPDATE ON upload_jobs
 WHEN NEW.job_revision <> OLD.job_revision + 1
@@ -241,7 +243,7 @@ BEGIN
 END
 "#;
 
-const CREATE_IMMUTABLE_IDENTITY_TRIGGER: &str = r#"
+pub(crate) const CREATE_IMMUTABLE_IDENTITY_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_identity_immutable
 BEFORE UPDATE OF artifact_path, filename, idempotency_key, file_size, sha256,
                  delivery_binding_sha256, created_at_ms
@@ -251,7 +253,7 @@ BEGIN
 END
 "#;
 
-const CREATE_IMMUTABLE_METADATA_TRIGGER: &str = r#"
+pub(crate) const CREATE_IMMUTABLE_METADATA_TRIGGER: &str = r#"
 CREATE TRIGGER upload_metadata_identity_immutable
 BEFORE UPDATE OF schema_signature, ledger_id, capture_root, destination
 ON upload_metadata
@@ -260,7 +262,7 @@ BEGIN
 END
 "#;
 
-const CREATE_NO_DELETE_TRIGGER: &str = r#"
+pub(crate) const CREATE_NO_DELETE_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_no_delete
 BEFORE DELETE ON upload_jobs
 BEGIN
@@ -305,6 +307,9 @@ pub(crate) enum UploadStoreError {
         #[source]
         source: io::Error,
     },
+
+    #[error(transparent)]
+    LedgerLease(#[from] LedgerLeaseError),
 
     #[error("the existing upload ledger has no recognized schema")]
     MissingSchema,
@@ -465,7 +470,7 @@ impl UploadJobId {
 pub(crate) struct UploadLedgerId([u8; 16]);
 
 impl UploadLedgerId {
-    fn random() -> Result<Self, UploadStoreError> {
+    pub(crate) fn random() -> Result<Self, UploadStoreError> {
         let mut value = [0_u8; 16];
         getrandom::fill(&mut value).map_err(|_| UploadStoreError::Randomness)?;
         Ok(Self(value))
@@ -480,6 +485,10 @@ impl UploadLedgerId {
 
     pub(crate) fn as_hex(self) -> String {
         hex_encode(&self.0)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 
     pub(crate) fn parse_hex(value: &str) -> Result<Self, UploadStoreError> {
@@ -779,6 +788,7 @@ pub(crate) enum SnapshottedClaimedArtifact {
 }
 
 pub(crate) struct UploadStore {
+    _ledger_lease: LedgerLease,
     connection: Connection,
     capture_root: PathBuf,
     ledger_id: UploadLedgerId,
@@ -793,6 +803,7 @@ impl UploadStore {
         authorization_fingerprint: UploadAuthorizationFingerprint,
     ) -> Result<Self, UploadStoreError> {
         let database_path = database_path.as_ref();
+        let ledger_lease = LedgerLease::acquire_live(database_path)?;
         let capture_root = canonical_capture_root(capture_directory.as_ref())?;
         let capture_root_text = capture_root
             .to_str()
@@ -838,11 +849,17 @@ impl UploadStore {
         recover_interrupted_jobs(&mut connection)?;
         let ledger_id = read_ledger_id(&connection)?;
         Ok(Self {
+            _ledger_lease: ledger_lease,
             connection,
             capture_root,
             ledger_id,
             delivery_binding,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ledger_id(&self) -> UploadLedgerId {
+        self.ledger_id
     }
 
     pub(crate) fn record_artifact(
@@ -2176,7 +2193,7 @@ fn normalize_destination(destination: &str) -> Result<String, UploadStoreError> 
     Ok(normalized.to_owned())
 }
 
-fn read_ledger_id(connection: &Connection) -> Result<UploadLedgerId, UploadStoreError> {
+pub(crate) fn read_ledger_id(connection: &Connection) -> Result<UploadLedgerId, UploadStoreError> {
     let value: Vec<u8> = connection.query_row(
         "SELECT ledger_id FROM upload_metadata WHERE singleton = 1",
         [],
@@ -2355,7 +2372,7 @@ fn configure_durability(connection: &Connection) -> Result<(), UploadStoreError>
     Ok(())
 }
 
-fn acquire_exclusive_ownership(connection: &Connection) -> Result<(), UploadStoreError> {
+pub(crate) fn acquire_exclusive_ownership(connection: &Connection) -> Result<(), UploadStoreError> {
     let locking_mode: String =
         connection.pragma_update_and_check(None, "locking_mode", "EXCLUSIVE", |row| row.get(0))?;
     if !locking_mode.eq_ignore_ascii_case("exclusive") {
@@ -2369,7 +2386,7 @@ fn configuration_error(name: &'static str, actual: String) -> UploadStoreError {
     UploadStoreError::Configuration { name, actual }
 }
 
-fn schema_version(connection: &Connection) -> Result<i64, UploadStoreError> {
+pub(crate) fn schema_version(connection: &Connection) -> Result<i64, UploadStoreError> {
     Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
@@ -2470,7 +2487,7 @@ fn create_schema(
     Ok(())
 }
 
-fn verify_schema(
+pub(crate) fn verify_schema(
     connection: &Connection,
     capture_root: &str,
     destination: &str,
@@ -2698,7 +2715,7 @@ fn recover_interrupted_jobs(connection: &mut Connection) -> Result<(), UploadSto
     Ok(())
 }
 
-fn normalize_sql(sql: &str) -> String {
+pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -2855,7 +2872,7 @@ pub(crate) fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
     seconds.checked_mul(1_000)?.checked_add(millis)
 }
 
-fn is_generated_frame_filename(filename: &str) -> bool {
+pub(crate) fn is_generated_frame_filename(filename: &str) -> bool {
     parse_generated_frame_filename(filename).is_some()
 }
 

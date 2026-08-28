@@ -12,6 +12,7 @@ autopiercam-core = { path = "../autopiercam-core" }
 autopiercam-protocol = { path = "../autopiercam-protocol" }
 clap.workspace = true
 ctrlc.workspace = true
+fs4.workspace = true
 getrandom.workspace = true
 image.workspace = true
 rusqlite.workspace = true

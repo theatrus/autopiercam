@@ -1,5 +1,7 @@
 use anyhow::Result;
-use autopiercam::{list_cameras, probe_camera, run_agent, snapshot};
+use autopiercam::{
+    archive_upload_ledger, list_cameras, migrate_upload_ledger, probe_camera, run_agent, snapshot,
+};
 use autopiercam_asi::Sdk;
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, sync::Arc};
@@ -54,6 +56,28 @@ enum Command {
         #[arg(long)]
         max_frames: Option<u64>,
     },
+    /// Perform offline maintenance on the durable upload ledger.
+    UploadLedger {
+        #[command(subcommand)]
+        command: UploadLedgerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum UploadLedgerCommand {
+    /// Migrate an exact v3 ledger to v4, or verify an exact v4 ledger.
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Archive a drained v4 ledger and retire the active database.
+    Archive {
+        #[arg(long)]
+        config: PathBuf,
+        /// Immutable 32-character ledger ID shown by the outbox or migrate command.
+        #[arg(long)]
+        expected_ledger_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -62,13 +86,52 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
+    let command = match cli.command {
+        Command::UploadLedger {
+            command: UploadLedgerCommand::Migrate { config },
+        } => {
+            let report = migrate_upload_ledger(&config)?;
+            if report.migrated {
+                println!(
+                    "migrated upload ledger v3 -> v4: {}\nledger_id={}",
+                    report.database_path.display(),
+                    report.ledger_id
+                );
+            } else {
+                println!(
+                    "verified upload ledger v4 (no changes): {}\nledger_id={}",
+                    report.database_path.display(),
+                    report.ledger_id
+                );
+            }
+            return Ok(());
+        }
+        Command::UploadLedger {
+            command:
+                UploadLedgerCommand::Archive {
+                    config,
+                    expected_ledger_id,
+                },
+        } => {
+            let report = archive_upload_ledger(&config, &expected_ledger_id)?;
+            println!(
+                "archived upload ledger {}\narchive={}\nretired={}\nsha256={}",
+                report.ledger_id,
+                report.archive_path.display(),
+                report.retired_path.display(),
+                report.sha256
+            );
+            return Ok(());
+        }
+        command => command,
+    };
     let sdk = Arc::new(match cli.sdk {
         Some(path) => Sdk::load(path)?,
         None => Sdk::load_default()?,
     });
     info!(version = %sdk.version(), path = %sdk.path().display(), "loaded ZWO ASI SDK");
 
-    match cli.command {
+    match command {
         Command::List { json } => list_cameras(&sdk, json),
         Command::Probe { camera_id } => probe_camera(&sdk, camera_id),
         Command::Snapshot {
@@ -90,5 +153,6 @@ fn main() -> Result<()> {
             jpeg_quality,
         ),
         Command::Run { config, max_frames } => run_agent(&sdk, &config, max_frames),
+        Command::UploadLedger { .. } => unreachable!("ledger maintenance returned before SDK load"),
     }
 }

@@ -29,7 +29,7 @@ use ureq::{
 };
 
 #[path = "upload_store.rs"]
-mod upload_store;
+pub(crate) mod upload_store;
 
 use upload_store::{
     ArtifactVerification, ClaimedUpload, RecordDisposition, RequeueUploadRequest,
