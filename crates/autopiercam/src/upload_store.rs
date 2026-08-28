@@ -9,12 +9,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x4150_4355;
 const SCHEMA_SIGNATURE: &str =
-    "autopiercam-upload-ledger-v1-destination-activation-aggregates-sha256-20260828";
+    "autopiercam-upload-ledger-v2-destination-authorization-activation-aggregates-sha256-20260828";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const IDEMPOTENCY_PREFIX: &str = "autopiercam-sha256-";
+const AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] = b"autopiercam-upload-authorization-identity-v1\0";
 
 const CREATE_METADATA: &str = r#"
 CREATE TABLE upload_metadata (
@@ -24,6 +25,9 @@ CREATE TABLE upload_metadata (
     destination              TEXT NOT NULL CHECK (
                                  length(destination) > 0 AND
                                  trim(destination) = destination
+                             ),
+    authorization_sha256     BLOB NOT NULL CHECK (
+                                 length(authorization_sha256) = 32
                              ),
     activation_at_ms         INTEGER NOT NULL CHECK (
                                  typeof(activation_at_ms) = 'integer' AND
@@ -262,6 +266,9 @@ pub(crate) enum UploadStoreError {
     #[error("the upload ledger belongs to a different upload destination")]
     DestinationMismatch,
 
+    #[error("the upload ledger belongs to a different upload authorization identity")]
+    AuthorizationIdentityMismatch,
+
     #[error("SQLite did not enable the requested {name} setting (reported {actual:?})")]
     Configuration { name: &'static str, actual: String },
 
@@ -321,6 +328,38 @@ pub(crate) struct UploadJobId(i64);
 impl std::fmt::Display for UploadJobId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+/// One-way identity bound to a durable upload ledger.
+///
+/// Bearer identity is derived from the actual token, never its environment
+/// variable name. Consequently, renaming the variable is safe while rotation
+/// is permitted only after all queued work reaches a terminal state. A token
+/// change with pending, in-progress, or retrying work fails ledger reopen.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct UploadAuthorizationFingerprint([u8; 32]);
+
+impl UploadAuthorizationFingerprint {
+    pub(crate) fn anonymous() -> Self {
+        Self::derive(b"anonymous", &[])
+    }
+
+    pub(crate) fn for_bearer_token(token: &str) -> Self {
+        Self::derive(b"bearer", token.as_bytes())
+    }
+
+    fn derive(kind: &[u8], identity: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(AUTHORIZATION_FINGERPRINT_DOMAIN);
+        hasher.update(kind);
+        hasher.update([0]);
+        hasher.update(identity);
+        Self(hasher.finalize().into())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -471,6 +510,7 @@ impl UploadStore {
         database_path: impl AsRef<Path>,
         capture_directory: impl AsRef<Path>,
         destination: &str,
+        authorization_fingerprint: UploadAuthorizationFingerprint,
     ) -> Result<Self, UploadStoreError> {
         let database_path = database_path.as_ref();
         let capture_root = canonical_capture_root(capture_directory.as_ref())?;
@@ -489,12 +529,18 @@ impl UploadStore {
                     &mut connection,
                     capture_root_text,
                     &destination,
+                    authorization_fingerprint,
                     current_unix_time_ms()?,
                 )?;
             }
             0 => return Err(UploadStoreError::MissingSchema),
             SCHEMA_VERSION => {
-                verify_schema(&connection, capture_root_text, &destination)?;
+                verify_schema(
+                    &mut connection,
+                    capture_root_text,
+                    &destination,
+                    authorization_fingerprint,
+                )?;
                 configure_durability(&connection)?;
             }
             found => {
@@ -1244,6 +1290,7 @@ fn create_schema(
     connection: &mut Connection,
     capture_root: &str,
     destination: &str,
+    authorization_fingerprint: UploadAuthorizationFingerprint,
     activation_at_unix_ms: u64,
 ) -> Result<(), UploadStoreError> {
     let activation_at = unix_ms_to_database(activation_at_unix_ms)?;
@@ -1259,10 +1306,16 @@ fn create_schema(
         r#"
         INSERT INTO upload_metadata (
             singleton, schema_signature, capture_root, destination,
-            activation_at_ms
-        ) VALUES (1, ?1, ?2, ?3, ?4)
+            authorization_sha256, activation_at_ms
+        ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
         "#,
-        params![SCHEMA_SIGNATURE, capture_root, destination, activation_at],
+        params![
+            SCHEMA_SIGNATURE,
+            capture_root,
+            destination,
+            authorization_fingerprint.as_slice(),
+            activation_at
+        ],
     )?;
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1271,9 +1324,10 @@ fn create_schema(
 }
 
 fn verify_schema(
-    connection: &Connection,
+    connection: &mut Connection,
     capture_root: &str,
     destination: &str,
+    authorization_fingerprint: UploadAuthorizationFingerprint,
 ) -> Result<(), UploadStoreError> {
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
@@ -1342,6 +1396,46 @@ fn verify_schema(
     if stored_destination != destination {
         return Err(UploadStoreError::DestinationMismatch);
     }
+    rotate_authorization_if_drained(connection, authorization_fingerprint)?;
+    Ok(())
+}
+
+/// Rebinds a drained ledger without discarding terminal history. The immediate
+/// transaction makes the live-work test and fingerprint update indivisible;
+/// interrupted `in_progress` work is deliberately checked before recovery.
+fn rotate_authorization_if_drained(
+    connection: &mut Connection,
+    authorization_fingerprint: UploadAuthorizationFingerprint,
+) -> Result<(), UploadStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored: Vec<u8> = transaction.query_row(
+        "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if stored.as_slice() != authorization_fingerprint.as_slice() {
+        let has_live_work: bool = transaction.query_row(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM upload_jobs
+                WHERE state IN ('pending', 'in_progress', 'retrying')
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        if has_live_work {
+            return Err(UploadStoreError::AuthorizationIdentityMismatch);
+        }
+        let changed = transaction.execute(
+            "UPDATE upload_metadata SET authorization_sha256 = ?1 WHERE singleton = 1",
+            [authorization_fingerprint.as_slice()],
+        )?;
+        if changed != 1 {
+            return Err(UploadStoreError::InvalidSchema);
+        }
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1602,7 +1696,13 @@ mod tests {
         }
 
         fn open(&self) -> UploadStore {
-            UploadStore::open(&self.database, &self.capture, TEST_DESTINATION).unwrap()
+            UploadStore::open(
+                &self.database,
+                &self.capture,
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
+            )
+            .unwrap()
         }
     }
 
@@ -1699,6 +1799,7 @@ mod tests {
             &environment.database,
             &environment.capture,
             &format!("  {destination}  "),
+            UploadAuthorizationFingerprint::anonymous(),
         )
         .unwrap();
         let stored: String = store
@@ -1713,13 +1814,20 @@ mod tests {
         drop(store);
 
         assert!(
-            UploadStore::open(&environment.database, &environment.capture, destination).is_ok()
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                destination,
+                UploadAuthorizationFingerprint::anonymous(),
+            )
+            .is_ok()
         );
         assert!(matches!(
             UploadStore::open(
                 &environment.database,
                 &environment.capture,
-                "https://different.invalid/upload"
+                "https://different.invalid/upload",
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::DestinationMismatch)
         ));
@@ -1727,10 +1835,192 @@ mod tests {
             UploadStore::open(
                 environment.root.join("blank.sqlite3"),
                 &environment.capture,
-                "  "
+                "  ",
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::InvalidDestination)
         ));
+    }
+
+    #[test]
+    fn anonymous_and_bearer_authorization_identities_cannot_share_live_work() {
+        let environment = TestEnvironment::new();
+        let anonymous = UploadAuthorizationFingerprint::anonymous();
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            anonymous,
+        )
+        .unwrap();
+        let stored: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.len(), 32);
+        assert!(stored.as_slice() == anonymous.as_slice());
+        store
+            .record_artifact(&environment.artifact(80, b"pending anonymous work"), 80)
+            .unwrap();
+        drop(store);
+
+        let bearer = UploadAuthorizationFingerprint::for_bearer_token("account-a-secret");
+        assert!(matches!(
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                bearer,
+            ),
+            Err(UploadStoreError::AuthorizationIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn bearer_token_identity_allows_same_token_and_rejects_rotation_with_live_work() {
+        let environment = TestEnvironment::new();
+        let original_token = "same-actual-token-from-either-environment-variable";
+        let original = UploadAuthorizationFingerprint::for_bearer_token(original_token);
+        drop(
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                original,
+            )
+            .unwrap(),
+        );
+
+        // The source environment-variable name is deliberately absent from
+        // the identity API, so the same actual token remains equivalent.
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            UploadAuthorizationFingerprint::for_bearer_token(original_token),
+        )
+        .unwrap();
+        store
+            .record_artifact(&environment.artifact(81, b"pending bearer work"), 81)
+            .unwrap();
+        drop(store);
+
+        let error = match UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            UploadAuthorizationFingerprint::for_bearer_token("rotated-account-token"),
+        ) {
+            Ok(_) => panic!("a changed bearer token reopened the existing upload ledger"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            UploadStoreError::AuthorizationIdentityMismatch
+        ));
+        let error_text = error.to_string();
+        assert!(!error_text.contains(original_token));
+        assert!(!error_text.contains("rotated-account-token"));
+
+        for database_file in [
+            environment.database.clone(),
+            environment.database.with_extension("sqlite3-wal"),
+        ] {
+            if let Ok(bytes) = fs::read(database_file) {
+                assert!(
+                    !bytes
+                        .windows(original_token.len())
+                        .any(|window| window == original_token.as_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authorization_rotation_rebinds_a_drained_ledger_with_terminal_history() {
+        let environment = TestEnvironment::new();
+        let original = UploadAuthorizationFingerprint::for_bearer_token("original-token");
+        let rotated = UploadAuthorizationFingerprint::for_bearer_token("rotated-token");
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            original,
+        )
+        .unwrap();
+        store
+            .record_artifact(&environment.artifact(82, b"terminal history"), 82)
+            .unwrap();
+        let claim = store.claim_due(82).unwrap().unwrap();
+        store.mark_completed(&claim, 83, 204).unwrap();
+        store
+            .record_artifact(&environment.artifact(84, b"permanent terminal history"), 84)
+            .unwrap();
+        let claim = store.claim_due(84).unwrap().unwrap();
+        store
+            .mark_permanently_failed(&claim, 85, Some(400), Some("rejected"))
+            .unwrap();
+        drop(store);
+
+        let reopened = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            rotated,
+        )
+        .unwrap();
+        assert_eq!(reopened.snapshot().unwrap().counts.completed, 1);
+        assert_eq!(reopened.snapshot().unwrap().counts.permanently_failed, 1);
+        let stored: Vec<u8> = reopened
+            .connection
+            .query_row(
+                "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.as_slice() == rotated.as_slice());
+    }
+
+    #[test]
+    fn authorization_rotation_rejects_every_nonterminal_state_before_recovery() {
+        for state in ["pending", "in_progress", "retrying"] {
+            let environment = TestEnvironment::new();
+            let original = UploadAuthorizationFingerprint::for_bearer_token("original-token");
+            let mut store = UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                original,
+            )
+            .unwrap();
+            store
+                .record_artifact(&environment.artifact(83, state.as_bytes()), 83)
+                .unwrap();
+            if state != "pending" {
+                let claim = store.claim_due(83).unwrap().unwrap();
+                if state == "retrying" {
+                    store
+                        .mark_retrying(&claim, 84, 1_000, Some(503), Some("outage"))
+                        .unwrap();
+                }
+            }
+            drop(store);
+
+            assert!(matches!(
+                UploadStore::open(
+                    &environment.database,
+                    &environment.capture,
+                    TEST_DESTINATION,
+                    UploadAuthorizationFingerprint::for_bearer_token("rotated-token"),
+                ),
+                Err(UploadStoreError::AuthorizationIdentityMismatch)
+            ));
+        }
     }
 
     #[test]
@@ -1982,7 +2272,8 @@ mod tests {
             UploadStore::open(
                 &empty_environment.database,
                 &empty_environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .is_ok()
         );
@@ -1997,7 +2288,8 @@ mod tests {
             UploadStore::open(
                 &partial_environment.database,
                 &partial_environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::MissingSchema)
         ));
@@ -2010,9 +2302,27 @@ mod tests {
             UploadStore::open(
                 &future_environment.database,
                 &future_environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::UnsupportedSchema { found: 99, .. })
+        ));
+
+        let unbound_environment = TestEnvironment::new();
+        let unbound = Connection::open(&unbound_environment.database).unwrap();
+        unbound.pragma_update(None, "user_version", 1).unwrap();
+        drop(unbound);
+        assert!(matches!(
+            UploadStore::open(
+                &unbound_environment.database,
+                &unbound_environment.capture,
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
+            ),
+            Err(UploadStoreError::UnsupportedSchema {
+                found: 1,
+                supported: SCHEMA_VERSION,
+            })
         ));
 
         let tampered_environment = TestEnvironment::new();
@@ -2021,6 +2331,7 @@ mod tests {
                 &tampered_environment.database,
                 &tampered_environment.capture,
                 TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .unwrap(),
         );
@@ -2036,7 +2347,8 @@ mod tests {
             UploadStore::open(
                 &tampered_environment.database,
                 &tampered_environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::InvalidSchema)
         ));
@@ -2047,7 +2359,8 @@ mod tests {
             UploadStore::open(
                 &root_environment.database,
                 &root_environment.other_capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             ),
             Err(UploadStoreError::CaptureRootMismatch)
         ));
@@ -2061,7 +2374,8 @@ mod tests {
             UploadStore::open(
                 &environment.database,
                 &environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .is_err()
         );
@@ -2070,7 +2384,8 @@ mod tests {
             UploadStore::open(
                 &environment.database,
                 &environment.capture,
-                TEST_DESTINATION
+                TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .is_ok()
         );

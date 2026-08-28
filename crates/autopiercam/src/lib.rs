@@ -31,8 +31,8 @@ mod upload;
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
 use upload::{
-    UploadEnqueueResult, UploadHealth, UploadObserver, UploadOptions, UploadSink, UploadTelemetry,
-    UploadWorker, bearer_authorization,
+    BearerAuthorization, UploadEnqueueResult, UploadHealth, UploadObserver, UploadOptions,
+    UploadSink, UploadTelemetry, UploadWorker, bearer_authorization,
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -822,7 +822,7 @@ fn start_upload_worker(
     })
 }
 
-fn load_bearer_authorization(variable: &str) -> Result<ureq::http::HeaderValue> {
+fn load_bearer_authorization(variable: &str) -> Result<BearerAuthorization> {
     let token = match std::env::var(variable) {
         Ok(token) => token,
         Err(std::env::VarError::NotPresent) => {

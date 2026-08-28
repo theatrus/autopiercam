@@ -26,8 +26,9 @@ use ureq::{
 mod upload_store;
 
 use upload_store::{
-    ArtifactVerification, ClaimedUpload, OpenedClaimedArtifact, RecordDisposition, UploadStore,
-    UploadStoreError, UploadStoreSnapshot, open_claimed_artifact,
+    ArtifactVerification, ClaimedUpload, OpenedClaimedArtifact, RecordDisposition,
+    UploadAuthorizationFingerprint, UploadStore, UploadStoreError, UploadStoreSnapshot,
+    open_claimed_artifact,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,7 +62,7 @@ const RETRY_TIME_ERROR: &str = "retry time cannot be represented safely";
 /// Complete HTTP configuration for one durable upload worker.
 pub(crate) struct UploadOptions {
     endpoint: Uri,
-    authorization: Option<HeaderValue>,
+    authorization: Option<BearerAuthorization>,
     /// Bounds coalesced wake hints. SQLite, not this channel, owns the queue.
     wake_capacity: usize,
 }
@@ -69,12 +70,9 @@ pub(crate) struct UploadOptions {
 impl UploadOptions {
     pub(crate) fn new(
         endpoint: Uri,
-        mut authorization: Option<HeaderValue>,
+        authorization: Option<BearerAuthorization>,
         wake_capacity: usize,
     ) -> Self {
-        if let Some(value) = &mut authorization {
-            value.set_sensitive(true);
-        }
         Self {
             endpoint,
             authorization,
@@ -83,14 +81,28 @@ impl UploadOptions {
     }
 }
 
-/// Constructs a sensitive `Authorization: Bearer ...` value without exposing
-/// rejected token bytes through this module's errors or logs.
+/// A sensitive bearer header paired with the one-way identity used to bind a
+/// durable ledger. Neither field exposes the underlying token.
+pub(crate) struct BearerAuthorization {
+    header: HeaderValue,
+    ledger_fingerprint: UploadAuthorizationFingerprint,
+}
+
+/// Constructs bearer authorization without exposing rejected token bytes
+/// through this module's errors or logs.
+///
+/// The ledger fingerprint follows the actual token rather than the environment
+/// variable that supplied it. Token rotation may rebind a ledger only after all
+/// work for the previous authorization identity is terminal.
 pub(crate) fn bearer_authorization(
     token: &str,
-) -> Result<HeaderValue, ureq::http::header::InvalidHeaderValue> {
+) -> Result<BearerAuthorization, ureq::http::header::InvalidHeaderValue> {
     let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
     value.set_sensitive(true);
-    Ok(value)
+    Ok(BearerAuthorization {
+        header: value,
+        ledger_fingerprint: UploadAuthorizationFingerprint::for_bearer_token(token),
+    })
 }
 
 /// A callback receives these snapshots in ledger mutation order. Callbacks
@@ -293,7 +305,13 @@ impl UploadWorker {
         }
 
         let now = clock.now_unix_ms()?;
-        let mut store = UploadStore::open(database_path, capture_directory, destination)?;
+        let authorization_fingerprint = transport.durable_ledger_authorization_fingerprint();
+        let mut store = UploadStore::open(
+            database_path,
+            capture_directory,
+            destination,
+            authorization_fingerprint,
+        )?;
         store.reconcile_capture_directory(now)?;
         notify_observer(&observer, UploadTelemetry::from(store.snapshot()?))?;
 
@@ -386,6 +404,10 @@ impl UploadClock for SystemClock {
 }
 
 trait UploadTransport: Send + 'static {
+    fn durable_ledger_authorization_fingerprint(&self) -> UploadAuthorizationFingerprint {
+        UploadAuthorizationFingerprint::anonymous()
+    }
+
     fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome;
 }
 
@@ -393,6 +415,7 @@ struct UreqTransport {
     agent: Agent,
     endpoint: Uri,
     authorization: Option<HeaderValue>,
+    authorization_fingerprint: UploadAuthorizationFingerprint,
 }
 
 impl UreqTransport {
@@ -408,15 +431,24 @@ impl UreqTransport {
             .tls_config(tls)
             .user_agent(concat!("AutoPierCam/", env!("CARGO_PKG_VERSION")))
             .build();
+        let (authorization, authorization_fingerprint) = match options.authorization {
+            Some(authorization) => (Some(authorization.header), authorization.ledger_fingerprint),
+            None => (None, UploadAuthorizationFingerprint::anonymous()),
+        };
         Self {
             agent: config.new_agent(),
             endpoint: options.endpoint,
-            authorization: options.authorization,
+            authorization,
+            authorization_fingerprint,
         }
     }
 }
 
 impl UploadTransport for UreqTransport {
+    fn durable_ledger_authorization_fingerprint(&self) -> UploadAuthorizationFingerprint {
+        self.authorization_fingerprint
+    }
+
     fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome {
         let file = match open_claimed_artifact(claim) {
             Ok(OpenedClaimedArtifact::Verified(file)) => file,
@@ -858,6 +890,75 @@ mod tests {
     }
 
     #[test]
+    fn worker_allows_drained_token_rotation_but_rejects_live_work_rotation() {
+        let environment = TestEnvironment::new();
+        let endpoint = Uri::from_static("http://127.0.0.1:9/upload");
+        let destination = endpoint.to_string();
+        let observer: UploadObserver = Arc::new(|_| {});
+
+        let (worker, sink) = UploadWorker::start(
+            UploadOptions::new(
+                endpoint.clone(),
+                Some(bearer_authorization("account-b-token").unwrap()),
+                1,
+            ),
+            &environment.database,
+            &environment.capture,
+            Arc::clone(&observer),
+        )
+        .unwrap();
+        worker.stop_and_join().unwrap();
+        drop(sink);
+
+        let (worker, sink) = UploadWorker::start(
+            UploadOptions::new(
+                endpoint.clone(),
+                Some(bearer_authorization("account-a-token").unwrap()),
+                1,
+            ),
+            &environment.database,
+            &environment.capture,
+            Arc::clone(&observer),
+        )
+        .unwrap();
+        worker.stop_and_join().unwrap();
+        drop(sink);
+
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            &destination,
+            UploadAuthorizationFingerprint::for_bearer_token("account-b-token"),
+        )
+        .unwrap();
+        store
+            .record_artifact(&environment.artifact(90, b"work bound to account b"), 90)
+            .unwrap();
+        drop(store);
+
+        let error = match UploadWorker::start(
+            UploadOptions::new(
+                endpoint,
+                Some(bearer_authorization("account-c-token").unwrap()),
+                1,
+            ),
+            &environment.database,
+            &environment.capture,
+            observer,
+        ) {
+            Ok(_) => panic!("a changed bearer token adopted live durable work"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            UploadError::Store(UploadStoreError::AuthorizationIdentityMismatch)
+        ));
+        assert!(!error.to_string().contains("account-a-token"));
+        assert!(!error.to_string().contains("account-b-token"));
+        assert!(!error.to_string().contains("account-c-token"));
+    }
+
+    #[test]
     fn fatal_worker_error_stops_health_while_later_intents_remain_durable() {
         let environment = TestEnvironment::new();
         let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -921,6 +1022,7 @@ mod tests {
             &environment.database,
             &environment.capture,
             TEST_DESTINATION,
+            UploadAuthorizationFingerprint::anonymous(),
         )
         .unwrap();
         let recovered = reopened.snapshot().unwrap();
@@ -1200,6 +1302,7 @@ mod tests {
                 &environment.database,
                 &environment.capture,
                 TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .unwrap();
             store.record_artifact(&artifact, 20_000).unwrap();
@@ -1237,6 +1340,7 @@ mod tests {
                 &environment.database,
                 &environment.capture,
                 TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .unwrap();
             store.record_artifact(&missing, 30_000).unwrap();
@@ -1271,6 +1375,7 @@ mod tests {
                 &environment.database,
                 &environment.capture,
                 TEST_DESTINATION,
+                UploadAuthorizationFingerprint::anonymous(),
             )
             .unwrap();
             store.record_artifact(&artifact, 31_000).unwrap();
@@ -1365,6 +1470,7 @@ mod tests {
             &environment.database,
             &environment.capture,
             TEST_DESTINATION,
+            transport.durable_ledger_authorization_fingerprint(),
         )
         .unwrap();
         store.record_artifact(&artifact, 40_000).unwrap();
