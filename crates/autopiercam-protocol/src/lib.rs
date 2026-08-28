@@ -25,6 +25,7 @@ pub const METHOD_UPLOADS_LIST: &str = "uploads.list";
 pub const METHOD_UPLOADS_REQUEUE: &str = "uploads.requeue";
 pub const CAPABILITY_UPLOADS_LIST: &str = METHOD_UPLOADS_LIST;
 pub const CAPABILITY_UPLOADS_REQUEUE: &str = METHOD_UPLOADS_REQUEUE;
+pub const CAPABILITY_STORAGE_RETENTION: &str = "storage.retention";
 
 pub const UPLOAD_LIST_DEFAULT_PAGE_SIZE: u16 = 50;
 pub const UPLOAD_LIST_MAX_PAGE_SIZE: u16 = 100;
@@ -33,6 +34,7 @@ pub const UPLOAD_CURSOR_MAX_BYTES: usize = 512;
 pub const UPLOAD_LEDGER_ID_MAX_BYTES: usize = 128;
 pub const UPLOAD_FILENAME_MAX_BYTES: usize = 255;
 pub const UPLOAD_ERROR_MAX_BYTES: usize = 2_048;
+pub const UPLOAD_JOB_ID_MAX: u64 = i64::MAX as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Method {
@@ -392,8 +394,8 @@ pub struct UploadJobSummary {
 
 impl UploadJobSummary {
     pub fn validate(&self) -> Result<(), UploadAdminValidationError> {
-        if self.job_id == 0 {
-            return Err(UploadAdminValidationError::ZeroJobId);
+        if !(1..=UPLOAD_JOB_ID_MAX).contains(&self.job_id) {
+            return Err(UploadAdminValidationError::InvalidJobId(self.job_id));
         }
         if self.job_revision == 0 {
             return Err(UploadAdminValidationError::ZeroJobRevision);
@@ -482,8 +484,8 @@ pub struct UploadRequeueRequest {
 impl UploadRequeueRequest {
     pub fn validate(&self) -> Result<(), UploadAdminValidationError> {
         validate_upload_ledger_id(&self.ledger_id)?;
-        if self.job_id == 0 {
-            return Err(UploadAdminValidationError::ZeroJobId);
+        if !(1..=UPLOAD_JOB_ID_MAX).contains(&self.job_id) {
+            return Err(UploadAdminValidationError::InvalidJobId(self.job_id));
         }
         if self.expected_job_revision == 0 {
             return Err(UploadAdminValidationError::ZeroJobRevision);
@@ -517,8 +519,8 @@ pub enum UploadAdminValidationError {
     InvalidCursor(String),
     #[error("invalid upload ledger_id: {0}")]
     InvalidLedgerId(String),
-    #[error("job_id must be greater than zero")]
-    ZeroJobId,
+    #[error("job_id {0} is outside 1..={UPLOAD_JOB_ID_MAX}")]
+    InvalidJobId(u64),
     #[error("job revision must be greater than zero")]
     ZeroJobRevision,
     #[error("invalid upload filename: {0}")]
@@ -1277,6 +1279,7 @@ mod tests {
         assert_eq!(METHOD_UPLOADS_REQUEUE, "uploads.requeue");
         assert_eq!(CAPABILITY_UPLOADS_LIST, METHOD_UPLOADS_LIST);
         assert_eq!(CAPABILITY_UPLOADS_REQUEUE, METHOD_UPLOADS_REQUEUE);
+        assert_eq!(CAPABILITY_STORAGE_RETENTION, "storage.retention");
         assert_eq!(Method::UploadsList.to_string(), METHOD_UPLOADS_LIST);
         assert_eq!(Method::UploadsRequeue.to_string(), METHOD_UPLOADS_REQUEUE);
 
@@ -1467,7 +1470,7 @@ mod tests {
             job.validate(),
             Err(UploadAdminValidationError::InvalidLastError(_))
         ));
-        for (job_id, revision) in [(0, 1), (1, 0)] {
+        for (job_id, revision) in [(0, 1), (UPLOAD_JOB_ID_MAX + 1, 1), (1, 0)] {
             job = upload_job_summary();
             job.job_id = job_id;
             job.job_revision = revision;
@@ -1620,7 +1623,12 @@ mod tests {
             .validate(),
             Err(UploadAdminValidationError::DuplicateJobId(42))
         ));
-        for (ledger_id, job_id, revision) in [("", 1, 1), ("ledger", 0, 1), ("ledger", 1, 0)] {
+        for (ledger_id, job_id, revision) in [
+            ("", 1, 1),
+            ("ledger", 0, 1),
+            ("ledger", UPLOAD_JOB_ID_MAX + 1, 1),
+            ("ledger", 1, 0),
+        ] {
             assert!(
                 UploadRequeueRequest {
                     ledger_id: ledger_id.to_owned(),
