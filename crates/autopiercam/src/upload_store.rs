@@ -9,18 +9,34 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: i64 = 0x4150_4355;
-const SCHEMA_SIGNATURE: &str = "autopiercam-upload-ledger-v3-destination-authorization-preactivation-inventory-aggregates-sha256-20260828";
+const SCHEMA_SIGNATURE: &str =
+    "autopiercam-upload-ledger-v4-operator-pagination-requeue-delivery-binding-revisions-20260828";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const IDEMPOTENCY_PREFIX: &str = "autopiercam-sha256-";
 const CAPTURE_SESSION_NONCE_HEX_LENGTH: usize = 32;
 const AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] = b"autopiercam-upload-authorization-identity-v1\0";
+const DELIVERY_BINDING_DOMAIN: &[u8] = b"autopiercam-upload-delivery-binding-v1\0";
+const LIST_CURSOR_DOMAIN: &[u8] = b"autopiercam-upload-list-cursor-v1\0";
+const LIST_CURSOR_LEDGER_DOMAIN: &[u8] = b"autopiercam-upload-list-ledger-v1\0";
+const LIST_CURSOR_PREFIX: &str = "apcu1_";
+const LIST_CURSOR_PAYLOAD_LENGTH: usize = 35;
+const LIST_CURSOR_MAC_LENGTH: usize = 16;
+const LIST_CURSOR_ENCODED_LENGTH: usize =
+    LIST_CURSOR_PREFIX.len() + (LIST_CURSOR_PAYLOAD_LENGTH + LIST_CURSOR_MAC_LENGTH) * 2;
+const ALL_UPLOAD_STATE_FILTER_MASK: u8 = 0b1_1111;
+pub(crate) const MAX_UPLOAD_LIST_PAGE_SIZE: u16 = 100;
 
 const CREATE_METADATA: &str = r#"
 CREATE TABLE upload_metadata (
     singleton                INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_signature         TEXT NOT NULL,
+    ledger_id                BLOB NOT NULL UNIQUE CHECK (length(ledger_id) = 16),
+    ledger_revision          INTEGER NOT NULL DEFAULT 0 CHECK (
+                                 typeof(ledger_revision) = 'integer' AND
+                                 ledger_revision >= 0
+                             ),
     capture_root             TEXT NOT NULL,
     destination              TEXT NOT NULL CHECK (
                                  length(destination) > 0 AND
@@ -75,6 +91,9 @@ CREATE TABLE upload_jobs (
     idempotency_key        TEXT NOT NULL UNIQUE,
     file_size              INTEGER NOT NULL CHECK (file_size >= 0),
     sha256                 BLOB NOT NULL CHECK (length(sha256) = 32),
+    delivery_binding_sha256 BLOB NOT NULL CHECK (
+                                length(delivery_binding_sha256) = 32
+                            ),
     state                  TEXT NOT NULL CHECK (
                                state IN (
                                    'pending',
@@ -100,6 +119,15 @@ CREATE TABLE upload_jobs (
     last_failure_at_ms     INTEGER CHECK (
                                last_failure_at_ms IS NULL OR last_failure_at_ms >= 0
                            ),
+    job_revision           INTEGER NOT NULL DEFAULT 1 CHECK (
+                               typeof(job_revision) = 'integer' AND job_revision >= 1
+                           ),
+    requeue_count          INTEGER NOT NULL DEFAULT 0 CHECK (
+                               typeof(requeue_count) = 'integer' AND requeue_count >= 0
+                           ),
+    last_requeued_at_ms    INTEGER CHECK (
+                               last_requeued_at_ms IS NULL OR last_requeued_at_ms >= 0
+                           ),
     CHECK (
         (state = 'retrying' AND next_attempt_at_ms IS NOT NULL) OR
         (state <> 'retrying' AND next_attempt_at_ms IS NULL)
@@ -107,6 +135,10 @@ CREATE TABLE upload_jobs (
     CHECK (
         (state = 'completed' AND completed_at_ms IS NOT NULL) OR
         (state <> 'completed' AND completed_at_ms IS NULL)
+    ),
+    CHECK (
+        (requeue_count = 0 AND last_requeued_at_ms IS NULL) OR
+        (requeue_count > 0 AND last_requeued_at_ms IS NOT NULL)
     )
 ) STRICT
 "#;
@@ -128,6 +160,7 @@ BEGIN
         completed_count = completed_count + (NEW.state = 'completed'),
         permanently_failed_count =
             permanently_failed_count + (NEW.state = 'permanently_failed'),
+        ledger_revision = ledger_revision + 1,
         last_success_at_ms = CASE
             WHEN NEW.completed_at_ms IS NOT NULL AND
                  (last_success_at_ms IS NULL OR
@@ -155,7 +188,7 @@ END
 
 const CREATE_UPDATE_AGGREGATE_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_after_status_update
-AFTER UPDATE OF state, completed_at_ms, last_failure_at_ms, last_error ON upload_jobs
+AFTER UPDATE ON upload_jobs
 BEGIN
     UPDATE upload_metadata
     SET pending_count = pending_count
@@ -169,6 +202,7 @@ BEGIN
         permanently_failed_count = permanently_failed_count
             - (OLD.state = 'permanently_failed')
             + (NEW.state = 'permanently_failed'),
+        ledger_revision = ledger_revision + 1,
         last_success_at_ms = CASE
             WHEN NEW.completed_at_ms IS NOT OLD.completed_at_ms AND
                  NEW.completed_at_ms IS NOT NULL AND
@@ -197,12 +231,31 @@ BEGIN
 END
 "#;
 
+const CREATE_JOB_REVISION_GUARD_TRIGGER: &str = r#"
+CREATE TRIGGER upload_jobs_revision_guard
+BEFORE UPDATE ON upload_jobs
+WHEN NEW.job_revision <> OLD.job_revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'upload job revision must increment exactly once');
+END
+"#;
+
 const CREATE_IMMUTABLE_IDENTITY_TRIGGER: &str = r#"
 CREATE TRIGGER upload_jobs_identity_immutable
-BEFORE UPDATE OF artifact_path, filename, idempotency_key, file_size, sha256, created_at_ms
+BEFORE UPDATE OF artifact_path, filename, idempotency_key, file_size, sha256,
+                 delivery_binding_sha256, created_at_ms
 ON upload_jobs
 BEGIN
     SELECT RAISE(ABORT, 'upload artifact identity is immutable');
+END
+"#;
+
+const CREATE_IMMUTABLE_METADATA_TRIGGER: &str = r#"
+CREATE TRIGGER upload_metadata_identity_immutable
+BEFORE UPDATE OF schema_signature, ledger_id, capture_root, destination
+ON upload_metadata
+BEGIN
+    SELECT RAISE(ABORT, 'upload ledger identity is immutable');
 END
 "#;
 
@@ -222,6 +275,7 @@ SELECT
     idempotency_key,
     file_size,
     sha256,
+    delivery_binding_sha256,
     state,
     attempt_count,
     next_attempt_at_ms,
@@ -230,7 +284,10 @@ SELECT
     created_at_ms,
     updated_at_ms,
     completed_at_ms,
-    last_failure_at_ms
+    last_failure_at_ms,
+    job_revision,
+    requeue_count,
+    last_requeued_at_ms
 FROM upload_jobs
 LIMIT 0
 "#;
@@ -271,6 +328,9 @@ pub(crate) enum UploadStoreError {
     #[error("the upload ledger belongs to a different upload authorization identity")]
     AuthorizationIdentityMismatch,
 
+    #[error("could not obtain secure randomness for a new upload ledger identity")]
+    Randomness,
+
     #[error("SQLite did not enable the requested {name} setting (reported {actual:?})")]
     Configuration { name: &'static str, actual: String },
 
@@ -310,12 +370,17 @@ pub(crate) enum UploadStoreError {
     #[error("upload ledger contains an invalid {column} integer: {value}")]
     CorruptInteger { column: &'static str, value: i64 },
 
-    #[cfg(test)]
     #[error("upload ledger contains an unknown upload state: {0:?}")]
     CorruptState(String),
 
     #[error("upload job {0} has inconsistent identity metadata")]
     CorruptArtifactIdentity(UploadJobId),
+
+    #[error("upload job {0} has a delivery binding inconsistent with the active ledger identity")]
+    UploadJobDeliveryBindingMismatch(UploadJobId),
+
+    #[error("upload job ID {0} is outside the supported range")]
+    InvalidJobId(u64),
 
     #[error("upload job {0} is not in progress or its attempt is stale")]
     InvalidTransition(UploadJobId),
@@ -325,6 +390,48 @@ pub(crate) enum UploadStoreError {
 
     #[error("upload reconciliation counter overflowed")]
     ReconcileCountOverflow,
+
+    #[error("upload list page size must be between 1 and {maximum}")]
+    InvalidListPageSize { maximum: u16 },
+
+    #[error("upload list cursor is invalid")]
+    InvalidListCursor,
+
+    #[error("upload list cursor is stale")]
+    StaleListCursor,
+
+    #[error("upload list cursor does not match the requested filter or page size")]
+    ListCursorParametersMismatch,
+
+    #[error("upload list state filter contains a duplicate state")]
+    DuplicateListStateFilter,
+
+    #[error("the upload ledger identity does not match the requeue request")]
+    RequeueLedgerMismatch,
+
+    #[error("the upload job does not exist")]
+    RequeueJobNotFound,
+
+    #[error("the upload job is not permanently failed")]
+    RequeueWrongState,
+
+    #[error("the upload job changed after it was listed")]
+    RequeueStaleJobRevision,
+
+    #[error("the upload job belongs to a different delivery identity")]
+    RequeueDeliveryBindingMismatch,
+
+    #[error("the upload artifact is missing or is not a safe regular file")]
+    RequeueArtifactUnavailable,
+
+    #[error("the upload artifact no longer matches its recorded size and digest")]
+    RequeueArtifactChanged,
+
+    #[error("upload job {0} has exhausted SQLite's revision counter")]
+    JobRevisionOverflow(UploadJobId),
+
+    #[error("upload job {0} has exhausted SQLite's requeue counter")]
+    RequeueCountOverflow(UploadJobId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -333,6 +440,47 @@ pub(crate) struct UploadJobId(i64);
 impl std::fmt::Display for UploadJobId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl UploadJobId {
+    pub(crate) fn get(self) -> u64 {
+        self.0 as u64
+    }
+
+    pub(crate) fn from_u64(value: u64) -> Result<Self, UploadStoreError> {
+        let value = i64::try_from(value).map_err(|_| UploadStoreError::InvalidJobId(value))?;
+        if value <= 0 {
+            return Err(UploadStoreError::InvalidJobId(value as u64));
+        }
+        job_id_from_database(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct UploadLedgerId([u8; 16]);
+
+impl UploadLedgerId {
+    fn random() -> Result<Self, UploadStoreError> {
+        let mut value = [0_u8; 16];
+        getrandom::fill(&mut value).map_err(|_| UploadStoreError::Randomness)?;
+        Ok(Self(value))
+    }
+
+    fn from_database(value: Vec<u8>) -> Result<Self, UploadStoreError> {
+        value
+            .try_into()
+            .map(Self)
+            .map_err(|_| UploadStoreError::InvalidSchema)
+    }
+
+    pub(crate) fn as_hex(self) -> String {
+        hex_encode(&self.0)
+    }
+
+    pub(crate) fn parse_hex(value: &str) -> Result<Self, UploadStoreError> {
+        let bytes = hex_decode_exact::<16>(value).ok_or(UploadStoreError::RequeueLedgerMismatch)?;
+        Ok(Self(bytes))
     }
 }
 
@@ -368,7 +516,31 @@ impl UploadAuthorizationFingerprint {
     }
 }
 
-#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UploadDeliveryBinding([u8; 32]);
+
+impl UploadDeliveryBinding {
+    fn derive(destination: &str, authorization: UploadAuthorizationFingerprint) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(DELIVERY_BINDING_DOMAIN);
+        hasher.update((destination.len() as u64).to_be_bytes());
+        hasher.update(destination.as_bytes());
+        hasher.update(authorization.as_slice());
+        Self(hasher.finalize().into())
+    }
+
+    fn from_database(job_id: UploadJobId, value: Vec<u8>) -> Result<Self, UploadStoreError> {
+        value
+            .try_into()
+            .map(Self)
+            .map_err(|_| UploadStoreError::CorruptArtifactIdentity(job_id))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UploadState {
     Pending,
@@ -378,7 +550,6 @@ pub(crate) enum UploadState {
     PermanentlyFailed,
 }
 
-#[cfg(test)]
 impl UploadState {
     fn from_database(value: String) -> Result<Self, UploadStoreError> {
         match value.as_str() {
@@ -390,6 +561,72 @@ impl UploadState {
             _ => Err(UploadStoreError::CorruptState(value)),
         }
     }
+
+    fn cursor_code(self) -> u8 {
+        match self {
+            Self::Pending => 1,
+            Self::InProgress => 2,
+            Self::Retrying => 3,
+            Self::Completed => 4,
+            Self::PermanentlyFailed => 5,
+        }
+    }
+
+    fn filter_bit(self) -> u8 {
+        1 << (self.cursor_code() - 1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadListCursor(String);
+
+impl UploadListCursor {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadListItem {
+    pub(crate) job_id: UploadJobId,
+    pub(crate) artifact_path: PathBuf,
+    pub(crate) filename: String,
+    pub(crate) file_size: u64,
+    pub(crate) sha256: [u8; 32],
+    pub(crate) state: UploadState,
+    pub(crate) attempt_count: u64,
+    pub(crate) next_attempt_at_unix_ms: Option<u64>,
+    pub(crate) last_http_status: Option<u16>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) updated_at_unix_ms: u64,
+    pub(crate) completed_at_unix_ms: Option<u64>,
+    pub(crate) last_failure_at_unix_ms: Option<u64>,
+    pub(crate) job_revision: u64,
+    pub(crate) requeue_count: u64,
+    pub(crate) last_requeued_at_unix_ms: Option<u64>,
+    pub(crate) delivery_binding_is_current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadListPage {
+    pub(crate) ledger_id: UploadLedgerId,
+    pub(crate) ledger_revision: u64,
+    pub(crate) jobs: Vec<UploadListItem>,
+    pub(crate) next_cursor: Option<UploadListCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequeueUploadRequest {
+    pub(crate) ledger_id: UploadLedgerId,
+    pub(crate) job_id: UploadJobId,
+    pub(crate) expected_job_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequeueUploadResult {
+    pub(crate) ledger_revision: u64,
+    pub(crate) job: UploadListItem,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +670,10 @@ pub(crate) struct UploadJobRecord {
     pub(crate) updated_at_unix_ms: u64,
     pub(crate) completed_at_unix_ms: Option<u64>,
     pub(crate) last_failure_at_unix_ms: Option<u64>,
+    pub(crate) job_revision: u64,
+    pub(crate) requeue_count: u64,
+    pub(crate) last_requeued_at_unix_ms: Option<u64>,
+    pub(crate) delivery_binding_is_current: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -508,6 +749,8 @@ pub(crate) enum SnapshottedClaimedArtifact {
 pub(crate) struct UploadStore {
     connection: Connection,
     capture_root: PathBuf,
+    ledger_id: UploadLedgerId,
+    delivery_binding: UploadDeliveryBinding,
 }
 
 impl UploadStore {
@@ -523,6 +766,8 @@ impl UploadStore {
             .to_str()
             .ok_or_else(|| UploadStoreError::CaptureDirectoryNotUtf8(capture_root.clone()))?;
         let destination = normalize_destination(destination)?;
+        let delivery_binding =
+            UploadDeliveryBinding::derive(&destination, authorization_fingerprint);
         let mut connection = Connection::open(database_path)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
 
@@ -536,6 +781,7 @@ impl UploadStore {
                     capture_root_text,
                     &destination,
                     authorization_fingerprint,
+                    UploadLedgerId::random()?,
                     &preactivation_artifacts,
                 )?;
             }
@@ -558,9 +804,12 @@ impl UploadStore {
         verify_schema(&connection, capture_root_text, &destination)?;
         rotate_authorization_if_drained(&mut connection, &capture_root, authorization_fingerprint)?;
         recover_interrupted_jobs(&mut connection)?;
+        let ledger_id = read_ledger_id(&connection)?;
         Ok(Self {
             connection,
             capture_root,
+            ledger_id,
+            delivery_binding,
         })
     }
 
@@ -577,11 +826,13 @@ impl UploadStore {
             r#"
             INSERT INTO upload_jobs (
                 artifact_path, filename, idempotency_key, file_size, sha256,
+                delivery_binding_sha256,
                 state, attempt_count, next_attempt_at_ms, last_http_status,
                 last_error, created_at_ms, updated_at_ms, completed_at_ms,
-                last_failure_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL,
-                      ?6, ?6, NULL, NULL)
+                last_failure_at_ms, job_revision, requeue_count,
+                last_requeued_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, NULL, NULL, NULL,
+                      ?7, ?7, NULL, NULL, 1, 0, NULL)
             ON CONFLICT(artifact_path) DO NOTHING
             "#,
             params![
@@ -590,6 +841,7 @@ impl UploadStore {
                 &values.idempotency_key,
                 file_size,
                 values.sha256.as_slice(),
+                self.delivery_binding.as_slice(),
                 recorded_at
             ],
         )?;
@@ -639,7 +891,8 @@ impl UploadStore {
             .query_row(
                 r#"
                 SELECT id, artifact_path, filename, idempotency_key,
-                       file_size, sha256, attempt_count
+                       file_size, sha256, delivery_binding_sha256,
+                       attempt_count
                 FROM upload_jobs
                 WHERE state IN ('pending', 'retrying')
                   AND COALESCE(next_attempt_at_ms, created_at_ms) <= ?1
@@ -655,7 +908,8 @@ impl UploadStore {
                         idempotency_key: row.get(3)?,
                         file_size: row.get(4)?,
                         sha256: row.get(5)?,
-                        attempt_count: row.get(6)?,
+                        delivery_binding: row.get(6)?,
+                        attempt_count: row.get(7)?,
                     })
                 },
             )
@@ -666,7 +920,7 @@ impl UploadStore {
         };
 
         let job_id = job_id_from_database(candidate.id)?;
-        let claim = candidate.into_claim(job_id, &self.capture_root)?;
+        let claim = candidate.into_claim(job_id, &self.capture_root, self.delivery_binding)?;
         let next_attempt_count = i64::try_from(claim.attempt_count)
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -675,7 +929,8 @@ impl UploadStore {
             r#"
             UPDATE upload_jobs
             SET state = 'in_progress', attempt_count = ?2,
-                next_attempt_at_ms = NULL, updated_at_ms = ?1
+                next_attempt_at_ms = NULL, updated_at_ms = ?1,
+                job_revision = job_revision + 1
             WHERE id = ?3
               AND state IN ('pending', 'retrying')
               AND COALESCE(next_attempt_at_ms, created_at_ms) <= ?1
@@ -706,7 +961,7 @@ impl UploadStore {
             r#"
             UPDATE upload_jobs
             SET state = 'pending', next_attempt_at_ms = NULL,
-                updated_at_ms = ?1
+                updated_at_ms = ?1, job_revision = job_revision + 1
             WHERE id = ?2 AND state = 'in_progress' AND attempt_count = ?3
             "#,
             params![now, claim.job_id.0, attempt_count],
@@ -730,7 +985,8 @@ impl UploadStore {
             UPDATE upload_jobs
             SET state = 'retrying', next_attempt_at_ms = ?1,
                 last_http_status = ?2, last_error = ?3,
-                updated_at_ms = ?4, last_failure_at_ms = ?4
+                updated_at_ms = ?4, last_failure_at_ms = ?4,
+                job_revision = job_revision + 1
             WHERE id = ?5 AND state = 'in_progress' AND attempt_count = ?6
             "#,
             params![
@@ -758,7 +1014,7 @@ impl UploadStore {
             UPDATE upload_jobs
             SET state = 'completed', next_attempt_at_ms = NULL,
                 last_http_status = ?1, updated_at_ms = ?2,
-                completed_at_ms = ?2
+                completed_at_ms = ?2, job_revision = job_revision + 1
             WHERE id = ?3 AND state = 'in_progress' AND attempt_count = ?4
             "#,
             params![
@@ -785,7 +1041,8 @@ impl UploadStore {
             UPDATE upload_jobs
             SET state = 'permanently_failed', next_attempt_at_ms = NULL,
                 last_http_status = ?1, last_error = ?2,
-                updated_at_ms = ?3, last_failure_at_ms = ?3
+                updated_at_ms = ?3, last_failure_at_ms = ?3,
+                job_revision = job_revision + 1
             WHERE id = ?4 AND state = 'in_progress' AND attempt_count = ?5
             "#,
             params![
@@ -809,17 +1066,19 @@ impl UploadStore {
             .query_row(
                 r#"
                 SELECT id, artifact_path, filename, idempotency_key,
-                       file_size, sha256, state, attempt_count,
+                       file_size, sha256, delivery_binding_sha256,
+                       state, attempt_count,
                        next_attempt_at_ms, last_http_status, last_error,
                        created_at_ms, updated_at_ms, completed_at_ms,
-                       last_failure_at_ms
+                       last_failure_at_ms, job_revision, requeue_count,
+                       last_requeued_at_ms
                 FROM upload_jobs WHERE id = ?1
                 "#,
                 [job_id.0],
                 RawUploadJob::from_row,
             )
             .optional()?;
-        raw.map(|raw| raw.into_record(&self.capture_root))
+        raw.map(|raw| raw.into_record(&self.capture_root, self.delivery_binding))
             .transpose()
     }
 
@@ -865,6 +1124,255 @@ impl UploadStore {
             last_failure_at_unix_ms: optional_database_u64("last_failure_at_ms", aggregate.6)?,
             last_error: aggregate.7,
             next_due_at_unix_ms: optional_database_u64("next due time", next_due)?,
+        })
+    }
+
+    /// Lists a revision-stable, newest-first page. The cursor is intentionally
+    /// opaque: it is authenticated against this ledger's random identity and
+    /// binds the global revision, high-water job ID, filter, and page size.
+    /// Consequently every durable mutation invalidates every outstanding
+    /// cursor instead of producing a mixed-time operator view.
+    pub(crate) fn list_jobs(
+        &self,
+        state_filters: &[UploadState],
+        page_size: u16,
+        cursor: Option<&str>,
+    ) -> Result<UploadListPage, UploadStoreError> {
+        if page_size == 0 || page_size > MAX_UPLOAD_LIST_PAGE_SIZE {
+            return Err(UploadStoreError::InvalidListPageSize {
+                maximum: MAX_UPLOAD_LIST_PAGE_SIZE,
+            });
+        }
+        let (raw_ledger_id, raw_revision, raw_high_water): (Vec<u8>, i64, i64) =
+            self.connection.query_row(
+                r#"
+                SELECT ledger_id, ledger_revision,
+                       COALESCE((SELECT MAX(id) FROM upload_jobs), 0)
+                FROM upload_metadata WHERE singleton = 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let ledger_id = UploadLedgerId::from_database(raw_ledger_id)?;
+        if ledger_id != self.ledger_id {
+            return Err(UploadStoreError::InvalidSchema);
+        }
+        let ledger_revision = database_u64("ledger_revision", raw_revision)?;
+        let current_high_water = database_u64("high-water id", raw_high_water)?;
+        let filter_mask = canonical_state_filter_mask(state_filters)?;
+        let (high_water, before_id) = match cursor {
+            Some(cursor) => {
+                let decoded = decode_list_cursor(cursor, ledger_id)?;
+                if decoded.ledger_tag != list_cursor_ledger_tag(ledger_id)
+                    || decoded.ledger_revision != ledger_revision
+                {
+                    return Err(UploadStoreError::StaleListCursor);
+                }
+                if decoded.filter_mask != filter_mask || decoded.page_size != page_size {
+                    return Err(UploadStoreError::ListCursorParametersMismatch);
+                }
+                if decoded.high_water_id == 0
+                    || decoded.before_id == 0
+                    || decoded.before_id > decoded.high_water_id
+                    || decoded.high_water_id > current_high_water
+                {
+                    return Err(UploadStoreError::InvalidListCursor);
+                }
+                (decoded.high_water_id, decoded.before_id)
+            }
+            None => (current_high_water, u64::MAX),
+        };
+
+        let high_water_database =
+            i64::try_from(high_water).map_err(|_| UploadStoreError::InvalidListCursor)?;
+        let before_database = if cursor.is_some() {
+            Some(i64::try_from(before_id).map_err(|_| UploadStoreError::InvalidListCursor)?)
+        } else {
+            None
+        };
+        let limit = i64::from(page_size) + 1;
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT id, artifact_path, filename, idempotency_key,
+                   file_size, sha256, delivery_binding_sha256,
+                   state, attempt_count, next_attempt_at_ms,
+                   last_http_status, last_error, created_at_ms,
+                   updated_at_ms, completed_at_ms, last_failure_at_ms,
+                   job_revision, requeue_count, last_requeued_at_ms
+            FROM upload_jobs
+            WHERE id <= ?1 AND (?2 IS NULL OR id < ?2)
+              AND (?3 & CASE state
+                    WHEN 'pending' THEN 1
+                    WHEN 'in_progress' THEN 2
+                    WHEN 'retrying' THEN 4
+                    WHEN 'completed' THEN 8
+                    WHEN 'permanently_failed' THEN 16
+                    ELSE 0
+                  END) <> 0
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )?;
+        let mut jobs = collect_list_items(
+            statement.query_map(
+                params![high_water_database, before_database, filter_mask, limit],
+                RawUploadJob::from_row,
+            )?,
+            &self.capture_root,
+            self.delivery_binding,
+        )?;
+
+        let has_more = jobs.len() > usize::from(page_size);
+        if has_more {
+            jobs.truncate(usize::from(page_size));
+        }
+        let next_cursor = if has_more {
+            let last_id = jobs
+                .last()
+                .expect("a nonzero full page has a last upload job")
+                .job_id
+                .get();
+            Some(encode_list_cursor(
+                ledger_id,
+                ledger_revision,
+                high_water,
+                last_id,
+                filter_mask,
+                page_size,
+            ))
+        } else {
+            None
+        };
+        Ok(UploadListPage {
+            ledger_id,
+            ledger_revision,
+            jobs,
+            next_cursor,
+        })
+    }
+
+    /// Requeues exactly one terminal failure after verifying the same local
+    /// bytes still exist. All operator fences are checked within one immediate
+    /// transaction, and the verified file handle remains open through commit.
+    pub(crate) fn requeue_permanently_failed(
+        &mut self,
+        request: RequeueUploadRequest,
+        requeued_at_unix_ms: u64,
+    ) -> Result<RequeueUploadResult, UploadStoreError> {
+        if request.ledger_id != self.ledger_id {
+            return Err(UploadStoreError::RequeueLedgerMismatch);
+        }
+        let requeued_at = unix_ms_to_database(requeued_at_unix_ms)?;
+        let expected_job_revision = i64::try_from(request.expected_job_revision)
+            .map_err(|_| UploadStoreError::RequeueStaleJobRevision)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw = transaction
+            .query_row(
+                r#"
+                SELECT artifact_path, filename, idempotency_key, file_size,
+                       sha256, delivery_binding_sha256, state, job_revision,
+                       requeue_count
+                FROM upload_jobs WHERE id = ?1
+                "#,
+                [request.job_id.0],
+                |row| {
+                    Ok(RawRequeueJob {
+                        artifact_path: row.get(0)?,
+                        filename: row.get(1)?,
+                        idempotency_key: row.get(2)?,
+                        file_size: row.get(3)?,
+                        sha256: row.get(4)?,
+                        delivery_binding: row.get(5)?,
+                        state: row.get(6)?,
+                        job_revision: row.get(7)?,
+                        requeue_count: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(UploadStoreError::RequeueJobNotFound)?;
+        if raw.state != "permanently_failed" {
+            return Err(UploadStoreError::RequeueWrongState);
+        }
+        if raw.job_revision != expected_job_revision {
+            return Err(UploadStoreError::RequeueStaleJobRevision);
+        }
+        let stored_binding =
+            UploadDeliveryBinding::from_database(request.job_id, raw.delivery_binding)?;
+        if stored_binding != self.delivery_binding {
+            return Err(UploadStoreError::RequeueDeliveryBindingMismatch);
+        }
+        let sha256 = sha256_from_database(request.job_id, raw.sha256)?;
+        let artifact_path = validate_stored_identity(
+            request.job_id,
+            raw.artifact_path,
+            &raw.filename,
+            &raw.idempotency_key,
+            &sha256,
+            &self.capture_root,
+        )?;
+        let file_size = database_u64("file_size", raw.file_size)?;
+        let verified_file = open_verified_requeue_artifact(&artifact_path, file_size, &sha256)?;
+        let next_job_revision = raw
+            .job_revision
+            .checked_add(1)
+            .ok_or(UploadStoreError::JobRevisionOverflow(request.job_id))?;
+        let next_requeue_count = raw
+            .requeue_count
+            .checked_add(1)
+            .ok_or(UploadStoreError::RequeueCountOverflow(request.job_id))?;
+        let changed = transaction.execute(
+            r#"
+            UPDATE upload_jobs
+            SET state = 'pending', next_attempt_at_ms = NULL,
+                updated_at_ms = ?1, job_revision = ?2,
+                requeue_count = ?3, last_requeued_at_ms = ?1
+            WHERE id = ?4 AND state = 'permanently_failed'
+              AND job_revision = ?5 AND delivery_binding_sha256 = ?6
+              AND EXISTS (
+                  SELECT 1 FROM upload_metadata
+                  WHERE singleton = 1 AND ledger_id = ?7
+              )
+            "#,
+            params![
+                requeued_at,
+                next_job_revision,
+                next_requeue_count,
+                request.job_id.0,
+                expected_job_revision,
+                self.delivery_binding.as_slice(),
+                self.ledger_id.0.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(UploadStoreError::RequeueStaleJobRevision);
+        }
+        let ledger_revision: i64 = transaction.query_row(
+            "SELECT ledger_revision FROM upload_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let updated = transaction.query_row(
+            r#"
+            SELECT id, artifact_path, filename, idempotency_key,
+                   file_size, sha256, delivery_binding_sha256,
+                   state, attempt_count, next_attempt_at_ms,
+                   last_http_status, last_error, created_at_ms,
+                   updated_at_ms, completed_at_ms, last_failure_at_ms,
+                   job_revision, requeue_count, last_requeued_at_ms
+            FROM upload_jobs WHERE id = ?1
+            "#,
+            [request.job_id.0],
+            RawUploadJob::from_row,
+        )?;
+        let job = updated.into_list_item(&self.capture_root, self.delivery_binding)?;
+        transaction.commit()?;
+        drop(verified_file);
+        Ok(RequeueUploadResult {
+            ledger_revision: database_u64("ledger_revision", ledger_revision)?,
+            job,
         })
     }
 
@@ -1079,6 +1587,82 @@ pub(crate) fn snapshot_claimed_artifact(
     Ok(SnapshottedClaimedArtifact::Verified(snapshot))
 }
 
+fn open_verified_requeue_artifact(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<File, UploadStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(UploadStoreError::RequeueArtifactUnavailable);
+        }
+        Err(source) => {
+            return Err(UploadStoreError::Io {
+                operation: "inspect artifact for requeue",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(UploadStoreError::RequeueArtifactUnavailable);
+    }
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(UploadStoreError::RequeueArtifactUnavailable);
+        }
+        Err(source) => {
+            return Err(UploadStoreError::Io {
+                operation: "resolve artifact for requeue",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if canonical != path {
+        return Err(UploadStoreError::RequeueArtifactUnavailable);
+    }
+    let mut file = match open_artifact_for_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(UploadStoreError::RequeueArtifactUnavailable);
+        }
+        Err(source) => {
+            return Err(UploadStoreError::Io {
+                operation: "open artifact for requeue",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let opened_metadata = file.metadata().map_err(|source| UploadStoreError::Io {
+        operation: "inspect opened artifact for requeue",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(UploadStoreError::RequeueArtifactUnavailable);
+    }
+    if opened_metadata.len() != expected_size {
+        return Err(UploadStoreError::RequeueArtifactChanged);
+    }
+    let actual_sha256 = sha256_open_file(&mut file, path)?;
+    let final_size = file
+        .metadata()
+        .map_err(|source| UploadStoreError::Io {
+            operation: "reinspect opened artifact for requeue",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if final_size != expected_size || actual_sha256 != *expected_sha256 {
+        return Err(UploadStoreError::RequeueArtifactChanged);
+    }
+    Ok(file)
+}
+
 fn copy_and_hash_snapshot(
     source: &mut File,
     snapshot: &mut File,
@@ -1200,6 +1784,7 @@ struct RawClaim {
     idempotency_key: String,
     file_size: i64,
     sha256: Vec<u8>,
+    delivery_binding: Vec<u8>,
     attempt_count: i64,
 }
 
@@ -1208,8 +1793,13 @@ impl RawClaim {
         self,
         job_id: UploadJobId,
         capture_root: &Path,
+        current_delivery_binding: UploadDeliveryBinding,
     ) -> Result<ClaimedUpload, UploadStoreError> {
         let sha256 = sha256_from_database(job_id, self.sha256)?;
+        let delivery_binding = UploadDeliveryBinding::from_database(job_id, self.delivery_binding)?;
+        if delivery_binding != current_delivery_binding {
+            return Err(UploadStoreError::UploadJobDeliveryBindingMismatch(job_id));
+        }
         let artifact_path = validate_stored_identity(
             job_id,
             self.artifact_path,
@@ -1230,7 +1820,6 @@ impl RawClaim {
     }
 }
 
-#[cfg(test)]
 struct RawUploadJob {
     id: i64,
     artifact_path: String,
@@ -1238,6 +1827,7 @@ struct RawUploadJob {
     idempotency_key: String,
     file_size: i64,
     sha256: Vec<u8>,
+    delivery_binding: Vec<u8>,
     state: String,
     attempt_count: i64,
     next_attempt_at_ms: Option<i64>,
@@ -1247,9 +1837,11 @@ struct RawUploadJob {
     updated_at_ms: i64,
     completed_at_ms: Option<i64>,
     last_failure_at_ms: Option<i64>,
+    job_revision: i64,
+    requeue_count: i64,
+    last_requeued_at_ms: Option<i64>,
 }
 
-#[cfg(test)]
 impl RawUploadJob {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -1259,21 +1851,31 @@ impl RawUploadJob {
             idempotency_key: row.get(3)?,
             file_size: row.get(4)?,
             sha256: row.get(5)?,
-            state: row.get(6)?,
-            attempt_count: row.get(7)?,
-            next_attempt_at_ms: row.get(8)?,
-            last_http_status: row.get(9)?,
-            last_error: row.get(10)?,
-            created_at_ms: row.get(11)?,
-            updated_at_ms: row.get(12)?,
-            completed_at_ms: row.get(13)?,
-            last_failure_at_ms: row.get(14)?,
+            delivery_binding: row.get(6)?,
+            state: row.get(7)?,
+            attempt_count: row.get(8)?,
+            next_attempt_at_ms: row.get(9)?,
+            last_http_status: row.get(10)?,
+            last_error: row.get(11)?,
+            created_at_ms: row.get(12)?,
+            updated_at_ms: row.get(13)?,
+            completed_at_ms: row.get(14)?,
+            last_failure_at_ms: row.get(15)?,
+            job_revision: row.get(16)?,
+            requeue_count: row.get(17)?,
+            last_requeued_at_ms: row.get(18)?,
         })
     }
 
-    fn into_record(self, capture_root: &Path) -> Result<UploadJobRecord, UploadStoreError> {
+    #[cfg(test)]
+    fn into_record(
+        self,
+        capture_root: &Path,
+        current_delivery_binding: UploadDeliveryBinding,
+    ) -> Result<UploadJobRecord, UploadStoreError> {
         let job_id = job_id_from_database(self.id)?;
         let sha256 = sha256_from_database(job_id, self.sha256)?;
+        let delivery_binding = UploadDeliveryBinding::from_database(job_id, self.delivery_binding)?;
         let artifact_path = validate_stored_identity(
             job_id,
             self.artifact_path,
@@ -1304,8 +1906,89 @@ impl RawUploadJob {
                 "last_failure_at_ms",
                 self.last_failure_at_ms,
             )?,
+            job_revision: database_u64("job_revision", self.job_revision)?,
+            requeue_count: database_u64("requeue_count", self.requeue_count)?,
+            last_requeued_at_unix_ms: optional_database_u64(
+                "last_requeued_at_ms",
+                self.last_requeued_at_ms,
+            )?,
+            delivery_binding_is_current: delivery_binding == current_delivery_binding,
         })
     }
+
+    fn into_list_item(
+        self,
+        capture_root: &Path,
+        current_delivery_binding: UploadDeliveryBinding,
+    ) -> Result<UploadListItem, UploadStoreError> {
+        let job_id = job_id_from_database(self.id)?;
+        let sha256 = sha256_from_database(job_id, self.sha256)?;
+        let delivery_binding = UploadDeliveryBinding::from_database(job_id, self.delivery_binding)?;
+        let artifact_path = validate_stored_identity(
+            job_id,
+            self.artifact_path,
+            &self.filename,
+            &self.idempotency_key,
+            &sha256,
+            capture_root,
+        )?;
+        Ok(UploadListItem {
+            job_id,
+            artifact_path,
+            filename: self.filename,
+            file_size: database_u64("file_size", self.file_size)?,
+            sha256,
+            state: UploadState::from_database(self.state)?,
+            attempt_count: database_u64("attempt_count", self.attempt_count)?,
+            next_attempt_at_unix_ms: optional_database_u64(
+                "next_attempt_at_ms",
+                self.next_attempt_at_ms,
+            )?,
+            last_http_status: optional_database_u16("last_http_status", self.last_http_status)?,
+            last_error: self.last_error,
+            created_at_unix_ms: database_u64("created_at_ms", self.created_at_ms)?,
+            updated_at_unix_ms: database_u64("updated_at_ms", self.updated_at_ms)?,
+            completed_at_unix_ms: optional_database_u64("completed_at_ms", self.completed_at_ms)?,
+            last_failure_at_unix_ms: optional_database_u64(
+                "last_failure_at_ms",
+                self.last_failure_at_ms,
+            )?,
+            job_revision: database_u64("job_revision", self.job_revision)?,
+            requeue_count: database_u64("requeue_count", self.requeue_count)?,
+            last_requeued_at_unix_ms: optional_database_u64(
+                "last_requeued_at_ms",
+                self.last_requeued_at_ms,
+            )?,
+            delivery_binding_is_current: delivery_binding == current_delivery_binding,
+        })
+    }
+}
+
+struct RawRequeueJob {
+    artifact_path: String,
+    filename: String,
+    idempotency_key: String,
+    file_size: i64,
+    sha256: Vec<u8>,
+    delivery_binding: Vec<u8>,
+    state: String,
+    job_revision: i64,
+    requeue_count: i64,
+}
+
+fn collect_list_items(
+    rows: rusqlite::MappedRows<
+        '_,
+        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawUploadJob>,
+    >,
+    capture_root: &Path,
+    current_delivery_binding: UploadDeliveryBinding,
+) -> Result<Vec<UploadListItem>, UploadStoreError> {
+    rows.map(|row| {
+        row.map_err(UploadStoreError::from)?
+            .into_list_item(capture_root, current_delivery_binding)
+    })
+    .collect()
 }
 
 fn canonical_capture_root(path: &Path) -> Result<PathBuf, UploadStoreError> {
@@ -1331,6 +2014,168 @@ fn normalize_destination(destination: &str) -> Result<String, UploadStoreError> 
         return Err(UploadStoreError::InvalidDestination);
     }
     Ok(normalized.to_owned())
+}
+
+fn read_ledger_id(connection: &Connection) -> Result<UploadLedgerId, UploadStoreError> {
+    let value: Vec<u8> = connection.query_row(
+        "SELECT ledger_id FROM upload_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    UploadLedgerId::from_database(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedListCursor {
+    ledger_tag: [u8; 8],
+    ledger_revision: u64,
+    high_water_id: u64,
+    before_id: u64,
+    filter_mask: u8,
+    page_size: u16,
+}
+
+fn encode_list_cursor(
+    ledger_id: UploadLedgerId,
+    ledger_revision: u64,
+    high_water_id: u64,
+    before_id: u64,
+    filter_mask: u8,
+    page_size: u16,
+) -> UploadListCursor {
+    let mut payload = [0_u8; LIST_CURSOR_PAYLOAD_LENGTH];
+    payload[..8].copy_from_slice(&list_cursor_ledger_tag(ledger_id));
+    payload[8..16].copy_from_slice(&ledger_revision.to_be_bytes());
+    payload[16..24].copy_from_slice(&high_water_id.to_be_bytes());
+    payload[24..32].copy_from_slice(&before_id.to_be_bytes());
+    payload[32] = filter_mask;
+    payload[33..35].copy_from_slice(&page_size.to_be_bytes());
+    let mac = list_cursor_mac(ledger_id, &payload);
+    let mut encoded = String::with_capacity(LIST_CURSOR_ENCODED_LENGTH);
+    encoded.push_str(LIST_CURSOR_PREFIX);
+    encoded.push_str(&hex_encode(&payload));
+    encoded.push_str(&hex_encode(&mac));
+    UploadListCursor(encoded)
+}
+
+fn decode_list_cursor(
+    cursor: &str,
+    ledger_id: UploadLedgerId,
+) -> Result<DecodedListCursor, UploadStoreError> {
+    if cursor.len() != LIST_CURSOR_ENCODED_LENGTH || !cursor.starts_with(LIST_CURSOR_PREFIX) {
+        return Err(UploadStoreError::InvalidListCursor);
+    }
+    let encoded = &cursor[LIST_CURSOR_PREFIX.len()..];
+    let bytes =
+        hex_decode_exact::<{ LIST_CURSOR_PAYLOAD_LENGTH + LIST_CURSOR_MAC_LENGTH }>(encoded)
+            .ok_or(UploadStoreError::InvalidListCursor)?;
+    let (payload, supplied_mac) = bytes.split_at(LIST_CURSOR_PAYLOAD_LENGTH);
+    let mut ledger_tag = [0_u8; 8];
+    ledger_tag.copy_from_slice(&payload[..8]);
+    if ledger_tag != list_cursor_ledger_tag(ledger_id) {
+        return Err(UploadStoreError::StaleListCursor);
+    }
+    let expected_mac = list_cursor_mac(ledger_id, payload);
+    if !constant_time_equal(supplied_mac, &expected_mac) {
+        return Err(UploadStoreError::InvalidListCursor);
+    }
+    let mut revision = [0_u8; 8];
+    revision.copy_from_slice(&payload[8..16]);
+    let mut high_water = [0_u8; 8];
+    high_water.copy_from_slice(&payload[16..24]);
+    let mut before = [0_u8; 8];
+    before.copy_from_slice(&payload[24..32]);
+    let filter_mask = payload[32];
+    if filter_mask == 0 || filter_mask & !ALL_UPLOAD_STATE_FILTER_MASK != 0 {
+        return Err(UploadStoreError::InvalidListCursor);
+    }
+    let mut page_size = [0_u8; 2];
+    page_size.copy_from_slice(&payload[33..35]);
+    Ok(DecodedListCursor {
+        ledger_tag,
+        ledger_revision: u64::from_be_bytes(revision),
+        high_water_id: u64::from_be_bytes(high_water),
+        before_id: u64::from_be_bytes(before),
+        filter_mask,
+        page_size: u16::from_be_bytes(page_size),
+    })
+}
+
+fn canonical_state_filter_mask(states: &[UploadState]) -> Result<u8, UploadStoreError> {
+    if states.is_empty() {
+        return Ok(ALL_UPLOAD_STATE_FILTER_MASK);
+    }
+    let mut mask = 0_u8;
+    for state in states {
+        let bit = state.filter_bit();
+        if mask & bit != 0 {
+            return Err(UploadStoreError::DuplicateListStateFilter);
+        }
+        mask |= bit;
+    }
+    Ok(mask)
+}
+
+fn list_cursor_ledger_tag(ledger_id: UploadLedgerId) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(LIST_CURSOR_LEDGER_DOMAIN);
+    hasher.update(ledger_id.0);
+    let digest: [u8; 32] = hasher.finalize().into();
+    digest[..8]
+        .try_into()
+        .expect("an eight-byte SHA-256 prefix has a fixed length")
+}
+
+fn list_cursor_mac(ledger_id: UploadLedgerId, payload: &[u8]) -> [u8; LIST_CURSOR_MAC_LENGTH] {
+    let mut hasher = Sha256::new();
+    hasher.update(LIST_CURSOR_DOMAIN);
+    hasher.update(ledger_id.0);
+    hasher.update(payload);
+    let digest: [u8; 32] = hasher.finalize().into();
+    digest[..LIST_CURSOR_MAC_LENGTH]
+        .try_into()
+        .expect("the cursor MAC prefix has a fixed length")
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    value
+}
+
+fn hex_decode_exact<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 || !value.is_ascii() {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn configure_durability(connection: &Connection) -> Result<(), UploadStoreError> {
@@ -1423,6 +2268,7 @@ fn create_schema(
     capture_root: &str,
     destination: &str,
     authorization_fingerprint: UploadAuthorizationFingerprint,
+    ledger_id: UploadLedgerId,
     preactivation_artifacts: &[String],
 ) -> Result<(), UploadStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1432,17 +2278,20 @@ fn create_schema(
     transaction.execute_batch(CREATE_DUE_INDEX)?;
     transaction.execute_batch(CREATE_INSERT_AGGREGATE_TRIGGER)?;
     transaction.execute_batch(CREATE_UPDATE_AGGREGATE_TRIGGER)?;
+    transaction.execute_batch(CREATE_JOB_REVISION_GUARD_TRIGGER)?;
     transaction.execute_batch(CREATE_IMMUTABLE_IDENTITY_TRIGGER)?;
+    transaction.execute_batch(CREATE_IMMUTABLE_METADATA_TRIGGER)?;
     transaction.execute_batch(CREATE_NO_DELETE_TRIGGER)?;
     transaction.execute(
         r#"
         INSERT INTO upload_metadata (
-            singleton, schema_signature, capture_root, destination,
-            authorization_sha256
-        ) VALUES (1, ?1, ?2, ?3, ?4)
+            singleton, schema_signature, ledger_id, ledger_revision,
+            capture_root, destination, authorization_sha256
+        ) VALUES (1, ?1, ?2, 0, ?3, ?4, ?5)
         "#,
         params![
             SCHEMA_SIGNATURE,
+            ledger_id.0.as_slice(),
             capture_root,
             destination,
             authorization_fingerprint.as_slice()
@@ -1476,7 +2325,7 @@ fn verify_schema(
         [],
         |row| row.get(0),
     )?;
-    if user_schema_object_count != 8 {
+    if user_schema_object_count != 10 {
         return Err(UploadStoreError::InvalidSchema);
     }
     for (kind, name, expected) in [
@@ -1500,8 +2349,18 @@ fn verify_schema(
         ),
         (
             "trigger",
+            "upload_jobs_revision_guard",
+            CREATE_JOB_REVISION_GUARD_TRIGGER,
+        ),
+        (
+            "trigger",
             "upload_jobs_identity_immutable",
             CREATE_IMMUTABLE_IDENTITY_TRIGGER,
+        ),
+        (
+            "trigger",
+            "upload_metadata_identity_immutable",
+            CREATE_IMMUTABLE_METADATA_TRIGGER,
         ),
         ("trigger", "upload_jobs_no_delete", CREATE_NO_DELETE_TRIGGER),
     ] {
@@ -1521,16 +2380,36 @@ fn verify_schema(
     }
     connection.prepare(VERIFY_SCHEMA_PROJECTION)?;
     connection.prepare("SELECT artifact_path FROM upload_preactivation_artifacts LIMIT 0")?;
-    let (signature, stored_root, stored_destination): (String, String, String) = connection
-        .query_row(
-            r#"
-        SELECT schema_signature, capture_root, destination
+    let (signature, ledger_id, ledger_revision, stored_root, stored_destination, authorization): (
+        String,
+        Vec<u8>,
+        i64,
+        String,
+        String,
+        Vec<u8>,
+    ) = connection.query_row(
+        r#"
+        SELECT schema_signature, ledger_id, ledger_revision, capture_root,
+               destination, authorization_sha256
         FROM upload_metadata WHERE singleton = 1
         "#,
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-    if signature != SCHEMA_SIGNATURE {
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    if signature != SCHEMA_SIGNATURE
+        || ledger_id.len() != 16
+        || ledger_revision < 0
+        || authorization.len() != 32
+    {
         return Err(UploadStoreError::InvalidSchema);
     }
     if stored_root != capture_root {
@@ -1571,7 +2450,12 @@ fn rotate_authorization_if_drained(
             return Err(UploadStoreError::AuthorizationIdentityMismatch);
         }
         let changed = transaction.execute(
-            "UPDATE upload_metadata SET authorization_sha256 = ?1 WHERE singleton = 1",
+            r#"
+            UPDATE upload_metadata
+            SET authorization_sha256 = ?1,
+                ledger_revision = ledger_revision + 1
+            WHERE singleton = 1
+            "#,
             [authorization_fingerprint.as_slice()],
         )?;
         if changed != 1 {
@@ -1642,7 +2526,12 @@ fn has_unrecorded_reconcilable_artifact(
 fn recover_interrupted_jobs(connection: &mut Connection) -> Result<(), UploadStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
-        "UPDATE upload_jobs SET state = 'pending', next_attempt_at_ms = NULL WHERE state = 'in_progress'",
+        r#"
+        UPDATE upload_jobs
+        SET state = 'pending', next_attempt_at_ms = NULL,
+            job_revision = job_revision + 1
+        WHERE state = 'in_progress'
+        "#,
         [],
     )?;
     transaction.commit()?;
@@ -1745,7 +2634,7 @@ fn sha256_from_database(job_id: UploadJobId, value: Vec<u8>) -> Result<[u8; 32],
         .map_err(|_| UploadStoreError::CorruptArtifactIdentity(job_id))
 }
 
-fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
+pub(crate) fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
     let stem = filename
         .strip_suffix(".jpg")
         .or_else(|| filename.strip_suffix(".jpeg"));
@@ -1831,7 +2720,6 @@ fn optional_database_u64(
     value.map(|value| database_u64(column, value)).transpose()
 }
 
-#[cfg(test)]
 fn optional_database_u16(
     column: &'static str,
     value: Option<i64>,
@@ -1917,6 +2805,509 @@ mod tests {
     impl Drop for TestEnvironment {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn ledger_revision(store: &UploadStore) -> u64 {
+        let revision: i64 = store
+            .connection
+            .query_row(
+                "SELECT ledger_revision FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        u64::try_from(revision).unwrap()
+    }
+
+    fn permanently_fail(store: &mut UploadStore, artifact: &Path, at: u64) -> UploadJobId {
+        let job_id = store.record_artifact(artifact, at).unwrap().job_id;
+        let claim = store.claim_due(at).unwrap().unwrap();
+        assert_eq!(claim.job_id, job_id);
+        store
+            .mark_permanently_failed(&claim, at + 1, Some(422), Some("operator test failure"))
+            .unwrap();
+        job_id
+    }
+
+    #[test]
+    fn operator_listing_is_newest_first_filtered_bounded_and_revision_stable() {
+        let environment = TestEnvironment::new();
+        let mut store = environment.open();
+        let first = environment.artifact(101, b"first permanent");
+        permanently_fail(&mut store, &first, 10);
+
+        let second = environment.artifact(102, b"completed");
+        store.record_artifact(&second, 20).unwrap();
+        let claim = store.claim_due(20).unwrap().unwrap();
+        store.mark_completed(&claim, 21, 204).unwrap();
+
+        let third = environment.artifact(103, b"third permanent");
+        permanently_fail(&mut store, &third, 30);
+        store
+            .record_artifact(&environment.artifact(104, b"pending"), 40)
+            .unwrap();
+        let fifth = environment.artifact(105, b"fifth permanent");
+        // The older pending job is due first, so terminalize it temporarily
+        // and then create the final permanent job in ID order.
+        let pending_claim = store.claim_due(40).unwrap().unwrap();
+        store
+            .mark_permanently_failed(&pending_claim, 41, Some(400), Some("fourth permanent"))
+            .unwrap();
+        permanently_fail(&mut store, &fifth, 50);
+
+        assert!(matches!(
+            store.list_jobs(&[], 0, None),
+            Err(UploadStoreError::InvalidListPageSize { .. })
+        ));
+        assert!(matches!(
+            store.list_jobs(&[], MAX_UPLOAD_LIST_PAGE_SIZE + 1, None),
+            Err(UploadStoreError::InvalidListPageSize { .. })
+        ));
+
+        let first_page = store.list_jobs(&[], 2, None).unwrap();
+        assert_eq!(
+            first_page
+                .jobs
+                .iter()
+                .map(|job| job.job_id.get())
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        assert_eq!(first_page.ledger_id, store.ledger_id);
+        assert_eq!(first_page.ledger_revision, ledger_revision(&store));
+        assert_eq!(
+            UploadLedgerId::parse_hex(&first_page.ledger_id.as_hex()).unwrap(),
+            first_page.ledger_id
+        );
+        let cursor = first_page.next_cursor.unwrap();
+        assert_eq!(cursor.as_str().len(), LIST_CURSOR_ENCODED_LENGTH);
+
+        assert!(matches!(
+            store.list_jobs(&[UploadState::PermanentlyFailed], 2, Some(cursor.as_str())),
+            Err(UploadStoreError::ListCursorParametersMismatch)
+        ));
+        assert!(matches!(
+            store.list_jobs(&[], 3, Some(cursor.as_str())),
+            Err(UploadStoreError::ListCursorParametersMismatch)
+        ));
+        let mut tampered = cursor.as_str().to_owned();
+        let replacement = if tampered.ends_with('0') { '1' } else { '0' };
+        tampered.pop();
+        tampered.push(replacement);
+        assert!(matches!(
+            store.list_jobs(&[], 2, Some(&tampered)),
+            Err(UploadStoreError::InvalidListCursor)
+        ));
+
+        let second_page = store.list_jobs(&[], 2, Some(cursor.as_str())).unwrap();
+        assert_eq!(
+            second_page
+                .jobs
+                .iter()
+                .map(|job| job.job_id.get())
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        let third_page = store
+            .list_jobs(&[], 2, Some(second_page.next_cursor.unwrap().as_str()))
+            .unwrap();
+        assert_eq!(third_page.jobs[0].job_id.get(), 1);
+        assert!(third_page.next_cursor.is_none());
+
+        let filtered = store
+            .list_jobs(&[UploadState::PermanentlyFailed], 2, None)
+            .unwrap();
+        assert_eq!(
+            filtered
+                .jobs
+                .iter()
+                .map(|job| job.job_id.get())
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        let filtered_next = store
+            .list_jobs(
+                &[UploadState::PermanentlyFailed],
+                2,
+                Some(filtered.next_cursor.unwrap().as_str()),
+            )
+            .unwrap();
+        assert_eq!(
+            filtered_next
+                .jobs
+                .iter()
+                .map(|job| job.job_id.get())
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(filtered_next.next_cursor.is_none());
+
+        assert!(matches!(
+            store.list_jobs(&[UploadState::Completed, UploadState::Completed], 2, None,),
+            Err(UploadStoreError::DuplicateListStateFilter)
+        ));
+        let multi_state = store
+            .list_jobs(
+                &[UploadState::Completed, UploadState::PermanentlyFailed],
+                2,
+                None,
+            )
+            .unwrap();
+        let multi_next = store
+            .list_jobs(
+                &[UploadState::PermanentlyFailed, UploadState::Completed],
+                2,
+                Some(multi_state.next_cursor.unwrap().as_str()),
+            )
+            .unwrap();
+        assert_eq!(
+            multi_next
+                .jobs
+                .iter()
+                .map(|job| job.job_id.get())
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+
+        let every_state = [
+            UploadState::Pending,
+            UploadState::InProgress,
+            UploadState::Retrying,
+            UploadState::Completed,
+            UploadState::PermanentlyFailed,
+        ];
+        let explicit_all = store.list_jobs(&every_state, 2, None).unwrap();
+        assert!(
+            store
+                .list_jobs(&[], 2, Some(explicit_all.next_cursor.unwrap().as_str()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_mutation_and_other_ledger_make_list_cursors_stale() {
+        let environment = TestEnvironment::new();
+        let mut store = environment.open();
+        for sequence in 110..=112 {
+            store
+                .record_artifact(&environment.artifact(sequence, &[sequence as u8]), sequence)
+                .unwrap();
+        }
+        let page = store.list_jobs(&[], 1, None).unwrap();
+        let cursor = page.next_cursor.unwrap();
+        let revision_before = page.ledger_revision;
+        let claim = store.claim_due(112).unwrap().unwrap();
+        assert_eq!(ledger_revision(&store), revision_before + 1);
+        assert!(matches!(
+            store.list_jobs(&[], 1, Some(cursor.as_str())),
+            Err(UploadStoreError::StaleListCursor)
+        ));
+        store.release_claim(&claim, 113).unwrap();
+
+        let other_environment = TestEnvironment::new();
+        let mut other = other_environment.open();
+        for sequence in 120..=121 {
+            other
+                .record_artifact(
+                    &other_environment.artifact(sequence, &[sequence as u8]),
+                    sequence,
+                )
+                .unwrap();
+        }
+        let other_cursor = other.list_jobs(&[], 1, None).unwrap().next_cursor.unwrap();
+        assert!(matches!(
+            store.list_jobs(&[], 1, Some(other_cursor.as_str())),
+            Err(UploadStoreError::StaleListCursor)
+        ));
+    }
+
+    #[test]
+    fn exact_requeue_preserves_failure_audit_and_persists_revisions_and_aggregates() {
+        let environment = TestEnvironment::new();
+        let artifact = environment.artifact(130, b"verified requeue bytes");
+        let mut store = environment.open();
+        let job_id = permanently_fail(&mut store, &artifact, 100);
+        let before = store.job(job_id).unwrap().unwrap();
+        let page = store
+            .list_jobs(&[UploadState::PermanentlyFailed], 10, None)
+            .unwrap();
+        let listed = &page.jobs[0];
+        assert_eq!(listed.job_id, job_id);
+        assert!(listed.delivery_binding_is_current);
+        let result = store
+            .requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: page.ledger_id,
+                    job_id,
+                    expected_job_revision: listed.job_revision,
+                },
+                200,
+            )
+            .unwrap();
+        assert_eq!(result.ledger_revision, page.ledger_revision + 1);
+        assert_eq!(result.job.job_revision, listed.job_revision + 1);
+        assert_eq!(result.job.requeue_count, 1);
+
+        let after = store.job(job_id).unwrap().unwrap();
+        assert_eq!(after.state, UploadState::Pending);
+        assert_eq!(after.attempt_count, before.attempt_count);
+        assert_eq!(after.last_http_status, before.last_http_status);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(
+            after.last_failure_at_unix_ms,
+            before.last_failure_at_unix_ms
+        );
+        assert_eq!(after.completed_at_unix_ms, None);
+        assert_eq!(after.updated_at_unix_ms, 200);
+        assert_eq!(after.last_requeued_at_unix_ms, Some(200));
+        assert_eq!(after.job_revision, result.job.job_revision);
+        assert_eq!(after.requeue_count, 1);
+        assert_eq!(
+            store.snapshot().unwrap().counts,
+            UploadStateCounts {
+                pending: 1,
+                ..UploadStateCounts::default()
+            }
+        );
+        drop(store);
+
+        let reopened = environment.open();
+        let persisted = reopened.job(job_id).unwrap().unwrap();
+        assert_eq!(persisted.state, UploadState::Pending);
+        assert_eq!(persisted.job_revision, result.job.job_revision);
+        assert_eq!(persisted.requeue_count, 1);
+        assert_eq!(persisted.last_requeued_at_unix_ms, Some(200));
+        assert_eq!(reopened.snapshot().unwrap().counts.pending, 1);
+        assert_eq!(ledger_revision(&reopened), result.ledger_revision);
+    }
+
+    #[test]
+    fn job_and_global_revisions_increment_exactly_once_per_durable_mutation() {
+        let environment = TestEnvironment::new();
+        let artifact = environment.artifact(135, b"revision sequence");
+        let mut store = environment.open();
+        assert_eq!(ledger_revision(&store), 0);
+
+        let job_id = store.record_artifact(&artifact, 1).unwrap().job_id;
+        assert_eq!(ledger_revision(&store), 1);
+        assert_eq!(store.job(job_id).unwrap().unwrap().job_revision, 1);
+
+        let first = store.claim_due(1).unwrap().unwrap();
+        assert_eq!(ledger_revision(&store), 2);
+        assert_eq!(store.job(job_id).unwrap().unwrap().job_revision, 2);
+        store.release_claim(&first, 2).unwrap();
+        assert_eq!(ledger_revision(&store), 3);
+        assert_eq!(store.job(job_id).unwrap().unwrap().job_revision, 3);
+
+        let second = store.claim_due(2).unwrap().unwrap();
+        assert_eq!(ledger_revision(&store), 4);
+        store
+            .mark_retrying(&second, 3, 4, Some(503), Some("retry"))
+            .unwrap();
+        assert_eq!(ledger_revision(&store), 5);
+        let third = store.claim_due(4).unwrap().unwrap();
+        assert_eq!(ledger_revision(&store), 6);
+        store
+            .mark_permanently_failed(&third, 5, Some(422), Some("terminal"))
+            .unwrap();
+        assert_eq!(ledger_revision(&store), 7);
+
+        let listed = store.list_jobs(&[], 10, None).unwrap();
+        assert_eq!(listed.jobs[0].job_revision, 7);
+        let requeued = store
+            .requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: listed.ledger_id,
+                    job_id,
+                    expected_job_revision: 7,
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(requeued.ledger_revision, 8);
+        assert_eq!(requeued.job.job_revision, 8);
+        let fourth = store.claim_due(6).unwrap().unwrap();
+        assert_eq!(ledger_revision(&store), 9);
+        store.mark_completed(&fourth, 7, 204).unwrap();
+        assert_eq!(ledger_revision(&store), 10);
+        assert_eq!(store.job(job_id).unwrap().unwrap().job_revision, 10);
+
+        let duplicate = store.record_artifact(&artifact, 100).unwrap();
+        assert_eq!(duplicate.disposition, RecordDisposition::AlreadyRecorded);
+        assert_eq!(ledger_revision(&store), 10);
+    }
+
+    #[test]
+    fn requeue_rejects_wrong_ledger_state_revision_and_delivery_binding_without_mutation() {
+        let environment = TestEnvironment::new();
+        let original = UploadAuthorizationFingerprint::for_bearer_token("original-requeue-token");
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            original,
+        )
+        .unwrap();
+        let permanent_artifact = environment.artifact(140, b"terminal binding");
+        let job_id = permanently_fail(&mut store, &permanent_artifact, 100);
+        let permanent = store.list_jobs(&[], 10, None).unwrap();
+        let job_revision = permanent.jobs[0].job_revision;
+        let baseline_revision = permanent.ledger_revision;
+
+        let other_environment = TestEnvironment::new();
+        let other_ledger = other_environment.open().ledger_id;
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: other_ledger,
+                    job_id,
+                    expected_job_revision: job_revision,
+                },
+                200,
+            ),
+            Err(UploadStoreError::RequeueLedgerMismatch)
+        ));
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: store.ledger_id,
+                    job_id,
+                    expected_job_revision: job_revision - 1,
+                },
+                200,
+            ),
+            Err(UploadStoreError::RequeueStaleJobRevision)
+        ));
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: store.ledger_id,
+                    job_id: UploadJobId::from_u64(job_id.get() + 10_000).unwrap(),
+                    expected_job_revision: job_revision,
+                },
+                200,
+            ),
+            Err(UploadStoreError::RequeueJobNotFound)
+        ));
+
+        let pending = store
+            .record_artifact(&environment.artifact(141, b"still pending"), 110)
+            .unwrap()
+            .job_id;
+        let pending_revision = store.job(pending).unwrap().unwrap().job_revision;
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: store.ledger_id,
+                    job_id: pending,
+                    expected_job_revision: pending_revision,
+                },
+                200,
+            ),
+            Err(UploadStoreError::RequeueWrongState)
+        ));
+        assert_eq!(ledger_revision(&store), baseline_revision + 1);
+
+        // Drain the remaining pending job, then rotate authorization. Terminal
+        // history remains visible but cannot cross the immutable delivery
+        // binding under which it was created.
+        let pending_claim = store.claim_due(110).unwrap().unwrap();
+        store.mark_completed(&pending_claim, 111, 204).unwrap();
+        let completed_revision = store.job(pending).unwrap().unwrap().job_revision;
+        let before_completed_rejection = ledger_revision(&store);
+        assert!(matches!(
+            store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: store.ledger_id,
+                    job_id: pending,
+                    expected_job_revision: completed_revision,
+                },
+                200,
+            ),
+            Err(UploadStoreError::RequeueWrongState)
+        ));
+        assert_eq!(ledger_revision(&store), before_completed_rejection);
+        drop(store);
+        let rotated = UploadAuthorizationFingerprint::for_bearer_token("rotated-requeue-token");
+        let mut rotated_store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            rotated,
+        )
+        .unwrap();
+        let rotated_page = rotated_store
+            .list_jobs(&[UploadState::PermanentlyFailed], 10, None)
+            .unwrap();
+        assert_eq!(rotated_page.ledger_id, permanent.ledger_id);
+        assert!(!rotated_page.jobs[0].delivery_binding_is_current);
+        let rotated_revision = rotated_page.ledger_revision;
+        assert!(matches!(
+            rotated_store.requeue_permanently_failed(
+                RequeueUploadRequest {
+                    ledger_id: rotated_page.ledger_id,
+                    job_id,
+                    expected_job_revision: rotated_page.jobs[0].job_revision,
+                },
+                300,
+            ),
+            Err(UploadStoreError::RequeueDeliveryBindingMismatch)
+        ));
+        assert_eq!(ledger_revision(&rotated_store), rotated_revision);
+        assert_eq!(
+            rotated_store.job(job_id).unwrap().unwrap().state,
+            UploadState::PermanentlyFailed
+        );
+    }
+
+    #[test]
+    fn requeue_rejects_missing_and_changed_artifacts_without_database_mutation() {
+        for (sequence, replacement, expected) in [
+            (150, None, UploadStoreError::RequeueArtifactUnavailable),
+            (
+                151,
+                Some(b"mutated!bytes!value!".as_slice()),
+                UploadStoreError::RequeueArtifactChanged,
+            ),
+        ] {
+            let environment = TestEnvironment::new();
+            let original = b"original bytes value";
+            assert_eq!(
+                replacement.map_or(original.len(), <[u8]>::len),
+                original.len()
+            );
+            let artifact = environment.artifact(sequence, original);
+            let mut store = environment.open();
+            let job_id = permanently_fail(&mut store, &artifact, 100);
+            let listed = store.list_jobs(&[], 10, None).unwrap();
+            let baseline_revision = listed.ledger_revision;
+            let baseline_counts = store.snapshot().unwrap().counts;
+            if let Some(replacement) = replacement {
+                fs::write(&artifact, replacement).unwrap();
+            } else {
+                fs::remove_file(&artifact).unwrap();
+            }
+            let error = store
+                .requeue_permanently_failed(
+                    RequeueUploadRequest {
+                        ledger_id: listed.ledger_id,
+                        job_id,
+                        expected_job_revision: listed.jobs[0].job_revision,
+                    },
+                    200,
+                )
+                .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(ledger_revision(&store), baseline_revision);
+            assert_eq!(store.snapshot().unwrap().counts, baseline_counts);
+            let unchanged = store.job(job_id).unwrap().unwrap();
+            assert_eq!(unchanged.state, UploadState::PermanentlyFailed);
+            assert_eq!(unchanged.requeue_count, 0);
+            assert_eq!(unchanged.last_requeued_at_unix_ms, None);
         }
     }
 
@@ -2740,7 +4131,7 @@ mod tests {
             Err(UploadStoreError::UnsupportedSchema { found: 99, .. })
         ));
 
-        for old_version in [1, 2] {
+        for old_version in [1, 2, 3] {
             let old_environment = TestEnvironment::new();
             let old = Connection::open(&old_environment.database).unwrap();
             old.pragma_update(None, "user_version", old_version)
@@ -2772,10 +4163,7 @@ mod tests {
         );
         let tampered = Connection::open(&tampered_environment.database).unwrap();
         tampered
-            .execute(
-                "UPDATE upload_metadata SET schema_signature = 'tampered' WHERE singleton = 1",
-                [],
-            )
+            .execute("DROP TRIGGER upload_jobs_no_delete", [])
             .unwrap();
         drop(tampered);
         assert!(matches!(
