@@ -269,6 +269,11 @@ prints its existing ledger ID. Every other version, malformed row, altered
 schema, aggregate mismatch, wrong capture root, unsafe database path, or failed
 integrity check is rejected without migration.
 
+V3 did not store a delivery identity per job and allowed authorization rotation
+after live work drained. A migrated v3 permanently failed row therefore keeps
+a deliberately non-current binding: it remains visible for inspection, but
+explicit requeue is denied rather than risking delivery to a different account.
+
 `archive` accepts exact v4 only and requires the operator to repeat the ledger
 ID shown by `migrate` or Manage outbox. It refuses to archive while any row is
 pending, in progress, retrying, or permanently failed, or when a generated JPEG
