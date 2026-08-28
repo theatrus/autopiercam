@@ -19,6 +19,7 @@ anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["derive", "env"] }
 ctrlc = "3.5.2"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+getrandom = "0.4.3"
 libloading = "0.9.0"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -36,6 +36,30 @@ use upload::{
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const CAPTURE_SESSION_NONCE_BYTES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureSessionNonce([u8; CAPTURE_SESSION_NONCE_BYTES]);
+
+impl CaptureSessionNonce {
+    fn random() -> Result<Self> {
+        let mut bytes = [0_u8; CAPTURE_SESSION_NONCE_BYTES];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| anyhow!("generating capture-session filename nonce: {error}"))?;
+        Ok(Self(bytes))
+    }
+
+    fn hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut value = String::with_capacity(CAPTURE_SESSION_NONCE_BYTES * 2);
+        for byte in self.0 {
+            value.push(char::from(HEX[usize::from(byte >> 4)]));
+            value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        value
+    }
+}
 
 /// Thread-safe controls shared by the tray, local IPC server, and camera owner.
 ///
@@ -439,6 +463,7 @@ fn run_agent_inner(
         })?;
     std::fs::create_dir_all(&capture_directory)
         .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
+    let capture_session_nonce = CaptureSessionNonce::random()?;
 
     let upload_ledger_path = config_path.with_extension("upload.sqlite3");
     let (upload_worker, upload_sink) = match start_upload_worker(
@@ -513,6 +538,7 @@ fn run_agent_inner(
         &writer_tx,
         upload_health.as_ref(),
         preview_sink.as_ref(),
+        capture_session_nonce,
     );
     monitor.set_state(AgentState::Stopping);
     drop(writer_tx);
@@ -546,6 +572,7 @@ fn capture_loop(
     writer: &SyncSender<CaptureJob>,
     upload_health: Option<&UploadHealth>,
     preview: Option<&PreviewSink>,
+    capture_session_nonce: CaptureSessionNonce,
 ) -> Result<()> {
     camera.start_video()?;
     let result = (|| {
@@ -623,7 +650,7 @@ fn capture_loop(
             if !capture_requested && !periodic_capture_due {
                 continue;
             }
-            let output = capture_directory.join(capture_filename(queued));
+            let output = capture_directory.join(capture_filename(capture_session_nonce, queued));
             let job = CaptureJob {
                 sequence: queued,
                 width: meta.width,
@@ -885,14 +912,23 @@ fn writer_loop(
     Ok(())
 }
 
-fn capture_filename(sequence: u64) -> String {
+fn capture_filename(session_nonce: CaptureSessionNonce, sequence: u64) -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
+    capture_filename_at(elapsed, session_nonce, sequence)
+}
+
+fn capture_filename_at(
+    captured_at: Duration,
+    session_nonce: CaptureSessionNonce,
+    sequence: u64,
+) -> String {
     format!(
-        "frame-{}-{:03}-{sequence:06}.jpg",
-        elapsed.as_secs(),
-        elapsed.subsec_millis()
+        "frame-{}-{:03}-{}-{sequence:06}.jpg",
+        captured_at.as_secs(),
+        captured_at.subsec_millis(),
+        session_nonce.hex()
     )
 }
 
@@ -1330,6 +1366,23 @@ mod tests {
         publish_attempt_result(&Ok(()), &control, &monitor);
 
         assert_eq!(monitor.snapshot().state, AgentState::Stopping);
+    }
+
+    #[test]
+    fn capture_filename_formats_time_session_nonce_and_sequence_exactly() {
+        let nonce = CaptureSessionNonce([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let captured_at = Duration::new(1_700_000_000, 123_000_000);
+        assert_eq!(
+            capture_filename_at(captured_at, nonce, 42),
+            "frame-1700000000-123-00112233445566778899aabbccddeeff-000042.jpg"
+        );
+        assert_ne!(
+            capture_filename_at(captured_at, nonce, 42),
+            capture_filename_at(captured_at, CaptureSessionNonce([0xff; 16]), 42)
+        );
     }
 
     #[test]

@@ -2,19 +2,19 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x4150_4355;
-const SCHEMA_SIGNATURE: &str =
-    "autopiercam-upload-ledger-v2-destination-authorization-activation-aggregates-sha256-20260828";
+const SCHEMA_SIGNATURE: &str = "autopiercam-upload-ledger-v3-destination-authorization-preactivation-inventory-aggregates-sha256-20260828";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const IDEMPOTENCY_PREFIX: &str = "autopiercam-sha256-";
+const CAPTURE_SESSION_NONCE_HEX_LENGTH: usize = 32;
 const AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] = b"autopiercam-upload-authorization-identity-v1\0";
 
 const CREATE_METADATA: &str = r#"
@@ -28,10 +28,6 @@ CREATE TABLE upload_metadata (
                              ),
     authorization_sha256     BLOB NOT NULL CHECK (
                                  length(authorization_sha256) = 32
-                             ),
-    activation_at_ms         INTEGER NOT NULL CHECK (
-                                 typeof(activation_at_ms) = 'integer' AND
-                                 activation_at_ms >= 0
                              ),
     pending_count            INTEGER NOT NULL DEFAULT 0 CHECK (
                                  typeof(pending_count) = 'integer' AND
@@ -63,6 +59,12 @@ CREATE TABLE upload_metadata (
                              ),
     last_error               TEXT
 ) STRICT
+"#;
+
+const CREATE_PREACTIVATION_ARTIFACTS: &str = r#"
+CREATE TABLE upload_preactivation_artifacts (
+    artifact_path TEXT PRIMARY KEY CHECK (length(artifact_path) > 0)
+) STRICT, WITHOUT ROWID
 "#;
 
 const CREATE_UPLOAD_JOBS: &str = r#"
@@ -289,6 +291,9 @@ pub(crate) enum UploadStoreError {
 
     #[error("artifact filename does not match AutoPierCam's generated JPEG grammar: {0:?}")]
     InvalidArtifactFilename(PathBuf),
+
+    #[error("artifact path conflicts with a different identity already in the upload ledger")]
+    ArtifactIdentityConflict,
 
     #[error("capture directory must be absolute: {0:?}")]
     CaptureDirectoryNotAbsolute(PathBuf),
@@ -525,12 +530,13 @@ impl UploadStore {
         match version {
             0 if database_is_completely_empty(&connection)? => {
                 configure_durability(&connection)?;
+                let preactivation_artifacts = inventory_generated_artifacts(&capture_root)?;
                 create_schema(
                     &mut connection,
                     capture_root_text,
                     &destination,
                     authorization_fingerprint,
-                    current_unix_time_ms()?,
+                    &preactivation_artifacts,
                 )?;
             }
             0 => return Err(UploadStoreError::MissingSchema),
@@ -579,21 +585,40 @@ impl UploadStore {
             ON CONFLICT(artifact_path) DO NOTHING
             "#,
             params![
-                values.artifact_path,
-                values.filename,
-                values.idempotency_key,
+                &values.artifact_path,
+                &values.filename,
+                &values.idempotency_key,
                 file_size,
                 values.sha256.as_slice(),
                 recorded_at
             ],
         )?;
-        let raw_id: i64 = self.connection.query_row(
-            "SELECT id FROM upload_jobs WHERE artifact_path = ?1",
-            [values.artifact_path],
-            |row| row.get(0),
+        let existing: (i64, String, String, i64, Vec<u8>) = self.connection.query_row(
+            r#"
+            SELECT id, filename, idempotency_key, file_size, sha256
+            FROM upload_jobs WHERE artifact_path = ?1
+            "#,
+            [&values.artifact_path],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
+        if inserted == 0
+            && (existing.1 != values.filename
+                || existing.2 != values.idempotency_key
+                || existing.3 != file_size
+                || existing.4.as_slice() != values.sha256.as_slice())
+        {
+            return Err(UploadStoreError::ArtifactIdentityConflict);
+        }
         Ok(RecordArtifactResult {
-            job_id: job_id_from_database(raw_id)?,
+            job_id: job_id_from_database(existing.0)?,
             disposition: if inserted == 1 {
                 RecordDisposition::Inserted
             } else {
@@ -848,12 +873,6 @@ impl UploadStore {
         recorded_at_unix_ms: u64,
     ) -> Result<ReconcileResult, UploadStoreError> {
         unix_ms_to_database(recorded_at_unix_ms)?;
-        let activation_at: i64 = self.connection.query_row(
-            "SELECT activation_at_ms FROM upload_metadata WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let activation_at = database_u64("activation_at_ms", activation_at)?;
         let entries = fs::read_dir(&self.capture_root).map_err(|source| UploadStoreError::Io {
             operation: "read capture directory",
             path: self.capture_root.clone(),
@@ -872,15 +891,20 @@ impl UploadStore {
             let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let Some(captured_at_unix_ms) = parse_generated_frame_filename(&filename) else {
-                continue;
-            };
-            if captured_at_unix_ms < activation_at {
+            if !is_generated_frame_filename(&filename) {
                 continue;
             }
             let artifact_path = path
                 .to_str()
                 .ok_or_else(|| UploadStoreError::ArtifactPathNotUtf8(path.clone()))?;
+            if self.is_preactivation_artifact(artifact_path)? {
+                continue;
+            }
+            // Avoid re-opening and hashing every historical job on each
+            // restart. Newly produced names contain a random session nonce,
+            // and direct recording verifies the complete identity on a path
+            // collision. Legacy-path replacement is still caught when the
+            // persisted claim is verified immediately before upload.
             if self.recorded_job_id(artifact_path)?.is_some() {
                 result.eligible = checked_reconcile_increment(result.eligible)?;
                 result.already_recorded = checked_reconcile_increment(result.already_recorded)?;
@@ -927,6 +951,19 @@ impl UploadStore {
             )
             .optional()?;
         raw_id.map(job_id_from_database).transpose()
+    }
+
+    fn is_preactivation_artifact(&self, artifact_path: &str) -> Result<bool, UploadStoreError> {
+        Ok(self.connection.query_row(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM upload_preactivation_artifacts
+                WHERE artifact_path = ?1
+            )
+            "#,
+            [artifact_path],
+            |row| row.get(0),
+        )?)
     }
 }
 
@@ -1230,16 +1267,6 @@ fn normalize_destination(destination: &str) -> Result<String, UploadStoreError> 
     Ok(normalized.to_owned())
 }
 
-fn current_unix_time_ms() -> Result<u64, UploadStoreError> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let value = u64::try_from(elapsed.as_millis())
-        .map_err(|_| UploadStoreError::TimestampOutOfRange(u64::MAX))?;
-    unix_ms_to_database(value)?;
-    Ok(value)
-}
-
 fn configure_durability(connection: &Connection) -> Result<(), UploadStoreError> {
     let journal_mode: String =
         connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
@@ -1286,16 +1313,55 @@ fn database_is_completely_empty(connection: &Connection) -> Result<bool, UploadS
     Ok(application_id == 0 && object_count == 0)
 }
 
+fn inventory_generated_artifacts(capture_root: &Path) -> Result<Vec<String>, UploadStoreError> {
+    let entries = fs::read_dir(capture_root).map_err(|source| UploadStoreError::Io {
+        operation: "inventory capture directory before upload activation",
+        path: capture_root.to_path_buf(),
+        source,
+    })?;
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| UploadStoreError::Io {
+            operation: "read capture-directory entry before upload activation",
+            path: capture_root.to_path_buf(),
+            source,
+        })?;
+        let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_generated_frame_filename(&filename) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|source| UploadStoreError::Io {
+            operation: "inspect capture artifact before upload activation",
+            path: path.clone(),
+            source,
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        artifacts.push(
+            path.to_str()
+                .ok_or_else(|| UploadStoreError::ArtifactPathNotUtf8(path.clone()))?
+                .to_owned(),
+        );
+    }
+    artifacts.sort_unstable();
+    artifacts.dedup();
+    Ok(artifacts)
+}
+
 fn create_schema(
     connection: &mut Connection,
     capture_root: &str,
     destination: &str,
     authorization_fingerprint: UploadAuthorizationFingerprint,
-    activation_at_unix_ms: u64,
+    preactivation_artifacts: &[String],
 ) -> Result<(), UploadStoreError> {
-    let activation_at = unix_ms_to_database(activation_at_unix_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(CREATE_METADATA)?;
+    transaction.execute_batch(CREATE_PREACTIVATION_ARTIFACTS)?;
     transaction.execute_batch(CREATE_UPLOAD_JOBS)?;
     transaction.execute_batch(CREATE_DUE_INDEX)?;
     transaction.execute_batch(CREATE_INSERT_AGGREGATE_TRIGGER)?;
@@ -1306,17 +1372,23 @@ fn create_schema(
         r#"
         INSERT INTO upload_metadata (
             singleton, schema_signature, capture_root, destination,
-            authorization_sha256, activation_at_ms
-        ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            authorization_sha256
+        ) VALUES (1, ?1, ?2, ?3, ?4)
         "#,
         params![
             SCHEMA_SIGNATURE,
             capture_root,
             destination,
-            authorization_fingerprint.as_slice(),
-            activation_at
+            authorization_fingerprint.as_slice()
         ],
     )?;
+    {
+        let mut insert = transaction
+            .prepare("INSERT INTO upload_preactivation_artifacts (artifact_path) VALUES (?1)")?;
+        for artifact_path in preactivation_artifacts {
+            insert.execute([artifact_path])?;
+        }
+    }
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -1339,11 +1411,16 @@ fn verify_schema(
         [],
         |row| row.get(0),
     )?;
-    if user_schema_object_count != 7 {
+    if user_schema_object_count != 8 {
         return Err(UploadStoreError::InvalidSchema);
     }
     for (kind, name, expected) in [
         ("table", "upload_metadata", CREATE_METADATA),
+        (
+            "table",
+            "upload_preactivation_artifacts",
+            CREATE_PREACTIVATION_ARTIFACTS,
+        ),
         ("table", "upload_jobs", CREATE_UPLOAD_JOBS),
         ("index", "upload_jobs_due", CREATE_DUE_INDEX),
         (
@@ -1378,6 +1455,7 @@ fn verify_schema(
         }
     }
     connection.prepare(VERIFY_SCHEMA_PROJECTION)?;
+    connection.prepare("SELECT artifact_path FROM upload_preactivation_artifacts LIMIT 0")?;
     let (signature, stored_root, stored_destination): (String, String, String) = connection
         .query_row(
             r#"
@@ -1551,19 +1629,27 @@ fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
         .or_else(|| filename.strip_suffix(".jpeg"));
     let stem = stem?;
     let mut parts = stem.split('-');
-    let (Some("frame"), Some(seconds), Some(millis), Some(sequence), None) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) else {
+    let (Some("frame"), Some(seconds), Some(millis), Some(fourth)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return None;
+    };
+    let fifth = parts.next();
+    let (session_nonce, sequence) = match (fifth, parts.next()) {
+        (None, None) => (None, fourth),
+        (Some(sequence), None) => (Some(fourth), sequence),
+        _ => return None,
     };
     if seconds.is_empty()
         || !seconds.bytes().all(|byte| byte.is_ascii_digit())
         || millis.len() != 3
         || !millis.bytes().all(|byte| byte.is_ascii_digit())
+        || session_nonce.is_some_and(|nonce| {
+            nonce.len() != CAPTURE_SESSION_NONCE_HEX_LENGTH
+                || !nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
         || sequence.len() < 6
         || !sequence.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -1704,18 +1790,6 @@ mod tests {
             )
             .unwrap()
         }
-    }
-
-    fn activation_at(store: &UploadStore) -> u64 {
-        let raw: i64 = store
-            .connection
-            .query_row(
-                "SELECT activation_at_ms FROM upload_metadata WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        u64::try_from(raw).unwrap()
     }
 
     impl Drop for TestEnvironment {
@@ -2042,9 +2116,33 @@ mod tests {
     }
 
     #[test]
+    fn generated_filename_parser_accepts_nonce_and_legacy_grammars_exactly() {
+        assert_eq!(
+            parse_generated_frame_filename(
+                "frame-1700000000-123-00112233445566778899aabbccddeeff-000042.jpg"
+            ),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            parse_generated_frame_filename("frame-1700000000-123-000042.jpeg"),
+            Some(1_700_000_000_123)
+        );
+        for invalid in [
+            "frame-1700000000-123-00112233445566778899AABBCCDDEEFF-000042.jpg",
+            "frame-1700000000-123-00112233445566778899aabbccddee-000042.jpg",
+            "frame-1700000000-123-00112233445566778899aabbccddeeff-00042.jpg",
+            "frame-01700000000-123-00112233445566778899aabbccddeeff-000042.jpg",
+            "frame-1700000000-123-00112233445566778899aabbccddeeff-000042-extra.jpg",
+        ] {
+            assert_eq!(parse_generated_frame_filename(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
     fn reconciliation_uses_exact_generated_grammar_and_is_idempotent() {
         let environment = TestEnvironment::new();
-        let future_seconds = current_unix_time_ms().unwrap() / 1_000 + 60;
+        let mut store = environment.open();
+        let future_seconds = 9_999_999_999_u64;
         fs::write(
             environment
                 .capture
@@ -2053,9 +2151,9 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            environment
-                .capture
-                .join(format!("frame-{future_seconds}-999-1000000.jpeg")),
+            environment.capture.join(format!(
+                "frame-{future_seconds}-999-00112233445566778899aabbccddeeff-1000000.jpeg"
+            )),
             b"two",
         )
         .unwrap();
@@ -2066,6 +2164,8 @@ mod tests {
             "frame-9999999999-001-000003.JPG",
             "other-9999999999-001-000004.jpg",
             "frame-9999999999-001-000005.png",
+            "frame-9999999999-001-00112233445566778899AABBCCDDEEFF-000005.jpg",
+            "frame-9999999999-001-00112233445566778899aabbccddee-000005.jpg",
         ] {
             fs::write(environment.capture.join(invalid), b"ignored").unwrap();
         }
@@ -2077,7 +2177,6 @@ mod tests {
         )
         .unwrap();
 
-        let mut store = environment.open();
         let first = store.reconcile_capture_directory(300).unwrap();
         assert_eq!(first.eligible, 2);
         assert_eq!(first.inserted, 2);
@@ -2090,50 +2189,72 @@ mod tests {
     }
 
     #[test]
-    fn activation_skips_history_but_reconciles_later_crash_gap_files() {
+    fn preactivation_inventory_skips_future_history_and_recovers_backdated_crash_gap() {
         let environment = TestEnvironment::new();
-        let historical_at = current_unix_time_ms().unwrap().saturating_sub(60_000);
-        environment.artifact_at(historical_at, 20, b"historical");
+        let historical = environment.artifact_at(9_999_999_999_999, 20, b"future history");
+        let historical_canonical = fs::canonicalize(&historical).unwrap();
+        // Model a crash after SQLite created the file but before schema
+        // initialization. Reopen must create schema and inventory together.
+        drop(Connection::open(&environment.database).unwrap());
 
         let mut store = environment.open();
-        let activation = activation_at(&store);
-        let first = store.reconcile_capture_directory(activation).unwrap();
+        let inventoried: Vec<String> = store
+            .connection
+            .prepare(
+                "SELECT artifact_path FROM upload_preactivation_artifacts ORDER BY artifact_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            inventoried,
+            vec![historical_canonical.to_str().unwrap().to_owned()]
+        );
+        let first = store.reconcile_capture_directory(10).unwrap();
         assert_eq!(first.eligible, 0);
         assert_eq!(store.snapshot().unwrap().counts.total(), 0);
 
-        let at_boundary = environment.artifact_at(activation, 21, b"at activation");
-        let crash_gap = environment.artifact_at(activation + 1, 22, b"post activation");
+        // This is created after activation with a deliberately backdated
+        // clock. Dropping the store models both a crash gap and captures made
+        // while upload is disabled before the next enabled restart.
+        let crash_gap = environment
+            .capture
+            .join("frame-1-000-00112233445566778899aabbccddeeff-000021.jpg");
+        fs::write(&crash_gap, b"post activation, backdated").unwrap();
         drop(store);
         let mut reopened = environment.open();
-        assert_eq!(activation_at(&reopened), activation);
-        let reconciled = reopened
-            .reconcile_capture_directory(activation + 2)
-            .unwrap();
-        assert_eq!(reconciled.eligible, 2);
-        assert_eq!(reconciled.inserted, 2);
-        let first_claim = reopened.claim_due(activation + 2).unwrap().unwrap();
+        let reconciled = reopened.reconcile_capture_directory(20).unwrap();
+        assert_eq!(reconciled.eligible, 1);
+        assert_eq!(reconciled.inserted, 1);
+        let first_claim = reopened.claim_due(20).unwrap().unwrap();
         assert_eq!(
             reopened
                 .job(first_claim.job_id)
                 .unwrap()
                 .unwrap()
                 .artifact_path,
-            fs::canonicalize(at_boundary).unwrap()
+            fs::canonicalize(&crash_gap).unwrap()
         );
-        assert!(crash_gap.exists());
+        assert!(
+            reopened
+                .recorded_job_id(historical_canonical.to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn reconciliation_skips_a_known_replaced_path_before_file_inspection() {
         let environment = TestEnvironment::new();
         let mut store = environment.open();
-        let activation = activation_at(&store);
-        let artifact = environment.artifact_at(activation + 1, 23, b"recorded bytes");
-        store.record_artifact(&artifact, activation + 1).unwrap();
+        let artifact = environment.artifact_at(1, 23, b"recorded bytes");
+        store.record_artifact(&artifact, 10).unwrap();
 
         fs::remove_file(&artifact).unwrap();
         fs::create_dir(&artifact).unwrap();
-        let result = store.reconcile_capture_directory(activation + 2).unwrap();
+        let result = store.reconcile_capture_directory(20).unwrap();
         assert_eq!(result.eligible, 1);
         assert_eq!(result.inserted, 0);
         assert_eq!(result.already_recorded, 1);
@@ -2162,6 +2283,21 @@ mod tests {
             verify_claimed_artifact(&claim).unwrap(),
             ArtifactVerification::SizeMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn same_path_with_different_bytes_is_an_identity_conflict() {
+        let environment = TestEnvironment::new();
+        let mut store = environment.open();
+        let artifact = environment.artifact(12, b"same-size-a");
+        store.record_artifact(&artifact, 1).unwrap();
+
+        fs::write(&artifact, b"same-size-b").unwrap();
+        assert!(matches!(
+            store.record_artifact(&artifact, 2),
+            Err(UploadStoreError::ArtifactIdentityConflict)
+        ));
+        assert_eq!(store.snapshot().unwrap().counts.total(), 1);
     }
 
     #[test]
@@ -2308,22 +2444,25 @@ mod tests {
             Err(UploadStoreError::UnsupportedSchema { found: 99, .. })
         ));
 
-        let unbound_environment = TestEnvironment::new();
-        let unbound = Connection::open(&unbound_environment.database).unwrap();
-        unbound.pragma_update(None, "user_version", 1).unwrap();
-        drop(unbound);
-        assert!(matches!(
-            UploadStore::open(
-                &unbound_environment.database,
-                &unbound_environment.capture,
-                TEST_DESTINATION,
-                UploadAuthorizationFingerprint::anonymous(),
-            ),
-            Err(UploadStoreError::UnsupportedSchema {
-                found: 1,
-                supported: SCHEMA_VERSION,
-            })
-        ));
+        for old_version in [1, 2] {
+            let old_environment = TestEnvironment::new();
+            let old = Connection::open(&old_environment.database).unwrap();
+            old.pragma_update(None, "user_version", old_version)
+                .unwrap();
+            drop(old);
+            assert!(matches!(
+                UploadStore::open(
+                    &old_environment.database,
+                    &old_environment.capture,
+                    TEST_DESTINATION,
+                    UploadAuthorizationFingerprint::anonymous(),
+                ),
+                Err(UploadStoreError::UnsupportedSchema {
+                    found,
+                    supported: SCHEMA_VERSION,
+                }) if found == old_version
+            ));
+        }
 
         let tampered_environment = TestEnvironment::new();
         drop(
