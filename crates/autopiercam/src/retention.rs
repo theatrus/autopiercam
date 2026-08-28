@@ -1051,7 +1051,7 @@ fn retention_loop(
     observer: &dyn Fn(RetentionTelemetry),
     sweep_interval: Duration,
 ) {
-    while !stop.load(Ordering::Acquire) {
+    loop {
         match wake_receiver.recv_timeout(sweep_interval) {
             Ok(()) => loop {
                 match wake_receiver.try_recv() {
@@ -1062,9 +1062,6 @@ fn retention_loop(
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-        if stop.load(Ordering::Acquire) {
-            break;
         }
         publish_retention_telemetry(
             capture_suspended,
@@ -1078,6 +1075,9 @@ fn retention_loop(
                 clock,
             ),
         );
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
     }
 }
 
@@ -1507,6 +1507,37 @@ mod tests {
         assert!(sink.is_stopped());
         assert!(sink.capture_suspended());
         assert_eq!(sink.try_wake(), RetentionWakeResult::Stopped);
+    }
+
+    #[test]
+    fn shutdown_performs_the_final_queued_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let platform = Arc::new(RecordingPlatform {
+            free_bytes: 1_000,
+            deleted: Mutex::new(Vec::new()),
+        });
+        let (worker, sink) = RetentionWorker::start_with_runtime(
+            RetentionPolicy {
+                max_managed_bytes: Some(1),
+                ..policy()
+            },
+            directory.path().to_path_buf(),
+            Arc::new(parse_test_frame_name),
+            Arc::new(LocalOnlyRetentionAuthority),
+            Arc::new(|_| {}),
+            platform.clone(),
+            Arc::new(FixedClock(300)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let artifact = directory.path().join("frame-100.jpg");
+        fs::write(&artifact, b"artifact").unwrap();
+        assert_eq!(sink.try_wake(), RetentionWakeResult::Queued);
+
+        worker.stop_and_join().unwrap();
+
+        assert!(sink.is_stopped());
+        assert_eq!(*platform.deleted.lock().unwrap(), [artifact]);
     }
 
     #[test]
