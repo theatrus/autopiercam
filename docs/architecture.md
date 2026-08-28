@@ -157,11 +157,12 @@ if that channel is full, the existing wake and periodic poll still drain every
 due ledger row.
 
 The ledger is created only when upload is enabled and records an activation
-watermark, canonical capture root, and normalized endpoint. First startup does
-not adopt older captures. Later startup reconciliation scans direct generated
-JPEG children at or after the watermark, closing the publish/record crash
-window and recovering files created while upload was temporarily disabled. A
-ledger refuses a different root, destination, schema, or concurrent owner.
+boundary, canonical capture root, normalized endpoint, and a domain-separated
+SHA-256 authorization fingerprint. First startup does not adopt older captures.
+Later startup reconciliation scans eligible direct generated JPEG children,
+closing the publish/record crash window and recovering files created while
+upload was temporarily disabled. A ledger refuses a different root,
+destination, live authorization identity, schema, or concurrent owner.
 
 Rows transition through `pending`, `in_progress`, `retrying`, `completed`, and
 `permanently_failed`. Retry deadlines, attempt counts, acknowledgements, and
@@ -216,9 +217,11 @@ process-wide sequence, and dropped-frame metadata describe resets, ordering,
 and producer loss; clearing an established session stream causes a bounded
 Viewer reconnect.
 
-Upload bearer material is never written into TOML. Configuration names the
-environment variable from which the current worker loads it; packaged Windows
-builds will use Credential Manager or DPAPI.
+Upload bearer material is never written into TOML or SQLite. Configuration
+names the environment variable from which the current worker loads it; the
+ledger stores only a one-way authorization fingerprint. Credential rotation is
+allowed when every row is terminal and fails closed while live work remains.
+Packaged Windows builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
 

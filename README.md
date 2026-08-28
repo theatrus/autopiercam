@@ -98,10 +98,10 @@ healthy.
   are persisted in a SQLite ledger beside the configuration file. The bounded
   in-process upload channel carries coalesced wake hints only, so a full channel
   does not lose a durable intent. The uploader never deletes the local JPEG.
-- A ledger is permanently bound to the canonical capture directory and
-  normalized HTTP endpoint used when it was created. Changing either requires
-  resolving or deliberately archiving the existing outbox first; see
-  `docs/upload.md` for the recovery and operator contract.
+- A ledger is bound to the canonical capture directory, normalized HTTP
+  endpoint, and a one-way authorization identity. Root or endpoint changes
+  fail closed. Credential rotation is accepted only after every upload is
+  terminal; see `docs/upload.md` for the recovery and operator contract.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
   off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.

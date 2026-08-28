@@ -13,7 +13,9 @@ credentials or a fragment. Use HTTPS for deployments outside a trusted
 loopback network. When `bearer_token_env` is present, HTTPS is required and the
 named environment variable must contain the token when the camera worker
 starts. The token itself is never written to TOML or SQLite and is not included
-in errors or logs.
+in errors or logs. SQLite stores only a domain-separated SHA-256 fingerprint of
+the effective authorization identity; anonymous upload has a distinct
+fingerprint.
 
 The endpoint is normalized to its canonical ASCII URL before use. Redirects
 are disabled, so that normalized URL, including its path and query, is the only
@@ -27,11 +29,14 @@ configuration filename's extension with `upload.sqlite3`. For example:
     C:\pier\autopiercam.toml
     C:\pier\autopiercam.upload.sqlite3
 
-The ledger stores and validates both the canonical capture directory and the
-normalized destination. It will not open if either differs from the values
-used to create it. This prevents pending artifacts from being silently sent to
-a new endpoint or interpreted relative to a new spool. Moving or renaming the
-configuration file also selects a different sidecar path.
+The ledger stores and validates the canonical capture directory, normalized
+destination, and one-way authorization fingerprint. It will not open with a
+different root or destination. A different authorization identity is accepted
+transactionally only when there are no `pending`, `in_progress`, or `retrying`
+rows; otherwise startup fails closed. This prevents pending artifacts from
+being silently sent to another endpoint, tenant, or account. Completed and
+permanently failed history does not block normal credential rotation. Moving
+or renaming the configuration file selects a different sidecar path.
 
 Only one active upload worker may own a ledger. It uses SQLite WAL mode,
 `synchronous=FULL`, a five-second busy timeout, an exclusive live connection,
@@ -170,9 +175,15 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
 - To intentionally change the capture root or endpoint, first drain or account
   for every nonterminal row, stop the agent, archive the existing ledger as a
   unit, then change configuration. The next start creates a fresh activation
-  watermark and will not adopt captures older than that point. Saving a
+  boundary and will not adopt captures older than that point. Saving a
   different endpoint in the Viewer does not migrate the old ledger; the
   restarted worker will report a destination mismatch.
+- A bearer token may rotate in place after every row is terminal. If any row is
+  pending, active, or retrying, a different token is rejected because the agent
+  cannot prove that it represents the same remote account. Restore the prior
+  credential or deliberately migrate the outbox before retrying. Renaming the
+  environment variable while preserving the exact token does not change the
+  authorization identity.
 - If the configuration file is moved, keep track of its old sidecar. The new
   path will not automatically discover or resume the old outbox.
 - A permanently failed row remains terminal even if its local file is later
