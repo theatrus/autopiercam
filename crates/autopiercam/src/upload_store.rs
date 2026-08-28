@@ -2598,6 +2598,98 @@ pub(crate) fn verify_schema(
     Ok(())
 }
 
+/// Verifies the identity fields shared by legacy and current upload rows.
+///
+/// This intentionally validates only persisted metadata. Completed artifacts
+/// may already have been removed by retention, so maintenance must not require
+/// the recorded file to still exist merely to trust or migrate its ledger row.
+pub(crate) fn verify_persisted_artifact_identities(
+    connection: &Connection,
+    capture_root: &Path,
+) -> Result<(), UploadStoreError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, artifact_path, filename, idempotency_key, sha256
+        FROM upload_jobs ORDER BY id
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (raw_id, artifact_path, filename, stored_idempotency_key, raw_sha256) = row?;
+        let job_id = job_id_from_database(raw_id)?;
+        let sha256 = sha256_from_database(job_id, raw_sha256)?;
+        validate_stored_identity(
+            job_id,
+            artifact_path,
+            &filename,
+            &stored_idempotency_key,
+            &sha256,
+            capture_root,
+        )?;
+    }
+    verify_persisted_preactivation_paths(connection, capture_root)
+}
+
+/// Applies the complete runtime row decoder to every current-schema job.
+/// Unlike an upload claim this is file-independent, but it rejects malformed
+/// IDs, hashes, paths, states, counters, timestamps, and delivery bindings.
+pub(crate) fn verify_persisted_v4_rows(
+    connection: &Connection,
+    capture_root: &Path,
+) -> Result<(), UploadStoreError> {
+    let (destination, raw_authorization): (String, Vec<u8>) = connection.query_row(
+        r#"
+        SELECT destination, authorization_sha256
+        FROM upload_metadata WHERE singleton = 1
+        "#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let authorization: [u8; 32] = raw_authorization
+        .try_into()
+        .map_err(|_| UploadStoreError::InvalidSchema)?;
+    let current_delivery_binding =
+        UploadDeliveryBinding::derive(&destination, UploadAuthorizationFingerprint(authorization));
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, artifact_path, filename, idempotency_key,
+               file_size, sha256, delivery_binding_sha256,
+               state, attempt_count, next_attempt_at_ms,
+               last_http_status, last_error, created_at_ms,
+               updated_at_ms, completed_at_ms, last_failure_at_ms,
+               job_revision, requeue_count, last_requeued_at_ms
+        FROM upload_jobs ORDER BY id
+        "#,
+    )?;
+    let rows = statement.query_map([], RawUploadJob::from_row)?;
+    for row in rows {
+        row?.into_list_item(capture_root, current_delivery_binding)?;
+    }
+    verify_persisted_preactivation_paths(connection, capture_root)
+}
+
+fn verify_persisted_preactivation_paths(
+    connection: &Connection,
+    capture_root: &Path,
+) -> Result<(), UploadStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT artifact_path FROM upload_preactivation_artifacts ORDER BY artifact_path",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        validate_preactivation_artifact_path(row?, capture_root)?;
+    }
+    Ok(())
+}
+
 /// Rebinds a drained ledger without discarding terminal history. The immediate
 /// transaction makes the live-work test and fingerprint update indivisible;
 /// interrupted `in_progress` work is deliberately checked before recovery.

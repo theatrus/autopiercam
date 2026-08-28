@@ -28,7 +28,7 @@ use crate::upload::upload_store::{
     CREATE_PREACTIVATION_ARTIFACTS, CREATE_UPDATE_AGGREGATE_TRIGGER, CREATE_UPLOAD_JOBS,
     DELIVERY_BINDING_DOMAIN, SCHEMA_SIGNATURE, SCHEMA_VERSION, UploadLedgerId, UploadStoreError,
     acquire_exclusive_ownership, is_generated_frame_filename, normalize_sql, read_ledger_id,
-    schema_version, verify_schema,
+    schema_version, verify_persisted_artifact_identities, verify_persisted_v4_rows, verify_schema,
 };
 
 const V3_SCHEMA_VERSION: i64 = 3;
@@ -455,6 +455,11 @@ pub fn archive_upload_ledger(
         config_path_for_output(config_path, &format!("upload.{ledger_hex}.archive.sqlite3"))?;
     let retired_path =
         config_path_for_output(config_path, &format!("upload.{ledger_hex}.retired.sqlite3"))?;
+    // A stale sidecar can make an otherwise absent target participate in a
+    // different SQLite history as soon as it is opened. Refuse every target
+    // sidecar before inspecting or publishing either standalone artifact.
+    ensure_no_sqlite_sidecars(&archive_path)?;
+    ensure_no_sqlite_sidecars(&retired_path)?;
     let active_exists =
         safe_regular_file(&context.database_path, "active upload ledger")?.is_some();
     let archive_exists = safe_regular_file(&archive_path, "upload-ledger archive")?.is_some();
@@ -488,11 +493,6 @@ pub fn archive_upload_ledger(
     }
 
     let source = open_existing_exclusive(&context.database_path)?;
-    if schema_version(&source)? != SCHEMA_VERSION {
-        return Err(LedgerMaintenanceError::UnsupportedSchema {
-            found: schema_version(&source)?,
-        });
-    }
     let ledger_id = verify_v4(&source, &context.capture_root)?;
     ensure_expected_id(expected, ledger_id)?;
     ensure_archive_ready(&source, &context.capture_root)?;
@@ -736,6 +736,7 @@ fn verify_v3(
         return Err(LedgerMaintenanceError::CaptureRootMismatch);
     }
     verify_aggregate_counts(connection, true)?;
+    verify_persisted_artifact_identities(connection, configured_capture_root)?;
     Ok(LedgerIdentity {
         capture_root,
         destination,
@@ -850,6 +851,10 @@ fn verify_v4(
     connection: &Connection,
     configured_capture_root: &Path,
 ) -> Result<UploadLedgerId, LedgerMaintenanceError> {
+    let version = schema_version(connection)?;
+    if version != SCHEMA_VERSION {
+        return Err(LedgerMaintenanceError::UnsupportedSchema { found: version });
+    }
     verify_integrity(connection)?;
     let (capture_root, destination): (String, String) = connection.query_row(
         "SELECT capture_root, destination FROM upload_metadata WHERE singleton = 1",
@@ -861,6 +866,7 @@ fn verify_v4(
     }
     verify_schema(connection, &capture_root, &destination)?;
     verify_aggregate_counts(connection, false)?;
+    verify_persisted_v4_rows(connection, configured_capture_root)?;
     Ok(read_ledger_id(connection)?)
 }
 
@@ -961,6 +967,11 @@ fn ensure_archive_ready(
     connection: &Connection,
     capture_root: &Path,
 ) -> Result<(), LedgerMaintenanceError> {
+    ensure_terminal_ledger(connection)?;
+    ensure_no_crash_gap(connection, capture_root)
+}
+
+fn ensure_terminal_ledger(connection: &Connection) -> Result<(), LedgerMaintenanceError> {
     let live: i64 = connection.query_row(
         "SELECT COUNT(*) FROM upload_jobs WHERE state IN ('pending', 'in_progress', 'retrying')",
         [],
@@ -977,7 +988,7 @@ fn ensure_archive_ready(
     if permanent != 0 {
         return Err(LedgerMaintenanceError::PermanentFailures { count: permanent });
     }
-    ensure_no_crash_gap(connection, capture_root)
+    Ok(())
 }
 
 fn ensure_no_crash_gap(
@@ -1052,12 +1063,11 @@ fn checkpoint_for_archive(
     if !journal_mode.eq_ignore_ascii_case("delete") {
         return Err(LedgerMaintenanceError::JournalMode(journal_mode));
     }
-    for sidecar in sqlite_sidecars(database_path) {
-        if sidecar.exists() {
-            return Err(LedgerMaintenanceError::SidecarPresent(sidecar));
-        }
-    }
-    Ok(())
+    // In EXCLUSIVE locking mode SQLite may retain its DELETE rollback-journal
+    // file until this connection closes. WAL state must already be gone here;
+    // the caller performs the full WAL/SHM/journal check after dropping the
+    // source connection and before publishing it as the retired artifact.
+    ensure_no_sqlite_wal_sidecars(database_path)
 }
 
 fn backup_database(
@@ -1082,15 +1092,22 @@ fn verify_archive(
             path.display()
         )));
     }
+    ensure_no_sqlite_sidecars(path)?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id = verify_v4(&connection, capture_root)?;
-    ensure_archive_ready(&connection, capture_root)?;
+    ensure_terminal_ledger(&connection)?;
+    drop(connection);
+    ensure_no_sqlite_sidecars(path)?;
     Ok(id)
 }
 
 fn ledger_content_digest_path(path: &Path) -> Result<[u8; 32], LedgerMaintenanceError> {
+    ensure_no_sqlite_sidecars(path)?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    ledger_content_digest(&connection)
+    let digest = ledger_content_digest(&connection)?;
+    drop(connection);
+    ensure_no_sqlite_sidecars(path)?;
+    Ok(digest)
 }
 
 fn ledger_content_digest(connection: &Connection) -> Result<[u8; 32], LedgerMaintenanceError> {
@@ -1284,22 +1301,46 @@ fn sync_file(path: &Path) -> Result<(), LedgerMaintenanceError> {
 
 fn ensure_no_sqlite_sidecars(database: &Path) -> Result<(), LedgerMaintenanceError> {
     for sidecar in sqlite_sidecars(database) {
-        if sidecar.exists() {
-            return Err(LedgerMaintenanceError::SidecarPresent(sidecar));
-        }
+        ensure_sqlite_sidecar_absent(sidecar)?;
     }
     Ok(())
 }
 
-fn sqlite_sidecars(database: &Path) -> [PathBuf; 2] {
+fn ensure_no_sqlite_wal_sidecars(database: &Path) -> Result<(), LedgerMaintenanceError> {
+    for sidecar in sqlite_sidecars(database).into_iter().take(2) {
+        ensure_sqlite_sidecar_absent(sidecar)?;
+    }
+    Ok(())
+}
+
+fn ensure_sqlite_sidecar_absent(sidecar: PathBuf) -> Result<(), LedgerMaintenanceError> {
+    match fs::symlink_metadata(&sidecar) {
+        Ok(_) => Err(LedgerMaintenanceError::SidecarPresent(sidecar)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LedgerMaintenanceError::Io {
+            operation: "inspect SQLite sidecar",
+            path: sidecar,
+            source,
+        }),
+    }
+}
+
+fn sqlite_sidecars(database: &Path) -> [PathBuf; 3] {
     let mut wal = database.as_os_str().to_os_string();
     wal.push("-wal");
     let mut shm = database.as_os_str().to_os_string();
     shm.push("-shm");
-    [PathBuf::from(wal), PathBuf::from(shm)]
+    let mut journal = database.as_os_str().to_os_string();
+    journal.push("-journal");
+    [
+        PathBuf::from(wal),
+        PathBuf::from(shm),
+        PathBuf::from(journal),
+    ]
 }
 
 fn sha256_path(path: &Path) -> Result<[u8; 32], LedgerMaintenanceError> {
+    ensure_no_sqlite_sidecars(path)?;
     let mut file = File::open(path).map_err(|source| LedgerMaintenanceError::Io {
         operation: "open archive for hashing",
         path: path.to_path_buf(),
@@ -1320,7 +1361,9 @@ fn sha256_path(path: &Path) -> Result<[u8; 32], LedgerMaintenanceError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().into())
+    let digest = hasher.finalize().into();
+    ensure_no_sqlite_sidecars(path)?;
+    Ok(digest)
 }
 
 fn hex_encode(value: &[u8]) -> String {
@@ -1453,6 +1496,54 @@ mod tests {
         connection
     }
 
+    fn test_idempotency_key(filename: &str, sha256: &[u8; 32]) -> String {
+        format!("autopiercam-sha256-{}-{filename}", hex_encode(sha256))
+    }
+
+    fn insert_v3_completed(
+        connection: &Connection,
+        id: i64,
+        artifact_path: &Path,
+        filename: &str,
+        idempotency_key: &str,
+        sha256: &[u8; 32],
+    ) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO upload_jobs (
+                    id, artifact_path, filename, idempotency_key, file_size,
+                    sha256, state, attempt_count, next_attempt_at_ms,
+                    last_http_status, last_error, created_at_ms, updated_at_ms,
+                    completed_at_ms, last_failure_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, 17, ?5, 'completed', 1, NULL,
+                          204, NULL, 10, 11, 11, NULL)
+                "#,
+                params![
+                    id,
+                    artifact_path.to_str().unwrap(),
+                    filename,
+                    idempotency_key,
+                    sha256.as_slice()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn assert_v3_rejected_without_schema_changes(environment: &TestEnvironment) {
+        assert!(migrate_upload_ledger(&environment.config).is_err());
+        let connection = Connection::open(&environment.database).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), V3_SCHEMA_VERSION);
+        let renamed_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE '%_v3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(renamed_tables, 0);
+    }
+
     fn permanently_fail(store: &mut UploadStore, artifact: &Path) {
         store.record_artifact(artifact, 10).unwrap();
         let claim = store.claim_due(10).unwrap().unwrap();
@@ -1539,24 +1630,16 @@ mod tests {
         let environment = TestEnvironment::new();
         let connection = create_v3(&environment);
         let artifact = environment.artifact(1, b"migrated artifact");
-        connection
-            .execute(
-                r#"
-                INSERT INTO upload_jobs (
-                    artifact_path, filename, idempotency_key, file_size, sha256,
-                    state, attempt_count, next_attempt_at_ms, last_http_status,
-                    last_error, created_at_ms, updated_at_ms, completed_at_ms,
-                    last_failure_at_ms
-                ) VALUES (?1, ?2, 'migration-key', 17, ?3, 'completed', 1,
-                          NULL, 204, NULL, 10, 11, 11, NULL)
-                "#,
-                params![
-                    artifact.to_str().unwrap(),
-                    artifact.file_name().unwrap().to_str().unwrap(),
-                    [9_u8; 32].as_slice()
-                ],
-            )
-            .unwrap();
+        let filename = artifact.file_name().unwrap().to_str().unwrap();
+        let sha256 = [9_u8; 32];
+        insert_v3_completed(
+            &connection,
+            1,
+            &artifact,
+            filename,
+            &test_idempotency_key(filename, &sha256),
+            &sha256,
+        );
         drop(connection);
 
         let report = migrate_upload_ledger(&environment.config).unwrap();
@@ -1614,6 +1697,141 @@ mod tests {
             migrate_upload_ledger(&tampered.config),
             Err(LedgerMaintenanceError::InvalidV3Schema)
         ));
+    }
+
+    #[test]
+    fn migration_rejects_invalid_v3_row_identities_before_ddl() {
+        let zero_id = TestEnvironment::new();
+        let connection = create_v3(&zero_id);
+        let artifact = zero_id.artifact(30, b"zero ID");
+        let filename = artifact.file_name().unwrap().to_str().unwrap();
+        let sha256 = [1_u8; 32];
+        insert_v3_completed(
+            &connection,
+            0,
+            &artifact,
+            filename,
+            &test_idempotency_key(filename, &sha256),
+            &sha256,
+        );
+        drop(connection);
+        assert_v3_rejected_without_schema_changes(&zero_id);
+
+        let mismatched_filename = TestEnvironment::new();
+        let connection = create_v3(&mismatched_filename);
+        let artifact = mismatched_filename.artifact(31, b"wrong filename");
+        let wrong_filename = "frame-1700000000-123-000032.jpg";
+        let sha256 = [2_u8; 32];
+        insert_v3_completed(
+            &connection,
+            1,
+            &artifact,
+            wrong_filename,
+            &test_idempotency_key(wrong_filename, &sha256),
+            &sha256,
+        );
+        drop(connection);
+        assert_v3_rejected_without_schema_changes(&mismatched_filename);
+
+        let mismatched_key = TestEnvironment::new();
+        let connection = create_v3(&mismatched_key);
+        let artifact = mismatched_key.artifact(33, b"wrong key");
+        let filename = artifact.file_name().unwrap().to_str().unwrap();
+        insert_v3_completed(
+            &connection,
+            1,
+            &artifact,
+            filename,
+            "not-the-derived-idempotency-key",
+            &[3_u8; 32],
+        );
+        drop(connection);
+        assert_v3_rejected_without_schema_changes(&mismatched_key);
+
+        let arbitrary_preactivation = TestEnvironment::new();
+        let connection = create_v3(&arbitrary_preactivation);
+        let outside = arbitrary_preactivation
+            .root
+            .path()
+            .join("frame-1700000000-123-000034.jpg");
+        connection
+            .execute(
+                "INSERT INTO upload_preactivation_artifacts (artifact_path) VALUES (?1)",
+                [outside.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        assert_v3_rejected_without_schema_changes(&arbitrary_preactivation);
+    }
+
+    #[test]
+    fn current_schema_maintenance_validates_every_persisted_identity() {
+        let zero_id = TestEnvironment::new();
+        let zero_id_ledger = completed_ledger(&zero_id, 35);
+        let connection = Connection::open(&zero_id.database).unwrap();
+        connection
+            .execute(
+                "UPDATE upload_jobs SET id = 0, job_revision = job_revision + 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(migrate_upload_ledger(&zero_id.config).is_err());
+        assert!(archive_upload_ledger(&zero_id.config, &zero_id_ledger).is_err());
+
+        let mismatched_key = TestEnvironment::new();
+        let mismatched_key_ledger = completed_ledger(&mismatched_key, 36);
+        let connection = Connection::open(&mismatched_key.database).unwrap();
+        connection
+            .execute("DROP TRIGGER upload_jobs_identity_immutable", [])
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                UPDATE upload_jobs
+                SET idempotency_key = 'tampered',
+                    job_revision = job_revision + 1
+                "#,
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(CREATE_IMMUTABLE_IDENTITY_TRIGGER)
+            .unwrap();
+        drop(connection);
+        assert!(migrate_upload_ledger(&mismatched_key.config).is_err());
+        assert!(archive_upload_ledger(&mismatched_key.config, &mismatched_key_ledger).is_err());
+
+        let arbitrary_preactivation = TestEnvironment::new();
+        let store = arbitrary_preactivation.open_v4();
+        let ledger_id = store.ledger_id().as_hex();
+        drop(store);
+        let outside = arbitrary_preactivation
+            .root
+            .path()
+            .join("frame-1700000000-123-000037.jpg");
+        let connection = Connection::open(&arbitrary_preactivation.database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO upload_preactivation_artifacts (artifact_path) VALUES (?1)",
+                [outside.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(migrate_upload_ledger(&arbitrary_preactivation.config).is_err());
+        assert!(archive_upload_ledger(&arbitrary_preactivation.config, &ledger_id).is_err());
+    }
+
+    #[test]
+    fn maintenance_does_not_require_completed_artifact_bytes() {
+        let environment = TestEnvironment::new();
+        let ledger_id = completed_ledger(&environment, 38);
+        fs::remove_file(environment.capture.join("frame-1700000000-123-000038.jpg")).unwrap();
+
+        let migration = migrate_upload_ledger(&environment.config).unwrap();
+        assert!(!migration.migrated);
+        assert_eq!(migration.ledger_id, ledger_id);
+        assert!(archive_upload_ledger(&environment.config, &ledger_id).is_ok());
     }
 
     #[test]
@@ -1771,6 +1989,68 @@ mod tests {
     }
 
     #[test]
+    fn archive_rejects_wal_shm_and_journal_sidecars_for_standalone_artifacts() {
+        let environment = TestEnvironment::new();
+        let ledger_id = completed_ledger(&environment, 39);
+        let archive_path = test_archive_path(&environment, &ledger_id);
+
+        for sidecar in sqlite_sidecars(&archive_path) {
+            fs::write(&sidecar, b"stale sidecar").unwrap();
+            assert!(matches!(
+                archive_upload_ledger(&environment.config, &ledger_id),
+                Err(LedgerMaintenanceError::SidecarPresent(path)) if path == sidecar
+            ));
+            fs::remove_file(sidecar).unwrap();
+        }
+
+        let report = archive_upload_ledger(&environment.config, &ledger_id).unwrap();
+        for ledger_path in [&report.archive_path, &report.retired_path] {
+            for sidecar in sqlite_sidecars(ledger_path) {
+                fs::write(&sidecar, b"unexpected sidecar").unwrap();
+                assert!(matches!(
+                    archive_upload_ledger(&environment.config, &ledger_id),
+                    Err(LedgerMaintenanceError::SidecarPresent(path)) if path == sidecar
+                ));
+                fs::remove_file(sidecar).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn archive_verifies_user_version_for_resumed_and_completed_artifacts() {
+        let resumed = TestEnvironment::new();
+        let resumed_id = completed_ledger(&resumed, 40);
+        let resumed_archive = test_archive_path(&resumed, &resumed_id);
+        make_backup_at(&resumed, &resumed_archive);
+        let connection = Connection::open(&resumed_archive).unwrap();
+        connection
+            .pragma_update(None, "user_version", V3_SCHEMA_VERSION)
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            archive_upload_ledger(&resumed.config, &resumed_id),
+            Err(LedgerMaintenanceError::UnsupportedSchema {
+                found: V3_SCHEMA_VERSION
+            })
+        ));
+
+        let completed = TestEnvironment::new();
+        let completed_id = completed_ledger(&completed, 41);
+        let report = archive_upload_ledger(&completed.config, &completed_id).unwrap();
+        let connection = Connection::open(&report.retired_path).unwrap();
+        connection
+            .pragma_update(None, "user_version", V3_SCHEMA_VERSION)
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            archive_upload_ledger(&completed.config, &completed_id),
+            Err(LedgerMaintenanceError::UnsupportedSchema {
+                found: V3_SCHEMA_VERSION
+            })
+        ));
+    }
+
+    #[test]
     fn archive_is_verified_published_without_replace_and_active_is_retired_last() {
         let environment = TestEnvironment::new();
         let ledger_id = completed_ledger(&environment, 5);
@@ -1797,8 +2077,10 @@ mod tests {
         verify_integrity(&archived).unwrap();
         drop(archived);
 
+        let post_archive_capture = environment.artifact(42, b"captured after archive");
         let repeated = archive_upload_ledger(&environment.config, &ledger_id).unwrap();
         assert_eq!(repeated, report);
+        assert!(post_archive_capture.is_file());
 
         let _keep_tempdir_alive = &environment.root;
     }
