@@ -82,11 +82,14 @@ an immediate still, render the latest JPEG preview with exposure/gain metadata,
 and edit max exposure, max gain, still cadence, HTTP upload, and video
 enablement. It preserves all hidden configuration fields when it writes a
 complete replacement. The preview UI reports connecting, waiting, live,
-reconnecting, stale, and malformed-frame conditions. Planned additions include:
+reconnecting, stale, and malformed-frame conditions. A separate upload card
+shows durable pending, active, retrying, completed, and permanently failed
+counts plus the most recent success and failure details. Planned additions
+include:
 
-- temperature, queue, and disk status;
+- temperature and disk status;
 - camera and output settings with capability-aware ranges;
-- upload and segmented-video settings;
+- segmented-video settings;
 - recent artifacts and recoverable errors.
 
 Configuration writes include the revision the UI read. The agent validates and
@@ -109,8 +112,9 @@ continuously. Consumers have independent policies:
   75. Replaced work increments the session's dropped-frame counter.
 - Stills: bounded scheduled queue; a missed deadline is observable.
 - Video: sample at configured output fps before conversion/encoding.
-- Upload: a bounded nonblocking queue accepts only atomically published files,
-  never a borrowed frame buffer; one dedicated thread performs HTTP.
+- Upload: SQLite owns a durable outbox of finalized artifacts. A bounded
+  nonblocking channel carries coalesced wake hints only; one dedicated thread
+  claims due rows and performs HTTP.
 
 No filesystem, HTTP, database, UI, or encoder operation runs on the camera
 thread.
@@ -146,25 +150,42 @@ added behind the same interface.
 
 Writers create a unique temporary file in the destination directory, explicitly
 flush and sync it, and atomically publish it without replacing an existing
-artifact. Only then does the writer make a nonblocking attempt to enqueue its
-path for HTTP upload. A full queue leaves the file untouched and never delays
-the camera or still writer.
+artifact. Windows uses a write-through move. Only then does the writer record
+the canonical path, size, SHA-256, and idempotency key in a SQLite ledger beside
+the configuration file. A nonblocking channel wake follows the durable insert;
+if that channel is full, the existing wake and periodic poll still drain every
+due ledger row.
 
-The implemented uploader is best-effort and process-local. Its dedicated thread
-opens and streams the finalized file with `PUT` to the validated endpoint after
-standard URL normalization, explicit JPEG content type and length, filename and
-stable idempotency headers, and optional bearer authorization loaded from a
-named environment variable. It never appends a filename. Redirects are
-disabled. HTTPS uses the platform certificate verifier; bearer authentication
-requires HTTPS. Connect and total request timeouts are five and fifteen seconds.
+The ledger is created only when upload is enabled and records an activation
+watermark, canonical capture root, and normalized endpoint. First startup does
+not adopt older captures. Later startup reconciliation scans direct generated
+JPEG children at or after the watermark, closing the publish/record crash
+window and recovering files created while upload was temporarily disabled. A
+ledger refuses a different root, destination, schema, or concurrent owner.
+
+Rows transition through `pending`, `in_progress`, `retrying`, `completed`, and
+`permanently_failed`. Retry deadlines, attempt counts, acknowledgements, and
+failure details persist. Startup returns abandoned `in_progress` claims to
+`pending`; completed and terminal rows remain as history. Before HTTP, the
+worker opens and verifies the exact recorded file size and SHA-256. Missing or
+changed artifacts become permanent failures so different bytes cannot reuse an
+existing identity.
+
+The dedicated thread streams the verified file with `PUT` to the validated
+endpoint after standard URL normalization, explicit JPEG content type and
+length, filename and digest-bound idempotency headers, and optional bearer
+authorization loaded from a named environment variable. It never appends a
+filename. Redirects are disabled. HTTPS uses the platform certificate verifier;
+bearer authentication requires HTTPS. Connect and total request timeouts are
+five and fifteen seconds.
 
 Transport failures, HTTP 408/425/429, and 5xx responses retry with bounded
 deterministic jitter; numeric `Retry-After` seconds act as a capped lower bound.
-Other non-2xx responses are permanent for that in-memory intent. Retryable
-failures continue at the capped delay until success, a permanent response, or
-shutdown. Neither a permanent failure nor a full queue removes the local
-artifact. During shutdown, the active bounded request finishes, retry waits are
-interrupted, and queued in-memory intents are abandoned.
+Other non-2xx responses are permanent. Neither completion nor failure removes
+the local artifact. During shutdown, the active bounded request finishes and
+its outcome is committed, an unsubmitted claim is released, retry waits are
+interrupted, and all other intents remain durable. The full contract and
+operator caveats are in `docs/upload.md`.
 
 Planned security video starts with an FFmpeg child process receiving sampled
 raw or RGB frames. It writes short H.264 Matroska segments because each
@@ -172,14 +193,10 @@ completed segment is independently usable after a crash. A segment is finalized
 and validated before it is renamed and queued. Optional MP4 remuxing happens
 after close.
 
-The next upload milestone adds SQLite records for artifacts, attempts,
-acknowledgements, retention, and recovery after restart. One thread will own
-database writes. The current stable idempotency key makes retries safe but does
-not by itself make the process-local queue durable.
-
-Retention is enforced by both age and disk quota. When space is critically low,
-new recording pauses before it can fill the volume; an explicit health error is
-shown rather than deleting unacknowledged data silently.
+Retention remains a later milestone. The current uploader never deletes a local
+artifact or ledger row, and the configured age/keep-latest fields are not yet
+enforced. Planned retention will account for both age and disk quota and must
+never delete unacknowledged data silently.
 
 ## Local IPC and security
 
@@ -210,18 +227,20 @@ Ordered shutdown:
 1. Stop accepting work and set cancellation.
 2. Stop and close the camera on its owner thread.
 3. Drain and close the still writer.
-4. Finish the active bounded HTTP request and abandon pending in-memory upload
-   intents.
+4. Finish and commit the active bounded HTTP result, release any claim not yet
+   submitted, and leave pending/retrying rows in SQLite.
 5. Close local IPC, remove the tray icon, and exit its event loop.
 
-Future durable video/upload work will also finalize the current video segment
-and commit database checkpoints before exit.
+Future durable video work will also finalize the current video segment before
+exit.
 
 The implemented startup path validates configuration, begins camera connection,
-and automatically retries startup or runtime faults. Future startup work will
-reconcile database rows with the spool, quarantine incomplete stills, validate
-recoverable video segments, and resume upload attempts. An at-logon Scheduled
-Task with restart-on-failure is appropriate for an unattended pier machine.
+and automatically retries startup or runtime faults. When upload is enabled it
+opens and validates the bound ledger, recovers abandoned claims, reconciles the
+capture directory against the activation watermark, and resumes due attempts.
+Future startup work will quarantine incomplete stills and validate recoverable
+video segments. An at-logon Scheduled Task with restart-on-failure is
+appropriate for an unattended pier machine.
 
 ## Delivery sequence
 
@@ -238,5 +257,6 @@ auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
 real tray host, secured one-request protocol-v1 control, atomic revisioned
 configuration persistence, and restart application. Item 4 now has a live
 WinUI preview, status, capture-now, and configuration client; artifact browsing
-remains. Item 6 has atomic still publication and a bounded best-effort HTTP
-uploader; durable SQLite recovery, acknowledgements, and retention remain.
+remains. Item 6 has atomic still publication and a durable SQLite HTTP outbox
+with restart recovery, acknowledgements, retry state, terminal failure state,
+and Viewer telemetry. Automated retention remains.

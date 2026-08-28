@@ -45,10 +45,26 @@ Reserved methods currently return a structured `not_implemented` error:
       "camera": { "id": 0, "name": "ZWO ASI676MC" },
       "frames_captured": 42,
       "frames_saved": 4,
-      "last_artifact": "captures/frame-....jpg"
+      "last_artifact": "captures/frame-....jpg",
+      "upload": {
+        "pending": 2,
+        "active": 1,
+        "retrying": 3,
+        "completed": 120,
+        "permanently_failed": 1,
+        "last_success_unix_ms": 1787952000000,
+        "last_failure_unix_ms": 1787951940000,
+        "last_error": "HTTP endpoint requested a retry"
+      }
     }
 
-`camera`, `last_artifact`, and `last_error` are omitted when unavailable.
+`camera`, `last_artifact`, `last_error`, and `upload` are omitted when
+unavailable. The upload object is published while the durable uploader is
+enabled. Its five counters are always present; the last-success, last-failure,
+and upload-error fields are omitted until available. `active` counts a row
+currently fenced to an HTTP attempt, while `retrying` counts rows waiting for a
+persisted retry deadline. Completed and permanently failed rows remain in the
+ledger and therefore remain in these cumulative counts across restarts.
 
 The Viewer opens one pipe connection per request and serializes its requests.
 It enforces a 2-second connection timeout, 30-second response timeout, matching

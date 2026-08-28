@@ -1,63 +1,180 @@
-# Best-effort HTTP upload
+# Durable HTTP upload outbox
 
-The current uploader sends completed JPEGs to an HTTP endpoint without putting
-network work on the camera or still-writer threads. It is intentionally
-best-effort: finalized images are durable on disk, while upload intents and
-retry state exist only in the running process. SQLite-backed recovery is the
-next milestone.
+The uploader sends finalized JPEGs without putting filesystem, database, or
+network work on the camera thread. SQLite is the authoritative outbox: artifact
+identity, attempts, retry deadlines, successes, and terminal failures survive
+an orderly shutdown, process crash, or machine restart.
 
-## Configuration and credentials
+## Configuration and ledger identity
 
-Enable `[upload]`, set an exact absolute endpoint, and choose a positive bounded
-`queue_capacity`. The endpoint must have a host and cannot embed credentials or
-a URL fragment. Use HTTPS. When `bearer_token_env` is present, HTTPS is required
-and the named environment variable must contain the token when the camera
-worker starts. The token itself is not stored in TOML or included in errors and
-logs.
+Enable `[upload]`, set an absolute HTTP or HTTPS endpoint, and choose a positive
+`queue_capacity`. The endpoint must have a host and cannot contain embedded
+credentials or a fragment. Use HTTPS for deployments outside a trusted
+loopback network. When `bearer_token_env` is present, HTTPS is required and the
+named environment variable must contain the token when the camera worker
+starts. The token itself is never written to TOML or SQLite and is not included
+in errors or logs.
 
-HTTPS certificate validation uses the platform verifier. Redirect following is
-disabled, so the validated URL, after standard URL normalization and including
-its path and query, is the only request target. Connect timeout is five seconds
-and total request timeout is fifteen seconds.
+The endpoint is normalized to its canonical ASCII URL before use. Redirects
+are disabled, so that normalized URL, including its path and query, is the only
+request target; AutoPierCam never appends a filename. HTTPS certificate
+validation uses the platform verifier. Connect timeout is five seconds and the
+total request timeout is fifteen seconds.
 
-## Artifact and request contract
+When upload is first enabled, AutoPierCam creates a sidecar by replacing the
+configuration filename's extension with `upload.sqlite3`. For example:
 
-The still writer encodes to a unique temporary file, flushes and syncs it, and
-atomically publishes it without replacing another artifact. Only after that
-publication succeeds does it try to enqueue the path. Enqueue never waits for
-capacity, so a full or stopped upload queue cannot delay capture.
+    C:\pier\autopiercam.toml
+    C:\pier\autopiercam.upload.sqlite3
 
-The dedicated upload thread opens and streams the file; it does not copy the
-whole JPEG into memory. Each attempt sends:
+The ledger stores and validates both the canonical capture directory and the
+normalized destination. It will not open if either differs from the values
+used to create it. This prevents pending artifacts from being silently sent to
+a new endpoint or interpreted relative to a new spool. Moving or renaming the
+configuration file also selects a different sidecar path.
+
+Only one active upload worker may own a ledger. It uses SQLite WAL mode,
+`synchronous=FULL`, a five-second busy timeout, an exclusive live connection,
+and a strict versioned schema. An unrecognized, modified, or newer schema is a
+startup error rather than something the agent tries to repair automatically.
+
+## Publication, recording, and startup reconciliation
+
+The still writer encodes to a unique temporary file in the capture directory,
+flushes and syncs it, then atomically publishes it without replacing an
+existing artifact. Windows publication uses a write-through move. Only after
+publication does the writer record the artifact in SQLite. Recording captures
+its canonical path, filename, size, SHA-256 digest, and stable idempotency key
+before a nonblocking wake is attempted.
+
+There is necessarily a small filesystem/database boundary between publishing a
+JPEG and inserting its row. Startup reconciliation closes that crash window.
+It scans direct children of the configured capture directory and records
+eligible generated JPEGs that do not already have rows.
+
+At first ledger creation, AutoPierCam records an activation timestamp. A scan
+only considers names in the generated
+`frame-<unix-seconds>-<three-digit-milliseconds>-<six-or-more-digit-sequence>.jpg`
+grammar (the reconciler also accepts `.jpeg`) whose encoded capture time is at
+or after that watermark. Therefore enabling upload for the first time does not
+adopt older captures already in the directory. Once a ledger exists, later
+startup scans do recover qualifying artifacts created after activation,
+including artifacts published while upload was temporarily disabled.
+
+Reconciliation ignores nested paths, symlinks, non-files, unrelated names, and
+pre-activation captures. Already recorded paths are skipped before file hashing.
+
+## Durable state and recovery
+
+Rows are never deleted and their artifact identity is immutable. Their mutable
+delivery state moves through:
+
+| State | Meaning | Restart behavior |
+| --- | --- | --- |
+| `pending` | Recorded and waiting for its first due attempt | Remains due |
+| `in_progress` | Fenced to one active HTTP attempt | Recovered to `pending`; the consumed attempt number is retained |
+| `retrying` | A retryable failure has a persisted deadline | Waits until the same deadline, then resumes |
+| `completed` | A 2xx response was received | Retained as acknowledged history |
+| `permanently_failed` | The endpoint or local artifact made automatic retry unsafe | Retained for operator inspection; not retried automatically |
+
+Claims include an incrementing attempt number so stale outcomes cannot update a
+later claim. Attempt results are committed before the worker reacts to a
+shutdown request. A worker failure faults the capture attempt so the supervisor
+can restart it; the durable rows remain available to the next worker.
+
+Before every request, the uploader opens the exact file it will stream and
+verifies that its size and SHA-256 still match the recorded identity. Missing,
+replaced, symlinked, or non-regular artifacts become permanent failures rather
+than sending different bytes under an existing idempotency key. On Windows,
+the verified read handle also denies later write and delete opens for the life
+of the request.
+
+The uploader never deletes a local JPEG. It also never removes completed or
+permanently failed rows. The configured `capture.retention_days` and
+`capture.keep_latest` fields are not yet enforced by a retention worker, so
+operators must currently plan disk capacity and preserve any file needed for
+manual recovery.
+
+## Request and idempotency contract
+
+Each attempt streams the verified file and sends:
 
     PUT <the normalized configured endpoint>
     Content-Type: image/jpeg
-    Content-Length: <finalized file size>
+    Content-Length: <recorded finalized file size>
     X-AutoPierCam-Filename: <artifact filename>
-    Idempotency-Key: autopiercam-<artifact filename>
+    Idempotency-Key: autopiercam-sha256-<64 lowercase SHA-256 hex characters>-<artifact filename>
     Authorization: Bearer <token>  # only when configured
 
-The filename-derived idempotency key is stable for every retry of that artifact.
-Any 2xx response is success. The uploader does not delete the local file after
-success, failure, or queue rejection.
+The idempotency key is stable across retries and restarts and binds both the
+content digest and generated filename. Receivers should implement idempotent
+PUT handling because a response can be lost after the server accepts a body.
+Any 2xx response completes the row.
 
-## Retry and shutdown behavior
+Transport/protocol failures and HTTP 408, 425, 429, and 5xx responses are
+retryable. Base delays are 1, 2, 5, 10, 30, 60, then 300 seconds. Deterministic
+80–120 percent jitter derived from the idempotency key and attempt number is
+applied, with a five-minute cap. A decimal-seconds `Retry-After` value acts as a
+minimum delay and is also capped at five minutes; HTTP-date values are not
+interpreted. Retryable failures continue indefinitely at the capped delay.
 
-Transport/protocol failures and HTTP 408, 425, 429, and 5xx responses retry the
-same file. Base delays are 1, 2, 5, 10, 30, 60, then 300 seconds. A deterministic
-80–120 percent jitter derived from filename and attempt is applied, with a
-five-minute cap. A decimal-seconds `Retry-After` value acts as a minimum delay
-and is also capped at five minutes; HTTP-date values are not interpreted. Other
-non-2xx statuses are permanent failures for that in-memory intent.
-Retryable failures continue at the capped delay until success, a permanent
-response, or shutdown.
+Other non-2xx statuses are permanent failures. Local identity failures such as
+a missing or changed file are also permanent. There is not yet an operator
+command to edit, delete, or requeue a terminal row.
 
-A full queue or permanent failure leaves the published JPEG untouched for
-inspection or later recovery. On orderly stop, the worker lets the current
-request finish within its timeout, interrupts any retry wait, and abandons
-pending in-memory intents. A crash or restart likewise loses unacknowledged
-intent state; the agent does not yet scan existing files and replay them.
+## Backpressure and status telemetry
 
-The planned durable slice will record artifacts, attempts, acknowledgements,
-and retention state in SQLite, reconcile the spool at startup, and resume
-unacknowledged uploads with the same stable idempotency keys.
+`upload.queue_capacity` bounds only a coalesced in-process wake channel. It
+does not cap the number of durable rows. The still writer first commits the row
+and then tries to send a wake without waiting. A full channel means a wake is
+already pending; the worker polls the ledger and drains every due row, so the
+artifact is not dropped. Disk capacity is the practical outbox bound.
+
+When upload is enabled, `status.get` includes an `upload` object and the Viewer
+shows the same aggregate state:
+
+    {
+      "pending": 2,
+      "active": 1,
+      "retrying": 3,
+      "completed": 120,
+      "permanently_failed": 1,
+      "last_success_unix_ms": 1787952000000,
+      "last_failure_unix_ms": 1787951940000,
+      "last_error": "HTTP endpoint requested a retry"
+    }
+
+The three last-detail fields are omitted until available. `last_error`
+describes the most recently recorded failure and is not cleared merely because
+a later upload succeeds. When upload is disabled, the optional `upload` object
+is absent because no ledger worker is active.
+
+## Shutdown and operator caveats
+
+Ordered shutdown drains the still-writer queue first, so every published JPEG
+it completes is recorded. The uploader then:
+
+1. finishes an HTTP request already in flight and persists its outcome;
+2. releases a claim that was fenced but not yet submitted back to `pending`;
+3. interrupts retry waiting and exits without discarding pending rows.
+
+A crash can leave `in_progress` rows; opening the ledger converts them back to
+`pending`. Because the server may have accepted the earlier request, restart
+delivery relies on the stable idempotency key.
+
+Treat the ledger and its `-wal`/`-shm` sidecars as application data:
+
+- Stop the agent before inspecting, backing up, moving, or archiving them.
+- Do not delete or edit a ledger to clear an error; that can discard the only
+  record of unacknowledged delivery.
+- To intentionally change the capture root or endpoint, first drain or account
+  for every nonterminal row, stop the agent, archive the existing ledger as a
+  unit, then change configuration. The next start creates a fresh activation
+  watermark and will not adopt captures older than that point. Saving a
+  different endpoint in the Viewer does not migrate the old ledger; the
+  restarted worker will report a destination mismatch.
+- If the configuration file is moved, keep track of its old sidecar. The new
+  path will not automatically discover or resume the old outbox.
+- A permanently failed row remains terminal even if its local file is later
+  restored. Preserve the ledger and artifact for manual investigation until a
+  supported requeue workflow is implemented.

@@ -22,8 +22,8 @@ The repository now contains a hardware-validated background capture slice:
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
 - a separate secured, outbound-only preview pipe backed by a bounded latest-frame
   producer;
-- a bounded best-effort HTTP worker that uploads atomically published JPEGs
-  without delaying capture;
+- a durable SQLite HTTP outbox that records atomically published JPEGs, resumes
+  retries after restart, and never delays capture for network work;
 - atomic, content-revisioned configuration replacement through that pipe;
 - a buildable unpackaged WinUI 3 viewer that shows live status, requests an
   immediate capture, renders the latest JPEG preview, and edits the supported
@@ -91,11 +91,17 @@ healthy.
 - Only one worker thread will own an open camera and all SDK calls.
 - ROI changes occur only while capture is stopped.
 - Frame reads always use checked buffer sizes and finite timeouts.
-- Slow writers, preview clients, encoders, and uploads may drop or queue their
-  own work, but must never block the SDK drain loop.
-- HTTP upload is currently best-effort and process-local. A full queue or
-  permanent failure leaves the finalized JPEG on disk, but restart recovery and
-  acknowledged delivery require the planned durable SQLite queue.
+- Slow writers, preview clients, encoders, and uploads apply independent
+  backpressure policies and must never block the SDK drain loop. Upload work is
+  recorded durably before its advisory wake signal is sent.
+- HTTP upload intents, retry deadlines, acknowledgements, and terminal failures
+  are persisted in a SQLite ledger beside the configuration file. The bounded
+  in-process upload channel carries coalesced wake hints only, so a full channel
+  does not lose a durable intent. The uploader never deletes the local JPEG.
+- A ledger is permanently bound to the canonical capture directory and
+  normalized HTTP endpoint used when it was created. Changing either requires
+  resolving or deliberately archiving the existing outbox first; see
+  `docs/upload.md` for the recovery and operator contract.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
   off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.
@@ -106,6 +112,6 @@ healthy.
 - The Viewer renders the live preview and marks it stale after five seconds
   without a new frame. Its camera selector remains read-only. Max exposure,
   max gain, still interval, upload endpoint/enable, and video enable are backed
-  by versioned configuration replacement. HTTP JPEG upload is active with the
-  best-effort limits above; security video remains a designed seam rather than
-  an active sink.
+  by versioned configuration replacement. It also reports durable upload
+  pending, active, retrying, completed, and permanently failed counts. Security
+  video remains a designed seam rather than an active sink.
