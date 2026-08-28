@@ -1029,6 +1029,17 @@ mod tests {
         }
     }
 
+    struct ReportingRetryTransport {
+        attempt: mpsc::Sender<u64>,
+    }
+
+    impl UploadTransport for ReportingRetryTransport {
+        fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome {
+            self.attempt.send(claim.attempt_count).unwrap();
+            AttemptOutcome::retry(Some(503), None, RETRYABLE_HTTP_ERROR)
+        }
+    }
+
     #[test]
     fn shutdown_finishes_current_attempt_and_restart_obeys_persisted_retry() {
         let environment = TestEnvironment::new();
@@ -1092,6 +1103,90 @@ mod tests {
         .unwrap();
         assert_eq!(attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
         receive_until(&telemetry, |value| value.completed == 1);
+        worker.stop_and_join().unwrap();
+        drop(sink);
+    }
+
+    #[test]
+    fn prolonged_outage_survives_repeated_restarts_until_success() {
+        let environment = TestEnvironment::new();
+        let artifact = environment.artifact(11, b"retry across several worker lifetimes");
+        let manual_clock = Arc::new(ManualClock::new(50_000));
+        let mut now = 50_000;
+        let mut last_failure_at = 0;
+
+        for expected_attempt in 1..=3 {
+            manual_clock.set(now);
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (observer, telemetry) = observer_channel();
+            let (worker, sink) = UploadWorker::start_with_transport(
+                ReportingRetryTransport {
+                    attempt: attempt_tx,
+                },
+                RetryPolicy {
+                    schedule: &LONG_DELAY,
+                },
+                1,
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                observer,
+                manual_clock.clone(),
+            )
+            .unwrap();
+            if expected_attempt == 1 {
+                assert_eq!(
+                    sink.try_enqueue(artifact.clone()).unwrap(),
+                    UploadEnqueueResult::Recorded
+                );
+            }
+
+            assert_eq!(
+                attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected_attempt
+            );
+            let retrying = receive_until(&telemetry, |value| {
+                value.active == 0 && value.retrying == 1 && value.last_failure_unix_ms == Some(now)
+            });
+            assert_eq!(retrying.last_failure_unix_ms, Some(now));
+            assert_eq!(retrying.last_error.as_deref(), Some(RETRYABLE_HTTP_ERROR));
+            let due = lock_store(&sink.store)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .next_due_at_unix_ms
+                .unwrap();
+            assert!(due > now);
+
+            worker.stop_and_join().unwrap();
+            drop(sink);
+            last_failure_at = now;
+            now = due;
+        }
+
+        manual_clock.set(now);
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            ReportingSuccessTransport {
+                attempt: attempt_tx,
+            },
+            RetryPolicy {
+                schedule: &LONG_DELAY,
+            },
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            manual_clock,
+        )
+        .unwrap();
+        assert_eq!(attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+        let completed = receive_until(&telemetry, |value| value.completed == 1);
+        assert_eq!(completed.retrying, 0);
+        assert_eq!(completed.last_success_unix_ms, Some(now));
+        assert_eq!(completed.last_failure_unix_ms, Some(last_failure_at));
         worker.stop_and_join().unwrap();
         drop(sink);
     }
@@ -1163,6 +1258,44 @@ mod tests {
         .unwrap();
         let failed = receive_until(&telemetry, |value| value.permanently_failed == 1);
         assert_eq!(failed.last_error.as_deref(), Some(MISSING_ARTIFACT_ERROR));
+        worker.stop_and_join().unwrap();
+        drop(sink);
+    }
+
+    #[test]
+    fn replaced_artifact_becomes_a_safe_permanent_failure() {
+        let environment = TestEnvironment::new();
+        let artifact = environment.artifact(31, b"original bytes");
+        {
+            let mut store = UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+            )
+            .unwrap();
+            store.record_artifact(&artifact, 31_000).unwrap();
+        }
+        std::fs::remove_file(&artifact).unwrap();
+        std::fs::write(&artifact, b"replaced bytes").unwrap();
+
+        let endpoint = Uri::from_static("http://127.0.0.1:9/upload");
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            UreqTransport::new(UploadOptions::new(endpoint, None, 1)),
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            Arc::new(ManualClock::new(31_000)),
+        )
+        .unwrap();
+        let failed = receive_until(&telemetry, |value| value.permanently_failed == 1);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some(ARTIFACT_CONTENT_CHANGED_ERROR)
+        );
         worker.stop_and_join().unwrap();
         drop(sink);
     }
