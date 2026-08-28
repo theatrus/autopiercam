@@ -7,7 +7,7 @@ use autopiercam_core::{
     config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
-use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera};
+use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera, StatusUpload};
 use image::{
     ColorType, ImageEncoder,
     codecs::{jpeg::JpegEncoder, png::PngEncoder},
@@ -30,7 +30,10 @@ mod upload;
 
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
-use upload::{UploadEnqueueResult, UploadOptions, UploadSink, UploadWorker, bearer_authorization};
+use upload::{
+    UploadEnqueueResult, UploadHealth, UploadObserver, UploadOptions, UploadSink, UploadTelemetry,
+    UploadWorker, bearer_authorization,
+};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -139,6 +142,7 @@ impl AgentMonitor {
         status.state = AgentState::Starting;
         status.camera = None;
         status.last_error = None;
+        status.upload = None;
     }
 
     fn set_camera(&self, info: &CameraInfo) {
@@ -174,6 +178,19 @@ impl AgentMonitor {
         let mut status = self.write();
         status.frames_saved = status.frames_saved.saturating_add(1);
         status.last_artifact = Some(path.to_string_lossy().into_owned());
+    }
+
+    fn upload_telemetry(&self, telemetry: UploadTelemetry) {
+        self.write().upload = Some(StatusUpload {
+            pending: telemetry.pending,
+            active: telemetry.active,
+            retrying: telemetry.retrying,
+            completed: telemetry.completed,
+            permanently_failed: telemetry.permanently_failed,
+            last_success_unix_ms: telemetry.last_success_unix_ms,
+            last_failure_unix_ms: telemetry.last_failure_unix_ms,
+            last_error: telemetry.last_error,
+        });
     }
 
     fn fault(&self, error: &anyhow::Error) {
@@ -402,8 +419,34 @@ fn run_agent_inner(
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
     }
-    let config = Config::load(config_path)?;
-    let (upload_worker, upload_sink) = match start_upload_worker(&config.upload)? {
+    let config_path = std::path::absolute(config_path)
+        .with_context(|| format!("resolving configuration path {}", config_path.display()))?;
+    let config = Config::load(&config_path)?;
+    let configured_capture_directory = if config.capture.directory.is_absolute() {
+        config.capture.directory.clone()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&config.capture.directory)
+    };
+    let capture_directory =
+        std::path::absolute(&configured_capture_directory).with_context(|| {
+            format!(
+                "resolving capture directory {}",
+                configured_capture_directory.display()
+            )
+        })?;
+    std::fs::create_dir_all(&capture_directory)
+        .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
+
+    let upload_ledger_path = config_path.with_extension("upload.sqlite3");
+    let (upload_worker, upload_sink) = match start_upload_worker(
+        &config.upload,
+        &upload_ledger_path,
+        &capture_directory,
+        monitor,
+    )? {
         Some((worker, sink)) => (Some(worker), Some(sink)),
         None => (None, None),
     };
@@ -440,18 +483,8 @@ fn run_agent_inner(
     };
     camera.set_roi(roi)?;
 
-    let capture_directory = if config.capture.directory.is_absolute() {
-        config.capture.directory.clone()
-    } else {
-        config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(&config.capture.directory)
-    };
-    std::fs::create_dir_all(&capture_directory)
-        .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
-
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
+    let upload_health = upload_sink.as_ref().map(UploadSink::health);
     let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
@@ -478,6 +511,7 @@ fn run_agent_inner(
         control,
         monitor,
         &writer_tx,
+        upload_health.as_ref(),
         preview_sink.as_ref(),
     );
     monitor.set_state(AgentState::Stopping);
@@ -510,6 +544,7 @@ fn capture_loop(
     control: &AgentControl,
     monitor: &AgentMonitor,
     writer: &SyncSender<CaptureJob>,
+    upload_health: Option<&UploadHealth>,
     preview: Option<&PreviewSink>,
 ) -> Result<()> {
     camera.start_video()?;
@@ -540,6 +575,9 @@ fn capture_loop(
         let mut queued = 0_u64;
 
         while !control.is_shutdown() {
+            if upload_health.is_some_and(UploadHealth::is_stopped) {
+                bail!("durable upload worker stopped unexpectedly");
+            }
             let exposure_us = camera
                 .control_value(ControlType::EXPOSURE)
                 .map(|value| value.value)
@@ -742,7 +780,12 @@ fn wait_for_auto_settle(
     }
 }
 
-fn start_upload_worker(config: &UploadConfig) -> Result<Option<(UploadWorker, UploadSink)>> {
+fn start_upload_worker(
+    config: &UploadConfig,
+    database_path: &Path,
+    capture_directory: &Path,
+    monitor: &AgentMonitor,
+) -> Result<Option<(UploadWorker, UploadSink)>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -760,13 +803,23 @@ fn start_upload_worker(config: &UploadConfig) -> Result<Option<(UploadWorker, Up
         .as_deref()
         .map(load_bearer_authorization)
         .transpose()?;
-    UploadWorker::start(UploadOptions::new(
-        endpoint,
-        authorization,
-        config.queue_capacity,
-    ))
+    let upload_monitor = monitor.clone();
+    let observer: UploadObserver = Arc::new(move |telemetry| {
+        upload_monitor.upload_telemetry(telemetry);
+    });
+    UploadWorker::start(
+        UploadOptions::new(endpoint, authorization, config.queue_capacity),
+        database_path,
+        capture_directory,
+        observer,
+    )
     .map(Some)
-    .context("starting HTTP upload worker")
+    .with_context(|| {
+        format!(
+            "starting durable HTTP upload worker with ledger {}",
+            database_path.display()
+        )
+    })
 }
 
 fn load_bearer_authorization(variable: &str) -> Result<ureq::http::HeaderValue> {
@@ -804,19 +857,19 @@ fn writer_loop(
         monitor.artifact_saved(&job.output);
         if let Some(upload) = upload {
             match upload.try_enqueue(job.output.clone()) {
-                UploadEnqueueResult::Queued => {}
-                UploadEnqueueResult::QueueFull => warn!(
-                    path = %job.output.display(),
-                    "upload queue is full; finalized artifact remains on disk"
+                Ok(UploadEnqueueResult::Recorded | UploadEnqueueResult::AlreadyRecorded) => {}
+                Ok(UploadEnqueueResult::WorkerStopped) => bail!(
+                    "upload worker stopped after recording {} durably",
+                    job.output.display()
                 ),
-                UploadEnqueueResult::WorkerStopped => warn!(
-                    path = %job.output.display(),
-                    "upload worker stopped; finalized artifact remains on disk"
-                ),
-                UploadEnqueueResult::InvalidArtifactPath => warn!(
-                    path = %job.output.display(),
-                    "finalized artifact has no safe upload file name"
-                ),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "recording finalized artifact {} in the upload ledger",
+                            job.output.display()
+                        )
+                    });
+                }
             }
         }
         info!(
@@ -1071,16 +1124,65 @@ fn save_rgb(path: &Path, width: u32, height: u32, rgb: &[u8], quality: u8) -> Re
         return Err(error);
     }
 
-    // A same-directory hard link publishes the fully synced artifact atomically
-    // and fails rather than replacing an existing final path.
-    if let Err(error) = std::fs::hard_link(&temporary, path) {
+    // Publish the fully synced artifact atomically and fail rather than
+    // replacing an existing final path. Windows uses a write-through move;
+    // other platforms flush both directory-entry transitions explicitly.
+    if let Err(error) = publish_temporary_artifact(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error)
             .with_context(|| format!("finalizing image without overwrite {}", path.display()));
     }
-    std::fs::remove_file(&temporary)
-        .with_context(|| format!("removing temporary image {}", temporary.display()))?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_temporary_artifact(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // MOVEFILE_REPLACE_EXISTING is deliberately omitted.
+    let moved = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_temporary_artifact(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, destination)?;
+    sync_parent_directory(destination)?;
+    std::fs::remove_file(temporary)?;
+    sync_parent_directory(destination)
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let directory = options.open(parent)?;
+    directory.sync_all()
 }
 
 fn temporary_artifact_path(path: &Path) -> Result<PathBuf> {
@@ -1158,6 +1260,16 @@ mod tests {
         });
         monitor.frame_captured(false);
         monitor.artifact_saved(Path::new("captures/test.jpg"));
+        monitor.upload_telemetry(UploadTelemetry {
+            pending: 2,
+            active: 1,
+            retrying: 3,
+            completed: 4,
+            permanently_failed: 5,
+            last_success_unix_ms: Some(10),
+            last_failure_unix_ms: Some(20),
+            last_error: Some("HTTP endpoint requested a retry".to_owned()),
+        });
 
         let status = monitor.snapshot();
         assert_eq!(status.state, AgentState::Capturing);
@@ -1165,6 +1277,18 @@ mod tests {
         assert_eq!(status.frames_captured, 1);
         assert_eq!(status.frames_saved, 1);
         assert_eq!(status.last_artifact.as_deref(), Some("captures/test.jpg"));
+        let upload = status.upload.expect("upload telemetry");
+        assert_eq!(upload.pending, 2);
+        assert_eq!(upload.active, 1);
+        assert_eq!(upload.retrying, 3);
+        assert_eq!(upload.completed, 4);
+        assert_eq!(upload.permanently_failed, 5);
+        assert_eq!(upload.last_success_unix_ms, Some(10));
+        assert_eq!(upload.last_failure_unix_ms, Some(20));
+        assert_eq!(
+            upload.last_error.as_deref(),
+            Some("HTTP endpoint requested a retry")
+        );
 
         monitor.report_fault("camera disconnected");
         monitor.begin_attempt();
@@ -1172,6 +1296,7 @@ mod tests {
         assert_eq!(retry_status.state, AgentState::Starting);
         assert!(retry_status.camera.is_none());
         assert!(retry_status.last_error.is_none());
+        assert!(retry_status.upload.is_none());
         assert_eq!(retry_status.frames_captured, 1);
         assert_eq!(retry_status.frames_saved, 1);
         assert_eq!(

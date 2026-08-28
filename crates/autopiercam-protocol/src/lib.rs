@@ -196,7 +196,7 @@ pub struct StatusUpload {
     pub pending: u64,
     /// Upload requests currently in progress.
     pub active: u64,
-    /// Upload intents currently waiting for or performing a retry.
+    /// Upload intents waiting for their next retry attempt.
     pub retrying: u64,
     /// Successful uploads retained in the durable ledger.
     pub completed: u64,

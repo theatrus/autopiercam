@@ -1,16 +1,17 @@
 use std::{
-    fs::File,
     io,
-    path::PathBuf,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use thiserror::Error;
 use tracing::{info, warn};
 use ureq::{
     Agent,
@@ -21,9 +22,17 @@ use ureq::{
     tls::{RootCerts, TlsConfig},
 };
 
+#[path = "upload_store.rs"]
+mod upload_store;
+
+use upload_store::{
+    ArtifactVerification, ClaimedUpload, OpenedClaimedArtifact, RecordDisposition, UploadStore,
+    UploadStoreError, UploadStoreSnapshot, open_claimed_artifact,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_IDLE_POLL: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const RETRY_DELAYS: [Duration; 7] = [
     Duration::from_secs(1),
@@ -37,21 +46,31 @@ const RETRY_DELAYS: [Duration; 7] = [
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-/// Complete configuration needed by one best-effort upload worker.
-///
-/// The caller validates the endpoint scheme and constructs the authorization
-/// value without exposing its source secret to this worker's errors or logs.
+const MISSING_ARTIFACT_ERROR: &str = "artifact file is missing";
+const UNOPENABLE_ARTIFACT_ERROR: &str = "artifact file could not be opened or verified";
+const SYMLINK_ARTIFACT_ERROR: &str = "artifact path became a symbolic link";
+const NON_FILE_ARTIFACT_ERROR: &str = "artifact path is not a regular file";
+const ARTIFACT_SIZE_CHANGED_ERROR: &str = "artifact file size changed after it was recorded";
+const ARTIFACT_CONTENT_CHANGED_ERROR: &str = "artifact file content changed after it was recorded";
+const INVALID_HEADER_ERROR: &str = "artifact metadata cannot be represented as HTTP headers";
+const TRANSPORT_ERROR: &str = "HTTP transport failed";
+const RETRYABLE_HTTP_ERROR: &str = "HTTP endpoint requested a retry";
+const PERMANENT_HTTP_ERROR: &str = "HTTP endpoint rejected the artifact";
+const RETRY_TIME_ERROR: &str = "retry time cannot be represented safely";
+
+/// Complete HTTP configuration for one durable upload worker.
 pub(crate) struct UploadOptions {
     endpoint: Uri,
     authorization: Option<HeaderValue>,
-    queue_capacity: usize,
+    /// Bounds coalesced wake hints. SQLite, not this channel, owns the queue.
+    wake_capacity: usize,
 }
 
 impl UploadOptions {
     pub(crate) fn new(
         endpoint: Uri,
         mut authorization: Option<HeaderValue>,
-        queue_capacity: usize,
+        wake_capacity: usize,
     ) -> Self {
         if let Some(value) = &mut authorization {
             value.set_sensitive(true);
@@ -59,15 +78,13 @@ impl UploadOptions {
         Self {
             endpoint,
             authorization,
-            queue_capacity,
+            wake_capacity,
         }
     }
 }
 
-/// Constructs a sensitive `Authorization: Bearer ...` value.
-///
-/// `InvalidHeaderValue` never includes the rejected bytes, so an invalid token
-/// is not surfaced through the returned error.
+/// Constructs a sensitive `Authorization: Bearer ...` value without exposing
+/// rejected token bytes through this module's errors or logs.
 pub(crate) fn bearer_authorization(
     token: &str,
 ) -> Result<HeaderValue, ureq::http::header::InvalidHeaderValue> {
@@ -76,136 +93,300 @@ pub(crate) fn bearer_authorization(
     Ok(value)
 }
 
-#[derive(Clone)]
-pub(crate) struct UploadSink {
-    sender: SyncSender<UploadJob>,
+/// A callback receives these snapshots in ledger mutation order. Callbacks
+/// must be fast and must not call back into the same upload worker or sink.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UploadTelemetry {
+    pub(crate) pending: u64,
+    pub(crate) active: u64,
+    pub(crate) retrying: u64,
+    pub(crate) completed: u64,
+    pub(crate) permanently_failed: u64,
+    pub(crate) last_success_unix_ms: Option<u64>,
+    pub(crate) last_failure_unix_ms: Option<u64>,
+    pub(crate) last_error: Option<String>,
+}
+
+impl From<UploadStoreSnapshot> for UploadTelemetry {
+    fn from(snapshot: UploadStoreSnapshot) -> Self {
+        Self {
+            pending: snapshot.counts.pending,
+            active: snapshot.counts.in_progress,
+            retrying: snapshot.counts.retrying,
+            completed: snapshot.counts.completed,
+            permanently_failed: snapshot.counts.permanently_failed,
+            last_success_unix_ms: snapshot.last_success_at_unix_ms,
+            last_failure_unix_ms: snapshot.last_failure_at_unix_ms,
+            last_error: snapshot.last_error,
+        }
+    }
+}
+
+pub(crate) type UploadObserver = Arc<dyn Fn(UploadTelemetry) + Send + Sync + 'static>;
+
+#[derive(Debug, Error)]
+pub(crate) enum UploadError {
+    #[error(transparent)]
+    Store(#[from] UploadStoreError),
+
+    #[error("upload wake capacity must be greater than zero")]
+    InvalidWakeCapacity,
+
+    #[error("the upload ledger lock was poisoned")]
+    StoreLockPoisoned,
+
+    #[error("the upload telemetry publication lock was poisoned")]
+    PublishLockPoisoned,
+
+    #[error("the system clock is before the Unix epoch")]
+    ClockBeforeUnixEpoch,
+
+    #[error("the system clock cannot be represented in milliseconds")]
+    ClockOutOfRange,
+
+    #[error("the upload telemetry observer panicked")]
+    ObserverPanicked,
+
+    #[error("could not start the upload worker thread")]
+    ThreadStart(#[source] io::Error),
+
+    #[error("the upload worker thread panicked")]
+    WorkerPanicked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UploadEnqueueResult {
-    Queued,
-    QueueFull,
+    Recorded,
+    AlreadyRecorded,
+    /// The artifact was recorded durably, but the worker has stopped and will
+    /// not attempt it until upload service is restarted.
     WorkerStopped,
-    InvalidArtifactPath,
+}
+
+type SharedStore = Arc<Mutex<UploadStore>>;
+type PublishLock = Arc<Mutex<()>>;
+
+/// Cloneable liveness view shared with the owner of an upload sink.
+///
+/// This becomes stopped as soon as shutdown is requested or the worker exits,
+/// including exits caused by a fatal worker-side error.
+#[derive(Clone, Debug)]
+pub(crate) struct UploadHealth {
+    stopped: Arc<AtomicBool>,
+}
+
+impl UploadHealth {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct UploadSink {
+    store: SharedStore,
+    publish_lock: PublishLock,
+    wake_sender: SyncSender<()>,
+    stop: Arc<AtomicBool>,
+    observer: UploadObserver,
+    clock: Arc<dyn UploadClock>,
 }
 
 impl UploadSink {
-    /// Attempts to enqueue a finalized artifact without waiting for capacity.
-    pub(crate) fn try_enqueue(&self, path: PathBuf) -> UploadEnqueueResult {
-        let Ok(job) = UploadJob::new(path) else {
-            return UploadEnqueueResult::InvalidArtifactPath;
-        };
-        match self.sender.try_send(job) {
-            Ok(()) => UploadEnqueueResult::Queued,
-            Err(TrySendError::Full(_)) => UploadEnqueueResult::QueueFull,
-            Err(TrySendError::Disconnected(_)) => UploadEnqueueResult::WorkerStopped,
+    pub(crate) fn health(&self) -> UploadHealth {
+        UploadHealth {
+            stopped: Arc::clone(&self.stop),
         }
+    }
+
+    /// Records a finalized artifact durably before attempting a nonblocking
+    /// wake. `Full` is success because another wake is already pending and the
+    /// worker always drains all due ledger rows.
+    pub(crate) fn try_enqueue(&self, path: PathBuf) -> Result<UploadEnqueueResult, UploadError> {
+        let result = self.record_and_publish(&path);
+        let disposition = match result {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                self.signal_stop();
+                return Err(error);
+            }
+        };
+
+        if self.health().is_stopped() {
+            return Ok(UploadEnqueueResult::WorkerStopped);
+        }
+        match self.wake_sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(match disposition {
+                RecordDisposition::Inserted => UploadEnqueueResult::Recorded,
+                RecordDisposition::AlreadyRecorded => UploadEnqueueResult::AlreadyRecorded,
+            }),
+            Err(TrySendError::Disconnected(())) => {
+                self.stop.store(true, Ordering::Release);
+                Ok(UploadEnqueueResult::WorkerStopped)
+            }
+        }
+    }
+
+    fn record_and_publish(&self, path: &Path) -> Result<RecordDisposition, UploadError> {
+        let now = self.clock.now_unix_ms()?;
+        let _publication = lock_publish(&self.publish_lock)?;
+        let (disposition, telemetry) = {
+            let mut store = lock_store(&self.store)?;
+            let disposition = store.record_artifact(path, now)?.disposition;
+            let telemetry = UploadTelemetry::from(store.snapshot()?);
+            (disposition, telemetry)
+        };
+        notify_observer(&self.observer, telemetry)?;
+        Ok(disposition)
+    }
+
+    fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.wake_sender.try_send(());
     }
 }
 
 /// Owns the single HTTP thread paired with an [`UploadSink`].
 pub(crate) struct UploadWorker {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    wake_sender: SyncSender<()>,
+    thread: Option<JoinHandle<Result<(), UploadError>>>,
 }
 
 impl UploadWorker {
-    pub(crate) fn start(options: UploadOptions) -> io::Result<(Self, UploadSink)> {
-        if options.queue_capacity == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "upload queue capacity must be greater than zero",
-            ));
-        }
-        let queue_capacity = options.queue_capacity;
+    pub(crate) fn start(
+        options: UploadOptions,
+        database_path: &Path,
+        capture_directory: &Path,
+        observer: UploadObserver,
+    ) -> Result<(Self, UploadSink), UploadError> {
+        let wake_capacity = options.wake_capacity;
+        let destination = options.endpoint.to_string();
         let transport = UreqTransport::new(options);
-        Self::start_with_transport(transport, RetryPolicy::production(), queue_capacity)
+        Self::start_with_transport(
+            transport,
+            RetryPolicy::production(),
+            wake_capacity,
+            database_path,
+            capture_directory,
+            &destination,
+            observer,
+            Arc::new(SystemClock),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_transport<T>(
         transport: T,
         retry_policy: RetryPolicy,
-        queue_capacity: usize,
-    ) -> io::Result<(Self, UploadSink)>
+        wake_capacity: usize,
+        database_path: &Path,
+        capture_directory: &Path,
+        destination: &str,
+        observer: UploadObserver,
+        clock: Arc<dyn UploadClock>,
+    ) -> Result<(Self, UploadSink), UploadError>
     where
         T: UploadTransport,
     {
-        if queue_capacity == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "upload queue capacity must be greater than zero",
-            ));
+        if wake_capacity == 0 {
+            return Err(UploadError::InvalidWakeCapacity);
         }
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+
+        let now = clock.now_unix_ms()?;
+        let mut store = UploadStore::open(database_path, capture_directory, destination)?;
+        store.reconcile_capture_directory(now)?;
+        notify_observer(&observer, UploadTelemetry::from(store.snapshot()?))?;
+
+        let store = Arc::new(Mutex::new(store));
+        let publish_lock = Arc::new(Mutex::new(()));
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(wake_capacity);
         let stop = Arc::new(AtomicBool::new(false));
+        let worker_store = Arc::clone(&store);
+        let worker_publish_lock = Arc::clone(&publish_lock);
         let worker_stop = Arc::clone(&stop);
+        let worker_observer = Arc::clone(&observer);
+        let worker_clock = Arc::clone(&clock);
         let thread = thread::Builder::new()
             .name("autopiercam-upload".to_owned())
-            .spawn(move || upload_loop(receiver, &worker_stop, transport, retry_policy))?;
+            .spawn(move || {
+                let _stop_on_exit = StopOnDrop(Arc::clone(&worker_stop));
+                upload_loop(
+                    wake_receiver,
+                    &worker_stop,
+                    &worker_store,
+                    &worker_publish_lock,
+                    transport,
+                    retry_policy,
+                    &worker_observer,
+                    &worker_clock,
+                )
+            })
+            .map_err(UploadError::ThreadStart)?;
+
         Ok((
             Self {
-                stop,
+                stop: Arc::clone(&stop),
+                wake_sender: wake_sender.clone(),
                 thread: Some(thread),
             },
-            UploadSink { sender },
+            UploadSink {
+                store,
+                publish_lock,
+                wake_sender,
+                stop,
+                observer,
+                clock,
+            },
         ))
     }
 
-    pub(crate) fn stop_and_join(mut self) -> io::Result<()> {
+    pub(crate) fn stop_and_join(mut self) -> Result<(), UploadError> {
         self.stop_and_join_inner()
     }
 
-    fn stop_and_join_inner(&mut self) -> io::Result<()> {
+    fn stop_and_join_inner(&mut self) -> Result<(), UploadError> {
         self.stop.store(true, Ordering::Release);
+        let _ = self.wake_sender.try_send(());
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        // Wakes an interruptible retry wait immediately. A worker awaiting a
-        // new queue item observes cancellation within QUEUE_POLL_INTERVAL.
-        thread.thread().unpark();
-        thread
-            .join()
-            .map_err(|_| io::Error::other("upload worker thread panicked"))
+        thread.join().map_err(|_| UploadError::WorkerPanicked)?
     }
 }
 
 impl Drop for UploadWorker {
     fn drop(&mut self) {
-        let _ = self.stop_and_join_inner();
+        if let Err(error) = self.stop_and_join_inner() {
+            warn!(%error, "upload worker did not shut down cleanly");
+        }
     }
 }
 
-struct UploadJob {
-    path: PathBuf,
-    file_name: HeaderValue,
-    idempotency_key: HeaderValue,
-    jitter_seed: u64,
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
-impl UploadJob {
-    fn new(path: PathBuf) -> Result<Self, ()> {
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or(())?;
-        if file_name.is_empty() {
-            return Err(());
-        }
-        let jitter_seed = fnv1a(file_name.as_bytes());
-        let file_name_header = HeaderValue::from_str(file_name).map_err(|_| ())?;
-        let idempotency_key =
-            HeaderValue::from_str(&format!("autopiercam-{file_name}")).map_err(|_| ())?;
-        Ok(Self {
-            path,
-            file_name: file_name_header,
-            idempotency_key,
-            jitter_seed,
-        })
+trait UploadClock: Send + Sync + 'static {
+    fn now_unix_ms(&self) -> Result<u64, UploadError>;
+}
+
+struct SystemClock;
+
+impl UploadClock for SystemClock {
+    fn now_unix_ms(&self) -> Result<u64, UploadError> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| UploadError::ClockBeforeUnixEpoch)?;
+        u64::try_from(elapsed.as_millis()).map_err(|_| UploadError::ClockOutOfRange)
     }
 }
 
 trait UploadTransport: Send + 'static {
-    fn upload(&mut self, job: &UploadJob) -> AttemptOutcome;
+    fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome;
 }
 
 struct UreqTransport {
@@ -236,22 +417,48 @@ impl UreqTransport {
 }
 
 impl UploadTransport for UreqTransport {
-    fn upload(&mut self, job: &UploadJob) -> AttemptOutcome {
-        let file = match File::open(&job.path) {
-            Ok(file) => file,
-            Err(_) => return AttemptOutcome::Permanent { status: None },
+    fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome {
+        let file = match open_claimed_artifact(claim) {
+            Ok(OpenedClaimedArtifact::Verified(file)) => file,
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Missing)) => {
+                return AttemptOutcome::permanent(None, MISSING_ARTIFACT_ERROR);
+            }
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Symlink)) => {
+                return AttemptOutcome::permanent(None, SYMLINK_ARTIFACT_ERROR);
+            }
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::NotRegularFile)) => {
+                return AttemptOutcome::permanent(None, NON_FILE_ARTIFACT_ERROR);
+            }
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::SizeMismatch { .. })) => {
+                return AttemptOutcome::permanent(None, ARTIFACT_SIZE_CHANGED_ERROR);
+            }
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Sha256Mismatch {
+                ..
+            })) => {
+                return AttemptOutcome::permanent(None, ARTIFACT_CONTENT_CHANGED_ERROR);
+            }
+            #[cfg(test)]
+            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Verified)) => {
+                return AttemptOutcome::retry(None, None, UNOPENABLE_ARTIFACT_ERROR);
+            }
+            Err(_) => return AttemptOutcome::retry(None, None, UNOPENABLE_ARTIFACT_ERROR),
         };
-        let content_length = match file.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(_) => return AttemptOutcome::Permanent { status: None },
+        let file_name = match HeaderValue::from_str(&claim.filename) {
+            Ok(value) => value,
+            Err(_) => return AttemptOutcome::permanent(None, INVALID_HEADER_ERROR),
         };
+        let idempotency_key = match HeaderValue::from_str(&claim.idempotency_key) {
+            Ok(value) => value,
+            Err(_) => return AttemptOutcome::permanent(None, INVALID_HEADER_ERROR),
+        };
+
         let mut request = self
             .agent
             .put(self.endpoint.clone())
             .content_type("image/jpeg")
-            .header(CONTENT_LENGTH, content_length.to_string())
-            .header("X-AutoPierCam-Filename", job.file_name.clone())
-            .header("Idempotency-Key", job.idempotency_key.clone());
+            .header(CONTENT_LENGTH, claim.file_size.to_string())
+            .header("X-AutoPierCam-Filename", file_name)
+            .header("Idempotency-Key", idempotency_key);
         if let Some(authorization) = &self.authorization {
             request = request.header(AUTHORIZATION, authorization.clone());
         }
@@ -261,39 +468,53 @@ impl UploadTransport for UreqTransport {
                 let status = response.status().as_u16();
                 classify_status(status, parse_retry_after(response.headers()))
             }
-            // Request construction was prevalidated. Remaining ureq failures
-            // are transport/protocol failures and are safe to retry because PUT
-            // and the idempotency key remain stable for this artifact.
-            Err(_) => AttemptOutcome::Retry {
-                status: None,
-                retry_after: None,
-            },
+            Err(ureq::Error::StatusCode(status)) => classify_status(status, None),
+            Err(_) => AttemptOutcome::retry(None, None, TRANSPORT_ERROR),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptOutcome {
-    Success,
+    Success {
+        status: u16,
+    },
     Retry {
         status: Option<u16>,
         retry_after: Option<Duration>,
+        error: &'static str,
     },
     Permanent {
         status: Option<u16>,
+        error: &'static str,
     },
+}
+
+impl AttemptOutcome {
+    const fn retry(
+        status: Option<u16>,
+        retry_after: Option<Duration>,
+        error: &'static str,
+    ) -> Self {
+        Self::Retry {
+            status,
+            retry_after,
+            error,
+        }
+    }
+
+    const fn permanent(status: Option<u16>, error: &'static str) -> Self {
+        Self::Permanent { status, error }
+    }
 }
 
 fn classify_status(status: u16, retry_after: Option<Duration>) -> AttemptOutcome {
     match status {
-        200..=299 => AttemptOutcome::Success,
-        408 | 425 | 429 | 500..=599 => AttemptOutcome::Retry {
-            status: Some(status),
-            retry_after,
-        },
-        _ => AttemptOutcome::Permanent {
-            status: Some(status),
-        },
+        200..=299 => AttemptOutcome::Success { status },
+        408 | 425 | 429 | 500..=599 => {
+            AttemptOutcome::retry(Some(status), retry_after, RETRYABLE_HTTP_ERROR)
+        }
+        _ => AttemptOutcome::permanent(Some(status), PERMANENT_HTTP_ERROR),
     }
 }
 
@@ -324,12 +545,17 @@ impl RetryPolicy {
 
     fn delay(
         self,
-        retry_index: usize,
+        attempt_count: u64,
         jitter_seed: u64,
         retry_after: Option<Duration>,
     ) -> Duration {
-        let base = self.schedule[retry_index.min(self.schedule.len() - 1)];
-        let mixed = mix64(jitter_seed ^ retry_index as u64);
+        debug_assert!(!self.schedule.is_empty());
+        let retry_index = attempt_count.saturating_sub(1);
+        let schedule_index = usize::try_from(retry_index)
+            .unwrap_or(usize::MAX)
+            .min(self.schedule.len() - 1);
+        let base = self.schedule[schedule_index];
+        let mixed = mix64(jitter_seed ^ retry_index);
         let jitter_percent = 80_u128 + u128::from(mixed % 41);
         let jittered_ms = base.as_millis().saturating_mul(jitter_percent) / 100;
         let retry_after_ms = retry_after
@@ -343,74 +569,184 @@ impl RetryPolicy {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_loop<T>(
-    receiver: Receiver<UploadJob>,
+    wake_receiver: Receiver<()>,
     stop: &AtomicBool,
+    shared_store: &SharedStore,
+    publish_lock: &PublishLock,
     mut transport: T,
     retry_policy: RetryPolicy,
-) where
+    observer: &UploadObserver,
+    clock: &Arc<dyn UploadClock>,
+) -> Result<(), UploadError>
+where
     T: UploadTransport,
 {
-    while !stop.load(Ordering::Acquire) {
-        let job = match receiver.recv_timeout(QUEUE_POLL_INTERVAL) {
-            Ok(job) => job,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return,
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let claim_time = clock.now_unix_ms()?;
+        let (claim, next_due) =
+            claim_and_publish(shared_store, publish_lock, observer, claim_time)?;
+        let Some(claim) = claim else {
+            match wake_receiver.recv_timeout(wait_until_due(next_due, claim_time)) {
+                Ok(()) | Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         };
-        let mut retry_index = 0_usize;
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            match transport.upload(&job) {
-                AttemptOutcome::Success => {
-                    info!(path = %job.path.display(), "uploaded finalized artifact");
-                    break;
-                }
-                AttemptOutcome::Permanent { status } => {
-                    warn!(
-                        path = %job.path.display(),
-                        ?status,
-                        "artifact upload failed permanently"
-                    );
-                    break;
-                }
-                AttemptOutcome::Retry {
-                    status,
-                    retry_after,
-                } => {
-                    let delay = retry_policy.delay(retry_index, job.jitter_seed, retry_after);
-                    retry_index = retry_index.saturating_add(1);
-                    warn!(
-                        path = %job.path.display(),
-                        ?status,
-                        retry_ms = delay.as_millis(),
-                        "artifact upload failed; retrying"
-                    );
-                    if wait_for_retry(stop, delay) {
-                        return;
-                    }
-                }
-            }
+        if stop.load(Ordering::Acquire) {
+            let _publication = lock_publish(publish_lock)?;
+            let telemetry = {
+                let mut store = lock_store(shared_store)?;
+                store.release_claim(&claim, claim_time)?;
+                UploadTelemetry::from(store.snapshot()?)
+            };
+            notify_observer(observer, telemetry)?;
+            return Ok(());
+        }
+
+        // No database mutex is held across verification or the bounded HTTP
+        // request. Once claimed, the outcome is persisted even if stop races in.
+        let outcome = transport.upload(&claim);
+        let (finished_at, clock_error) = match clock.now_unix_ms() {
+            Ok(now) => (now, None),
+            Err(error) => (claim_time, Some(error)),
+        };
+        persist_outcome_and_publish(
+            shared_store,
+            publish_lock,
+            observer,
+            &claim,
+            outcome,
+            finished_at,
+            retry_policy,
+        )?;
+
+        if let Some(error) = clock_error {
+            return Err(error);
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
         }
     }
 }
 
-/// Returns true when cancellation interrupts the wait.
-fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
-    let Some(deadline) = Instant::now().checked_add(delay) else {
-        return stop.load(Ordering::Acquire);
+fn claim_and_publish(
+    shared_store: &SharedStore,
+    publish_lock: &PublishLock,
+    observer: &UploadObserver,
+    now: u64,
+) -> Result<(Option<ClaimedUpload>, Option<u64>), UploadError> {
+    let _publication = lock_publish(publish_lock)?;
+    let (claim, snapshot) = {
+        let mut store = lock_store(shared_store)?;
+        let claim = store.claim_due(now)?;
+        let snapshot = store.snapshot()?;
+        (claim, snapshot)
     };
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::park_timeout(remaining);
+    let next_due = snapshot.next_due_at_unix_ms;
+    if claim.is_some() {
+        notify_observer(observer, UploadTelemetry::from(snapshot))?;
     }
+    Ok((claim, next_due))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_outcome_and_publish(
+    shared_store: &SharedStore,
+    publish_lock: &PublishLock,
+    observer: &UploadObserver,
+    claim: &ClaimedUpload,
+    outcome: AttemptOutcome,
+    finished_at: u64,
+    retry_policy: RetryPolicy,
+) -> Result<(), UploadError> {
+    let _publication = lock_publish(publish_lock)?;
+    let telemetry = {
+        let mut store = lock_store(shared_store)?;
+        match outcome {
+            AttemptOutcome::Success { status } => {
+                store.mark_completed(claim, finished_at, status)?;
+                info!(
+                    path = %claim.artifact_path.display(),
+                    attempt = claim.attempt_count,
+                    status,
+                    "uploaded finalized artifact"
+                );
+            }
+            AttemptOutcome::Permanent { status, error } => {
+                store.mark_permanently_failed(claim, finished_at, status, Some(error))?;
+                warn!(
+                    path = %claim.artifact_path.display(),
+                    attempt = claim.attempt_count,
+                    ?status,
+                    error,
+                    "artifact upload failed permanently"
+                );
+            }
+            AttemptOutcome::Retry {
+                status,
+                retry_after,
+                error,
+            } => {
+                let delay = retry_policy.delay(
+                    claim.attempt_count,
+                    fnv1a(claim.idempotency_key.as_bytes()),
+                    retry_after,
+                );
+                let delay_ms =
+                    u64::try_from(delay.as_millis()).map_err(|_| UploadError::ClockOutOfRange)?;
+                let Some(next_attempt_at) = finished_at.checked_add(delay_ms) else {
+                    store.mark_permanently_failed(
+                        claim,
+                        finished_at,
+                        status,
+                        Some(RETRY_TIME_ERROR),
+                    )?;
+                    return Err(UploadError::ClockOutOfRange);
+                };
+                store.mark_retrying(claim, finished_at, next_attempt_at, status, Some(error))?;
+                warn!(
+                    path = %claim.artifact_path.display(),
+                    attempt = claim.attempt_count,
+                    ?status,
+                    retry_ms = delay.as_millis(),
+                    error,
+                    "artifact upload failed; retry scheduled"
+                );
+            }
+        }
+        UploadTelemetry::from(store.snapshot()?)
+    };
+    notify_observer(observer, telemetry)
+}
+
+fn lock_store(store: &SharedStore) -> Result<MutexGuard<'_, UploadStore>, UploadError> {
+    store.lock().map_err(|_| UploadError::StoreLockPoisoned)
+}
+
+fn lock_publish(publish_lock: &PublishLock) -> Result<MutexGuard<'_, ()>, UploadError> {
+    publish_lock
+        .lock()
+        .map_err(|_| UploadError::PublishLockPoisoned)
+}
+
+fn notify_observer(
+    observer: &UploadObserver,
+    telemetry: UploadTelemetry,
+) -> Result<(), UploadError> {
+    catch_unwind(AssertUnwindSafe(|| observer(telemetry)))
+        .map_err(|_| UploadError::ObserverPanicked)
+}
+
+fn wait_until_due(next_due: Option<u64>, now: u64) -> Duration {
+    let until_due = next_due
+        .map(|due| Duration::from_millis(due.saturating_sub(now)))
+        .unwrap_or(MAX_IDLE_POLL);
+    until_due.min(MAX_IDLE_POLL)
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -430,46 +766,413 @@ fn mix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
         io::{Read, Write},
         net::TcpListener,
-        path::Path,
+        str::FromStr,
         sync::atomic::AtomicU64,
     };
 
     use super::*;
 
-    static TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    const NO_DELAY: [Duration; 1] = [Duration::ZERO];
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const LONG_DELAY: [Duration; 1] = [Duration::from_secs(60)];
+    const TEST_DESTINATION: &str = "https://upload.example.test/camera/latest";
 
-    struct TestArtifact(PathBuf);
+    struct TestEnvironment {
+        root: PathBuf,
+        capture: PathBuf,
+        database: PathBuf,
+    }
 
-    impl TestArtifact {
-        fn new(name: &str, contents: &[u8]) -> Self {
-            let sequence = TEST_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "autopiercam-upload-test-{}-{sequence}-{name}",
+    impl TestEnvironment {
+        fn new() -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "autopiercam-upload-integration-test-{}-{sequence}",
                 std::process::id()
             ));
-            std::fs::write(&path, contents).unwrap();
-            Self(path)
+            let capture = root.join("captures");
+            std::fs::create_dir_all(&capture).unwrap();
+            let database = root.join("uploads.sqlite3");
+            Self {
+                root,
+                capture,
+                database,
+            }
         }
 
-        fn path(&self) -> &Path {
-            &self.0
+        fn artifact(&self, sequence: u64, contents: &[u8]) -> PathBuf {
+            let path = self
+                .capture
+                .join(format!("frame-1700000000-123-{sequence:06}.jpg"));
+            std::fs::write(&path, contents).unwrap();
+            path
         }
     }
 
-    impl Drop for TestArtifact {
+    impl Drop for TestEnvironment {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn new(now: u64) -> Self {
+            Self(AtomicU64::new(now))
+        }
+
+        fn set(&self, now: u64) {
+            self.0.store(now, Ordering::Release);
+        }
+    }
+
+    impl UploadClock for ManualClock {
+        fn now_unix_ms(&self) -> Result<u64, UploadError> {
+            Ok(self.0.load(Ordering::Acquire))
+        }
+    }
+
+    fn observer_channel() -> (UploadObserver, mpsc::Receiver<UploadTelemetry>) {
+        let (sender, receiver) = mpsc::channel();
+        let observer: UploadObserver = Arc::new(move |telemetry| {
+            let _ = sender.send(telemetry);
+        });
+        (observer, receiver)
+    }
+
+    fn receive_until(
+        receiver: &mpsc::Receiver<UploadTelemetry>,
+        predicate: impl Fn(&UploadTelemetry) -> bool,
+    ) -> UploadTelemetry {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let telemetry = receiver.recv_timeout(remaining).unwrap();
+            if predicate(&telemetry) {
+                return telemetry;
+            }
         }
     }
 
     #[test]
-    fn status_and_retry_after_classification_is_explicit_and_bounded() {
-        assert_eq!(classify_status(204, None), AttemptOutcome::Success);
+    fn fatal_worker_error_stops_health_while_later_intents_remain_durable() {
+        let environment = TestEnvironment::new();
+        let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer_failed_once = Arc::clone(&failed_once);
+        let observer: UploadObserver = Arc::new(move |telemetry| {
+            if telemetry.active != 0 && !observer_failed_once.swap(true, Ordering::AcqRel) {
+                panic!("injected worker-side observer failure");
+            }
+        });
+        let (worker, sink) = UploadWorker::start_with_transport(
+            ReportingSuccessTransport {
+                attempt: mpsc::channel().0,
+            },
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .unwrap();
+        let health = sink.health();
+        assert!(!health.is_stopped());
+
+        assert_eq!(
+            sink.try_enqueue(environment.artifact(1, b"first durable intent"))
+                .unwrap(),
+            UploadEnqueueResult::Recorded
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !health.is_stopped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker health did not observe the fatal exit"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            sink.try_enqueue(environment.artifact(2, b"recorded after worker exit"))
+                .unwrap(),
+            UploadEnqueueResult::WorkerStopped
+        );
+        assert_eq!(
+            lock_store(&sink.store)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .counts
+                .total(),
+            2
+        );
+        assert!(matches!(
+            worker.stop_and_join(),
+            Err(UploadError::ObserverPanicked)
+        ));
+        drop(sink);
+
+        let reopened = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+        )
+        .unwrap();
+        let recovered = reopened.snapshot().unwrap();
+        assert_eq!(recovered.counts.pending, 2);
+        assert_eq!(recovered.counts.total(), 2);
+    }
+
+    struct FirstBlockingTransport {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl UploadTransport for FirstBlockingTransport {
+        fn upload(&mut self, _claim: &ClaimedUpload) -> AttemptOutcome {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            AttemptOutcome::Success { status: 204 }
+        }
+    }
+
+    #[test]
+    fn full_wake_channel_never_loses_durable_intent() {
+        let environment = TestEnvironment::new();
+        let (observer, telemetry) = observer_channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let transport = FirstBlockingTransport {
+            entered: entered_tx,
+            release: release_rx,
+            attempts: Arc::clone(&attempts),
+        };
+        let (worker, sink) = UploadWorker::start_with_transport(
+            transport,
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.try_enqueue(environment.artifact(1, b"first")).unwrap(),
+            UploadEnqueueResult::Recorded
+        );
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Occupy the sole advisory wake slot. These records must still succeed.
+        assert!(matches!(
+            sink.wake_sender.try_send(()),
+            Ok(()) | Err(TrySendError::Full(()))
+        ));
+        assert_eq!(
+            sink.try_enqueue(environment.artifact(2, b"second"))
+                .unwrap(),
+            UploadEnqueueResult::Recorded
+        );
+        assert_eq!(
+            sink.try_enqueue(environment.artifact(3, b"third")).unwrap(),
+            UploadEnqueueResult::Recorded
+        );
+        assert_eq!(
+            lock_store(&sink.store)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .counts
+                .total(),
+            3
+        );
+
+        release_tx.send(()).unwrap();
+        let final_state = receive_until(&telemetry, |value| value.completed == 3);
+        assert_eq!(final_state.pending, 0);
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+        worker.stop_and_join().unwrap();
+    }
+
+    struct BlockingRetryTransport {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl UploadTransport for BlockingRetryTransport {
+        fn upload(&mut self, _claim: &ClaimedUpload) -> AttemptOutcome {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            AttemptOutcome::retry(Some(503), None, RETRYABLE_HTTP_ERROR)
+        }
+    }
+
+    struct ReportingSuccessTransport {
+        attempt: mpsc::Sender<u64>,
+    }
+
+    impl UploadTransport for ReportingSuccessTransport {
+        fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome {
+            self.attempt.send(claim.attempt_count).unwrap();
+            AttemptOutcome::Success { status: 204 }
+        }
+    }
+
+    #[test]
+    fn shutdown_finishes_current_attempt_and_restart_obeys_persisted_retry() {
+        let environment = TestEnvironment::new();
+        let manual_clock = Arc::new(ManualClock::new(10_000));
+        let (observer, telemetry) = observer_channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (mut worker, sink) = UploadWorker::start_with_transport(
+            BlockingRetryTransport {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            RetryPolicy {
+                schedule: &LONG_DELAY,
+            },
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            manual_clock.clone(),
+        )
+        .unwrap();
+        sink.try_enqueue(environment.artifact(10, b"retry me"))
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Stop races with the active request. Releasing it must still persist
+        // the retry outcome before join returns.
+        worker.stop.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        worker.stop_and_join_inner().unwrap();
+        let retrying = receive_until(&telemetry, |value| value.retrying == 1);
+        let due = lock_store(&sink.store)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .next_due_at_unix_ms
+            .unwrap();
+        assert!(due > 10_000);
+        assert_eq!(retrying.active, 0);
+        drop(sink);
+
+        manual_clock.set(due);
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            ReportingSuccessTransport {
+                attempt: attempt_tx,
+            },
+            RetryPolicy {
+                schedule: &LONG_DELAY,
+            },
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            manual_clock,
+        )
+        .unwrap();
+        assert_eq!(attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        receive_until(&telemetry, |value| value.completed == 1);
+        worker.stop_and_join().unwrap();
+        drop(sink);
+    }
+
+    #[test]
+    fn restart_recovers_an_abandoned_claim() {
+        let environment = TestEnvironment::new();
+        let artifact = environment.artifact(20, b"recover me");
+        let stale_claim = {
+            let mut store = UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+            )
+            .unwrap();
+            store.record_artifact(&artifact, 20_000).unwrap();
+            store.claim_due(20_000).unwrap().unwrap()
+        };
+        assert_eq!(stale_claim.attempt_count, 1);
+
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            ReportingSuccessTransport {
+                attempt: attempt_tx,
+            },
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            Arc::new(ManualClock::new(20_000)),
+        )
+        .unwrap();
+        assert_eq!(attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        receive_until(&telemetry, |value| value.completed == 1);
+        worker.stop_and_join().unwrap();
+        drop(sink);
+    }
+
+    #[test]
+    fn missing_artifact_becomes_a_safe_permanent_failure() {
+        let environment = TestEnvironment::new();
+        let missing = environment.artifact(30, b"gone soon");
+        {
+            let mut store = UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+            )
+            .unwrap();
+            store.record_artifact(&missing, 30_000).unwrap();
+        }
+        std::fs::remove_file(&missing).unwrap();
+
+        let endpoint = Uri::from_static("http://127.0.0.1:9/upload");
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            UreqTransport::new(UploadOptions::new(endpoint, None, 1)),
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            Arc::new(ManualClock::new(30_000)),
+        )
+        .unwrap();
+        let failed = receive_until(&telemetry, |value| value.permanently_failed == 1);
+        assert_eq!(failed.last_error.as_deref(), Some(MISSING_ARTIFACT_ERROR));
+        worker.stop_and_join().unwrap();
+        drop(sink);
+    }
+
+    #[test]
+    fn status_retry_after_and_jitter_are_explicit_and_bounded() {
+        assert_eq!(
+            classify_status(204, None),
+            AttemptOutcome::Success { status: 204 }
+        );
         for status in [408, 425, 429, 500, 503, 599] {
             assert!(matches!(
                 classify_status(status, None),
@@ -480,12 +1183,13 @@ mod tests {
             ));
         }
         for status in [300, 400, 401, 404, 409, 413] {
-            assert_eq!(
+            assert!(matches!(
                 classify_status(status, None),
                 AttemptOutcome::Permanent {
-                    status: Some(status)
-                }
-            );
+                    status: Some(found),
+                    ..
+                } if found == status
+            ));
         }
 
         let mut headers = ureq::http::HeaderMap::new();
@@ -499,193 +1203,44 @@ mod tests {
             HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
         );
         assert_eq!(parse_retry_after(&headers), None);
-    }
 
-    #[test]
-    fn jitter_is_deterministic_and_capped() {
         let policy = RetryPolicy::production();
-        let first = policy.delay(0, 42, None);
-        assert_eq!(first, policy.delay(0, 42, None));
+        let first = policy.delay(1, 42, None);
+        assert_eq!(first, policy.delay(1, 42, None));
         assert!((Duration::from_millis(800)..=Duration::from_millis(1_200)).contains(&first));
         assert_eq!(
-            policy.delay(99, 42, Some(Duration::from_secs(999))),
+            policy.delay(100, 42, Some(Duration::from_secs(999))),
             MAX_RETRY_DELAY
         );
     }
 
-    struct BlockingTransport {
-        entered: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
-        calls: Arc<AtomicU64>,
-    }
-
-    impl UploadTransport for BlockingTransport {
-        fn upload(&mut self, _job: &UploadJob) -> AttemptOutcome {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            self.entered.send(()).unwrap();
-            self.release.recv().unwrap();
-            AttemptOutcome::Success
-        }
-    }
-
     #[test]
-    fn queue_is_bounded_and_shutdown_abandons_pending_jobs() {
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let calls = Arc::new(AtomicU64::new(0));
-        let transport = BlockingTransport {
-            entered: entered_tx,
-            release: release_rx,
-            calls: Arc::clone(&calls),
-        };
-        let (mut worker, sink) = UploadWorker::start_with_transport(
-            transport,
-            RetryPolicy {
-                schedule: &NO_DELAY,
-            },
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(
-            sink.try_enqueue(PathBuf::from("first.jpg")),
-            UploadEnqueueResult::Queued
-        );
-        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(
-            sink.try_enqueue(PathBuf::from("second.jpg")),
-            UploadEnqueueResult::Queued
-        );
-        assert_eq!(
-            sink.try_enqueue(PathBuf::from("third.jpg")),
-            UploadEnqueueResult::QueueFull
-        );
-
-        // Set cancellation before releasing the active request. The queued
-        // second job must be abandoned rather than started during shutdown.
-        worker.stop.store(true, Ordering::Release);
-        release_tx.send(()).unwrap();
-        worker.stop_and_join_inner().unwrap();
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-    }
-
-    struct ScriptedTransport {
-        outcomes: VecDeque<AttemptOutcome>,
-        attempts: mpsc::Sender<AttemptOutcome>,
-    }
-
-    impl UploadTransport for ScriptedTransport {
-        fn upload(&mut self, _job: &UploadJob) -> AttemptOutcome {
-            let outcome = self.outcomes.pop_front().unwrap_or(AttemptOutcome::Success);
-            self.attempts.send(outcome).unwrap();
-            outcome
-        }
-    }
-
-    #[test]
-    fn transient_failure_retries_the_same_job() {
-        let retry = AttemptOutcome::Retry {
-            status: Some(503),
-            retry_after: Some(Duration::ZERO),
-        };
-        let (attempt_tx, attempt_rx) = mpsc::channel();
-        let transport = ScriptedTransport {
-            outcomes: VecDeque::from([retry, AttemptOutcome::Success]),
-            attempts: attempt_tx,
-        };
-        let (worker, sink) = UploadWorker::start_with_transport(
-            transport,
-            RetryPolicy {
-                schedule: &NO_DELAY,
-            },
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            sink.try_enqueue(PathBuf::from("retry.jpg")),
-            UploadEnqueueResult::Queued
-        );
-        assert_eq!(
-            attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            retry
-        );
-        assert_eq!(
-            attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            AttemptOutcome::Success
-        );
-        worker.stop_and_join().unwrap();
-    }
-
-    struct AlwaysRetry {
-        entered: mpsc::Sender<()>,
-    }
-
-    impl UploadTransport for AlwaysRetry {
-        fn upload(&mut self, _job: &UploadJob) -> AttemptOutcome {
-            self.entered.send(()).unwrap();
-            AttemptOutcome::Retry {
-                status: None,
-                retry_after: None,
-            }
-        }
-    }
-
-    #[test]
-    fn shutdown_interrupts_a_long_backoff() {
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (worker, sink) = UploadWorker::start_with_transport(
-            AlwaysRetry {
-                entered: entered_tx,
-            },
-            RetryPolicy {
-                schedule: &LONG_DELAY,
-            },
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            sink.try_enqueue(PathBuf::from("offline.jpg")),
-            UploadEnqueueResult::Queued
-        );
-        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        worker.stop_and_join().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn enqueue_rejects_a_path_without_a_file_name() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        let sink = UploadSink { sender };
-        assert_eq!(
-            sink.try_enqueue(PathBuf::new()),
-            UploadEnqueueResult::InvalidArtifactPath
-        );
-    }
-
-    #[test]
-    fn loopback_put_streams_exact_file_and_contract_headers() {
+    fn loopback_put_streams_exact_verified_file_and_headers() {
+        let environment = TestEnvironment::new();
         let jpeg = b"\xff\xd8autopiercam-test-jpeg\xff\xd9";
-        let artifact = TestArtifact::new("frame.jpg", jpeg);
-        let expected_file_name = artifact
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let artifact = environment.artifact(40, jpeg);
+        let expected_file_name = artifact.file_name().unwrap().to_str().unwrap().to_owned();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || read_one_request(listener));
 
-        let endpoint = format!("http://{address}/camera/latest?site=pier")
-            .parse::<Uri>()
-            .unwrap();
+        let endpoint = Uri::from_str(&format!("http://{address}/camera/latest?site=pier")).unwrap();
         let authorization = bearer_authorization("contract-secret").unwrap();
-        let options = UploadOptions::new(endpoint, Some(authorization), 1);
-        let mut transport = UreqTransport::new(options);
-        let job = UploadJob::new(artifact.path().to_path_buf()).unwrap();
-        assert_eq!(transport.upload(&job), AttemptOutcome::Success);
+        let mut transport =
+            UreqTransport::new(UploadOptions::new(endpoint, Some(authorization), 1));
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+        )
+        .unwrap();
+        store.record_artifact(&artifact, 40_000).unwrap();
+        let claim = store.claim_due(40_000).unwrap().unwrap();
+        let expected_idempotency_key = claim.idempotency_key.clone();
+        assert_eq!(
+            transport.upload(&claim),
+            AttemptOutcome::Success { status: 204 }
+        );
 
         let request = server.join().unwrap();
         assert_eq!(
@@ -698,10 +1253,7 @@ mod tests {
             request.headers["x-autopiercam-filename"],
             expected_file_name
         );
-        assert_eq!(
-            request.headers["idempotency-key"],
-            format!("autopiercam-{expected_file_name}")
-        );
+        assert_eq!(request.headers["idempotency-key"], expected_idempotency_key);
         assert_eq!(request.headers["authorization"], "Bearer contract-secret");
         assert_eq!(request.body, jpeg);
     }
