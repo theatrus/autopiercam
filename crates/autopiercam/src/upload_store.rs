@@ -541,12 +541,6 @@ impl UploadStore {
             }
             0 => return Err(UploadStoreError::MissingSchema),
             SCHEMA_VERSION => {
-                verify_schema(
-                    &mut connection,
-                    capture_root_text,
-                    &destination,
-                    authorization_fingerprint,
-                )?;
                 configure_durability(&connection)?;
             }
             found => {
@@ -556,7 +550,13 @@ impl UploadStore {
                 });
             }
         }
+        // The authorization fingerprint is the one mutable part of ledger
+        // identity. Acquire SQLite's process-lifetime exclusive ownership
+        // before validating or rebinding it so a losing concurrent start can
+        // never alter the winner's route identity after validation.
         acquire_exclusive_ownership(&connection)?;
+        verify_schema(&connection, capture_root_text, &destination)?;
+        rotate_authorization_if_drained(&mut connection, &capture_root, authorization_fingerprint)?;
         recover_interrupted_jobs(&mut connection)?;
         Ok(Self {
             connection,
@@ -1462,10 +1462,9 @@ fn create_schema(
 }
 
 fn verify_schema(
-    connection: &mut Connection,
+    connection: &Connection,
     capture_root: &str,
     destination: &str,
-    authorization_fingerprint: UploadAuthorizationFingerprint,
 ) -> Result<(), UploadStoreError> {
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
@@ -1540,7 +1539,6 @@ fn verify_schema(
     if stored_destination != destination {
         return Err(UploadStoreError::DestinationMismatch);
     }
-    rotate_authorization_if_drained(connection, authorization_fingerprint)?;
     Ok(())
 }
 
@@ -1549,6 +1547,7 @@ fn verify_schema(
 /// interrupted `in_progress` work is deliberately checked before recovery.
 fn rotate_authorization_if_drained(
     connection: &mut Connection,
+    capture_root: &Path,
     authorization_fingerprint: UploadAuthorizationFingerprint,
 ) -> Result<(), UploadStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1568,7 +1567,7 @@ fn rotate_authorization_if_drained(
             [],
             |row| row.get(0),
         )?;
-        if has_live_work {
+        if has_live_work || has_unrecorded_reconcilable_artifact(&transaction, capture_root)? {
             return Err(UploadStoreError::AuthorizationIdentityMismatch);
         }
         let changed = transaction.execute(
@@ -1581,6 +1580,63 @@ fn rotate_authorization_if_drained(
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// Finds publish/record crash-gap files without hashing them. A different
+/// authorization identity may not claim those files merely because SQLite has
+/// no live row yet; the prior identity must reconcile and drain them first.
+fn has_unrecorded_reconcilable_artifact(
+    transaction: &rusqlite::Transaction<'_>,
+    capture_root: &Path,
+) -> Result<bool, UploadStoreError> {
+    let entries = fs::read_dir(capture_root).map_err(|source| UploadStoreError::Io {
+        operation: "inspect capture directory before authorization rotation",
+        path: capture_root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| UploadStoreError::Io {
+            operation: "read capture-directory entry before authorization rotation",
+            path: capture_root.to_path_buf(),
+            source,
+        })?;
+        let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_generated_frame_filename(&filename) {
+            continue;
+        }
+        let path = entry.path();
+        let artifact_path = path
+            .to_str()
+            .ok_or_else(|| UploadStoreError::ArtifactPathNotUtf8(path.clone()))?;
+        let (preactivation, recorded): (bool, bool) = transaction.query_row(
+            r#"
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM upload_preactivation_artifacts
+                    WHERE artifact_path = ?1
+                ),
+                EXISTS (
+                    SELECT 1 FROM upload_jobs WHERE artifact_path = ?1
+                )
+            "#,
+            [artifact_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if preactivation || recorded {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|source| UploadStoreError::Io {
+            operation: "inspect capture artifact before authorization rotation",
+            path: path.clone(),
+            source,
+        })?;
+        if file_type.is_file() && !file_type.is_symlink() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn recover_interrupted_jobs(connection: &mut Connection) -> Result<(), UploadStoreError> {
@@ -2124,6 +2180,130 @@ mod tests {
             )
             .unwrap();
         assert!(stored.as_slice() == rotated.as_slice());
+    }
+
+    #[test]
+    fn authorization_rotation_rejects_an_unledgered_crash_gap_until_it_is_drained() {
+        let environment = TestEnvironment::new();
+        let original = UploadAuthorizationFingerprint::for_bearer_token("original-token");
+        let rotated = UploadAuthorizationFingerprint::for_bearer_token("rotated-token");
+        drop(
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                original,
+            )
+            .unwrap(),
+        );
+
+        // Model a crash after atomic publication but before the writer could
+        // insert the durable row. SQLite looks drained, but these bytes still
+        // belong to the authorization identity active at publication time.
+        let crash_gap = environment.artifact(86, b"published before crash");
+        assert!(matches!(
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                rotated,
+            ),
+            Err(UploadStoreError::AuthorizationIdentityMismatch)
+        ));
+
+        let mut original_store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            original,
+        )
+        .unwrap();
+        let stored: Vec<u8> = original_store
+            .connection
+            .query_row(
+                "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_slice(), original.as_slice());
+        let reconciled = original_store.reconcile_capture_directory(86).unwrap();
+        assert_eq!(reconciled.inserted, 1);
+        let claim = original_store.claim_due(86).unwrap().unwrap();
+        assert_eq!(claim.artifact_path, fs::canonicalize(crash_gap).unwrap());
+        original_store.mark_completed(&claim, 87, 204).unwrap();
+        drop(original_store);
+
+        let rotated_store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            rotated,
+        )
+        .unwrap();
+        let stored: Vec<u8> = rotated_store
+            .connection
+            .query_row(
+                "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_slice(), rotated.as_slice());
+    }
+
+    #[test]
+    fn exclusive_owner_fences_a_stale_concurrent_authorization_rebind() {
+        let environment = TestEnvironment::new();
+        let original = UploadAuthorizationFingerprint::for_bearer_token("original-token");
+        drop(
+            UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                original,
+            )
+            .unwrap(),
+        );
+
+        let capture_root = canonical_capture_root(&environment.capture).unwrap();
+        let capture_root_text = capture_root.to_str().unwrap();
+        let winner = UploadAuthorizationFingerprint::for_bearer_token("winner-token");
+        let loser = UploadAuthorizationFingerprint::for_bearer_token("loser-token");
+        let mut winner_connection = Connection::open(&environment.database).unwrap();
+        winner_connection
+            .busy_timeout(Duration::from_millis(20))
+            .unwrap();
+        verify_schema(&winner_connection, capture_root_text, TEST_DESTINATION).unwrap();
+
+        acquire_exclusive_ownership(&winner_connection).unwrap();
+        rotate_authorization_if_drained(&mut winner_connection, &capture_root, winner).unwrap();
+        let mut loser_connection = Connection::open(&environment.database).unwrap();
+        loser_connection
+            .busy_timeout(Duration::from_millis(20))
+            .unwrap();
+        let error = rotate_authorization_if_drained(&mut loser_connection, &capture_root, loser)
+            .unwrap_err();
+        match error {
+            UploadStoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => assert!(
+                matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "unexpected SQLite contention code: {:?}",
+                code.code
+            ),
+            other => panic!("unexpected stale-owner error: {other:?}"),
+        }
+
+        let stored: Vec<u8> = winner_connection
+            .query_row(
+                "SELECT authorization_sha256 FROM upload_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_slice(), winner.as_slice());
     }
 
     #[test]
