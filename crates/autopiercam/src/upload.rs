@@ -11,6 +11,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use autopiercam_protocol::{
+    UploadJobState, UploadJobSummary, UploadListRequest, UploadListResponse,
+    UploadRequeueRequest as ProtocolUploadRequeueRequest,
+    UploadRequeueResult as ProtocolUploadRequeueResult,
+};
 use thiserror::Error;
 use tracing::{info, warn};
 use ureq::{
@@ -26,9 +31,9 @@ use ureq::{
 mod upload_store;
 
 use upload_store::{
-    ArtifactVerification, ClaimedUpload, RecordDisposition, SnapshottedClaimedArtifact,
-    UploadAuthorizationFingerprint, UploadStore, UploadStoreError, UploadStoreSnapshot,
-    snapshot_claimed_artifact,
+    ArtifactVerification, ClaimedUpload, RecordDisposition, RequeueUploadRequest,
+    SnapshottedClaimedArtifact, UploadAuthorizationFingerprint, UploadJobId, UploadListItem,
+    UploadState, UploadStore, UploadStoreError, UploadStoreSnapshot, snapshot_claimed_artifact,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,8 +180,208 @@ pub(crate) enum UploadEnqueueResult {
     WorkerStopped,
 }
 
+/// Stable failures exposed to the local operator protocol. Internal SQLite,
+/// filesystem, and bound endpoint details deliberately stay behind this
+/// boundary.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum UploadAdminError {
+    #[error("the upload administration service is unavailable")]
+    ServiceUnavailable,
+    #[error("the upload administration request is invalid")]
+    InvalidRequest,
+    #[error("the upload list cursor is invalid")]
+    InvalidCursor,
+    #[error("the upload list cursor is stale")]
+    StaleCursor,
+    #[error("the upload list cursor does not match this request")]
+    CursorParametersMismatch,
+    #[error("the upload ledger does not match this request")]
+    LedgerMismatch,
+    #[error("the upload job does not exist")]
+    JobNotFound,
+    #[error("the upload job is not permanently failed")]
+    WrongState,
+    #[error("the upload job changed after it was listed")]
+    StaleJobRevision,
+    #[error("the upload job belongs to a different delivery identity")]
+    DeliveryBindingMismatch,
+    #[error("the upload artifact is missing or is not a safe regular file")]
+    ArtifactUnavailable,
+    #[error("the upload artifact no longer matches its recorded identity")]
+    ArtifactChanged,
+    #[error("the upload administration service failed internally")]
+    Internal,
+}
+
 type SharedStore = Arc<Mutex<UploadStore>>;
 type PublishLock = Arc<Mutex<()>>;
+
+/// Cloneable, in-process administration facade over the already-open durable
+/// ledger. It never opens a second SQLite connection, preserving the
+/// process-lifetime exclusive-owner guarantee.
+#[derive(Clone)]
+pub(crate) struct UploadAdmin {
+    store: SharedStore,
+    publish_lock: PublishLock,
+    wake_sender: SyncSender<()>,
+    stop: Arc<AtomicBool>,
+    observer: UploadObserver,
+    clock: Arc<dyn UploadClock>,
+}
+
+impl std::fmt::Debug for UploadAdmin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UploadAdmin")
+            .field("worker_stopped", &self.stop.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl UploadAdmin {
+    pub(crate) fn list(
+        &self,
+        request: &UploadListRequest,
+    ) -> Result<UploadListResponse, UploadAdminError> {
+        request
+            .validate()
+            .map_err(|_| UploadAdminError::InvalidRequest)?;
+        let states = request
+            .states
+            .iter()
+            .copied()
+            .map(store_upload_state)
+            .collect::<Vec<_>>();
+        let page = lock_store(&self.store)
+            .map_err(|_| UploadAdminError::Internal)?
+            .list_jobs(&states, request.page_size, request.cursor.as_deref())
+            .map_err(map_store_admin_error)?;
+        let response = UploadListResponse {
+            ledger_id: page.ledger_id.as_hex(),
+            jobs: page.jobs.into_iter().map(protocol_upload_job).collect(),
+            next_cursor: page.next_cursor.map(|cursor| cursor.as_str().to_owned()),
+        };
+        response
+            .validate()
+            .map_err(|_| UploadAdminError::Internal)?;
+        Ok(response)
+    }
+
+    pub(crate) fn requeue(
+        &self,
+        request: &ProtocolUploadRequeueRequest,
+    ) -> Result<ProtocolUploadRequeueResult, UploadAdminError> {
+        request
+            .validate()
+            .map_err(|_| UploadAdminError::InvalidRequest)?;
+        let ledger_id = upload_store::UploadLedgerId::parse_hex(&request.ledger_id)
+            .map_err(map_store_admin_error)?;
+        let job_id = UploadJobId::from_u64(request.job_id).map_err(map_store_admin_error)?;
+        let now = self
+            .clock
+            .now_unix_ms()
+            .map_err(|_| UploadAdminError::Internal)?;
+        let _publication =
+            lock_publish(&self.publish_lock).map_err(|_| UploadAdminError::Internal)?;
+        let (job, telemetry) = {
+            let mut store = lock_store(&self.store).map_err(|_| UploadAdminError::Internal)?;
+            let result = store
+                .requeue_permanently_failed(
+                    RequeueUploadRequest {
+                        ledger_id,
+                        job_id,
+                        expected_job_revision: request.expected_job_revision,
+                    },
+                    now,
+                )
+                .map_err(map_store_admin_error)?;
+            let telemetry = UploadTelemetry::from(store.snapshot().map_err(map_store_admin_error)?);
+            (protocol_upload_job(result.job), telemetry)
+        };
+        notify_observer(&self.observer, telemetry).map_err(|_| UploadAdminError::Internal)?;
+
+        let worker_notified = if self.stop.load(Ordering::Acquire) {
+            false
+        } else {
+            match self.wake_sender.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => true,
+                Err(TrySendError::Disconnected(())) => {
+                    self.stop.store(true, Ordering::Release);
+                    false
+                }
+            }
+        };
+        let result = ProtocolUploadRequeueResult {
+            job,
+            worker_notified,
+        };
+        result.validate().map_err(|_| UploadAdminError::Internal)?;
+        Ok(result)
+    }
+}
+
+fn store_upload_state(state: UploadJobState) -> UploadState {
+    match state {
+        UploadJobState::Pending => UploadState::Pending,
+        UploadJobState::InProgress => UploadState::InProgress,
+        UploadJobState::Retrying => UploadState::Retrying,
+        UploadJobState::Completed => UploadState::Completed,
+        UploadJobState::PermanentlyFailed => UploadState::PermanentlyFailed,
+    }
+}
+
+fn protocol_upload_state(state: UploadState) -> UploadJobState {
+    match state {
+        UploadState::Pending => UploadJobState::Pending,
+        UploadState::InProgress => UploadJobState::InProgress,
+        UploadState::Retrying => UploadJobState::Retrying,
+        UploadState::Completed => UploadJobState::Completed,
+        UploadState::PermanentlyFailed => UploadJobState::PermanentlyFailed,
+    }
+}
+
+fn protocol_upload_job(job: UploadListItem) -> UploadJobSummary {
+    UploadJobSummary {
+        job_id: job.job_id.get(),
+        job_revision: job.job_revision,
+        filename: job.filename,
+        state: protocol_upload_state(job.state),
+        file_size_bytes: job.file_size,
+        attempt_count: job.attempt_count,
+        requeue_count: job.requeue_count,
+        created_at_unix_ms: job.created_at_unix_ms,
+        updated_at_unix_ms: job.updated_at_unix_ms,
+        next_attempt_at_unix_ms: job.next_attempt_at_unix_ms,
+        completed_at_unix_ms: job.completed_at_unix_ms,
+        last_failure_at_unix_ms: job.last_failure_at_unix_ms,
+        last_requeued_at_unix_ms: job.last_requeued_at_unix_ms,
+        last_http_status: job.last_http_status,
+        last_error: job.last_error,
+        requeue_eligible: job.state == UploadState::PermanentlyFailed
+            && job.delivery_binding_is_current,
+    }
+}
+
+fn map_store_admin_error(error: UploadStoreError) -> UploadAdminError {
+    match error {
+        UploadStoreError::InvalidListPageSize { .. } => UploadAdminError::InvalidRequest,
+        UploadStoreError::InvalidListCursor => UploadAdminError::InvalidCursor,
+        UploadStoreError::StaleListCursor => UploadAdminError::StaleCursor,
+        UploadStoreError::ListCursorParametersMismatch => {
+            UploadAdminError::CursorParametersMismatch
+        }
+        UploadStoreError::RequeueLedgerMismatch => UploadAdminError::LedgerMismatch,
+        UploadStoreError::RequeueJobNotFound => UploadAdminError::JobNotFound,
+        UploadStoreError::RequeueWrongState => UploadAdminError::WrongState,
+        UploadStoreError::RequeueStaleJobRevision => UploadAdminError::StaleJobRevision,
+        UploadStoreError::RequeueDeliveryBindingMismatch => {
+            UploadAdminError::DeliveryBindingMismatch
+        }
+        UploadStoreError::RequeueArtifactUnavailable => UploadAdminError::ArtifactUnavailable,
+        UploadStoreError::RequeueArtifactChanged => UploadAdminError::ArtifactChanged,
+        _ => UploadAdminError::Internal,
+    }
+}
 
 /// Cloneable liveness view shared with the owner of an upload sink.
 ///
@@ -204,6 +409,17 @@ pub(crate) struct UploadSink {
 }
 
 impl UploadSink {
+    pub(crate) fn admin(&self) -> UploadAdmin {
+        UploadAdmin {
+            store: Arc::clone(&self.store),
+            publish_lock: Arc::clone(&self.publish_lock),
+            wake_sender: self.wake_sender.clone(),
+            stop: Arc::clone(&self.stop),
+            observer: Arc::clone(&self.observer),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
     pub(crate) fn health(&self) -> UploadHealth {
         UploadHealth {
             stopped: Arc::clone(&self.stop),
@@ -1142,6 +1358,82 @@ mod tests {
             self.attempt.send(claim.attempt_count).unwrap();
             AttemptOutcome::retry(Some(503), None, RETRYABLE_HTTP_ERROR)
         }
+    }
+
+    struct PermanentFailureTransport;
+
+    impl UploadTransport for PermanentFailureTransport {
+        fn upload(&mut self, _claim: &ClaimedUpload) -> AttemptOutcome {
+            AttemptOutcome::Permanent {
+                status: Some(400),
+                error: PERMANENT_HTTP_ERROR,
+            }
+        }
+    }
+
+    #[test]
+    fn administration_lists_and_revision_fences_a_verified_requeue() {
+        let environment = TestEnvironment::new();
+        let manual_clock = Arc::new(ManualClock::new(40_000));
+        let (observer, telemetry) = observer_channel();
+        let (worker, sink) = UploadWorker::start_with_transport(
+            PermanentFailureTransport,
+            RetryPolicy::production(),
+            1,
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            observer,
+            manual_clock.clone(),
+        )
+        .unwrap();
+        let admin = sink.admin();
+        sink.try_enqueue(environment.artifact(12, b"operator recovery"))
+            .unwrap();
+        receive_until(&telemetry, |value| value.permanently_failed == 1);
+
+        let failed = admin
+            .list(&UploadListRequest {
+                states: vec![UploadJobState::PermanentlyFailed],
+                page_size: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(failed.jobs.len(), 1);
+        let failed_job = failed.jobs.first().unwrap();
+        assert_eq!(failed_job.state, UploadJobState::PermanentlyFailed);
+        assert!(failed_job.requeue_eligible);
+        assert_eq!(failed_job.last_http_status, Some(400));
+        assert_eq!(failed_job.last_error.as_deref(), Some(PERMANENT_HTTP_ERROR));
+
+        worker.stop_and_join().unwrap();
+        manual_clock.set(41_000);
+        let requeued = admin
+            .requeue(&ProtocolUploadRequeueRequest {
+                ledger_id: failed.ledger_id.clone(),
+                job_id: failed_job.job_id,
+                expected_job_revision: failed_job.job_revision,
+            })
+            .unwrap();
+        assert!(!requeued.worker_notified);
+        assert_eq!(requeued.job.state, UploadJobState::Pending);
+        assert_eq!(requeued.job.job_revision, failed_job.job_revision + 1);
+        assert_eq!(requeued.job.requeue_count, 1);
+        assert_eq!(requeued.job.last_requeued_at_unix_ms, Some(41_000));
+        assert_eq!(requeued.job.last_http_status, Some(400));
+        assert_eq!(
+            requeued.job.last_error.as_deref(),
+            Some(PERMANENT_HTTP_ERROR)
+        );
+
+        assert_eq!(
+            admin.requeue(&ProtocolUploadRequeueRequest {
+                ledger_id: failed.ledger_id,
+                job_id: failed_job.job_id,
+                expected_job_revision: failed_job.job_revision,
+            }),
+            Err(UploadAdminError::WrongState)
+        );
     }
 
     #[test]

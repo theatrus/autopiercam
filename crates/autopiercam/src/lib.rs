@@ -7,7 +7,10 @@ use autopiercam_core::{
     config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
-use autopiercam_protocol::{AgentState, AgentStatus, StatusCamera, StatusUpload};
+use autopiercam_protocol::{
+    AgentState, AgentStatus, CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, StatusCamera,
+    StatusUpload, UploadListRequest, UploadListResponse, UploadRequeueRequest, UploadRequeueResult,
+};
 use image::{
     ColorType, ImageEncoder,
     codecs::{jpeg::JpegEncoder, png::PngEncoder},
@@ -30,9 +33,10 @@ mod upload;
 
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
+pub use upload::UploadAdminError;
 use upload::{
-    BearerAuthorization, UploadEnqueueResult, UploadHealth, UploadObserver, UploadOptions,
-    UploadSink, UploadTelemetry, UploadWorker, bearer_authorization,
+    BearerAuthorization, UploadAdmin, UploadEnqueueResult, UploadHealth, UploadObserver,
+    UploadOptions, UploadSink, UploadTelemetry, UploadWorker, bearer_authorization,
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -113,6 +117,35 @@ impl AgentControl {
 pub struct AgentMonitor {
     inner: Arc<RwLock<AgentStatus>>,
     capturing_generation: Arc<AtomicU64>,
+    upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
+    upload_admin_generation: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredUploadAdmin {
+    generation: u64,
+    admin: UploadAdmin,
+}
+
+#[derive(Debug)]
+struct UploadAdminRegistration {
+    registry: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
+    generation: u64,
+}
+
+impl Drop for UploadAdminRegistration {
+    fn drop(&mut self) {
+        let mut registration = match self.registry.write() {
+            Ok(registration) => registration,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if registration
+            .as_ref()
+            .is_some_and(|current| current.generation == self.generation)
+        {
+            *registration = None;
+        }
+    }
 }
 
 impl Default for AgentMonitor {
@@ -123,9 +156,16 @@ impl Default for AgentMonitor {
 
 impl AgentMonitor {
     pub fn new() -> Self {
+        let mut status = AgentStatus::new(AgentState::Starting);
+        status.capabilities = vec![
+            CAPABILITY_UPLOADS_LIST.to_owned(),
+            CAPABILITY_UPLOADS_REQUEUE.to_owned(),
+        ];
         Self {
-            inner: Arc::new(RwLock::new(AgentStatus::new(AgentState::Starting))),
+            inner: Arc::new(RwLock::new(status)),
             capturing_generation: Arc::new(AtomicU64::new(0)),
+            upload_admin: Arc::new(RwLock::new(None)),
+            upload_admin_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -152,6 +192,52 @@ impl AgentMonitor {
     /// is not missed between status polls.
     pub fn capturing_generation(&self) -> u64 {
         self.capturing_generation.load(Ordering::Acquire)
+    }
+
+    /// List one revision-stable page from the currently owned durable upload
+    /// ledger. The operation is unavailable while upload is disabled or the
+    /// supervised camera/upload attempt is restarting.
+    pub fn list_uploads(
+        &self,
+        request: &UploadListRequest,
+    ) -> Result<UploadListResponse, UploadAdminError> {
+        self.current_upload_admin()?.list(request)
+    }
+
+    /// Requeue one revision-fenced terminal failure after verifying its exact
+    /// recorded artifact and current delivery binding.
+    pub fn requeue_upload(
+        &self,
+        request: &UploadRequeueRequest,
+    ) -> Result<UploadRequeueResult, UploadAdminError> {
+        self.current_upload_admin()?.requeue(request)
+    }
+
+    fn current_upload_admin(&self) -> Result<UploadAdmin, UploadAdminError> {
+        let registration = match self.upload_admin.read() {
+            Ok(registration) => registration,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registration
+            .as_ref()
+            .map(|registration| registration.admin.clone())
+            .ok_or(UploadAdminError::ServiceUnavailable)
+    }
+
+    fn register_upload_admin(&self, admin: UploadAdmin) -> UploadAdminRegistration {
+        let generation = self
+            .upload_admin_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let mut registration = match self.upload_admin.write() {
+            Ok(registration) => registration,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *registration = Some(RegisteredUploadAdmin { generation, admin });
+        UploadAdminRegistration {
+            registry: Arc::clone(&self.upload_admin),
+            generation,
+        }
     }
 
     fn write(&self) -> RwLockWriteGuard<'_, AgentStatus> {
@@ -475,6 +561,9 @@ fn run_agent_inner(
         Some((worker, sink)) => (Some(worker), Some(sink)),
         None => (None, None),
     };
+    let upload_admin_registration = upload_sink
+        .as_ref()
+        .map(|sink| monitor.register_upload_admin(sink.admin()));
     let info = select_configured_camera(sdk, &config.camera)?;
     monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
@@ -545,6 +634,7 @@ fn run_agent_inner(
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("still-writer thread panicked"));
+    drop(upload_admin_registration);
     let upload_result = upload_worker
         .map(UploadWorker::stop_and_join)
         .unwrap_or(Ok(()));
@@ -1313,6 +1403,13 @@ mod tests {
         assert_eq!(status.frames_captured, 1);
         assert_eq!(status.frames_saved, 1);
         assert_eq!(status.last_artifact.as_deref(), Some("captures/test.jpg"));
+        assert_eq!(
+            status.capabilities,
+            [
+                CAPABILITY_UPLOADS_LIST.to_owned(),
+                CAPABILITY_UPLOADS_REQUEUE.to_owned()
+            ]
+        );
         let upload = status.upload.expect("upload telemetry");
         assert_eq!(upload.pending, 2);
         assert_eq!(upload.active, 1);
@@ -1354,6 +1451,45 @@ mod tests {
         assert_eq!(monitor.capturing_generation(), 1);
         monitor.frame_captured(false);
         assert_eq!(monitor.capturing_generation(), 2);
+    }
+
+    #[test]
+    fn stale_upload_registration_cannot_clear_its_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("captures");
+        std::fs::create_dir(&capture).unwrap();
+        let database = root.path().join("upload.sqlite3");
+        let monitor = AgentMonitor::new();
+        let observer: UploadObserver = Arc::new(|_| {});
+        let (worker, sink) = UploadWorker::start(
+            UploadOptions::new(
+                ureq::http::Uri::from_static("http://127.0.0.1:9/upload"),
+                None,
+                1,
+            ),
+            &database,
+            &capture,
+            observer,
+        )
+        .unwrap();
+
+        let first = monitor.register_upload_admin(sink.admin());
+        let replacement = monitor.register_upload_admin(sink.admin());
+        drop(first);
+        assert_eq!(
+            monitor
+                .list_uploads(&UploadListRequest::default())
+                .unwrap()
+                .jobs,
+            []
+        );
+
+        drop(replacement);
+        assert_eq!(
+            monitor.list_uploads(&UploadListRequest::default()),
+            Err(UploadAdminError::ServiceUnavailable)
+        );
+        worker.stop_and_join().unwrap();
     }
 
     #[test]

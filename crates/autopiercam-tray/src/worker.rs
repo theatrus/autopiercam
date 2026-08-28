@@ -41,7 +41,7 @@ pub(crate) enum TrayCommand {
 
 #[derive(Debug)]
 pub(crate) enum WorkerEvent {
-    StatusChanged(AgentStatus),
+    StatusChanged(Box<AgentStatus>),
     WorkerStopped,
 }
 
@@ -466,7 +466,7 @@ fn publish_snapshot_if_changed<F>(
     if last_status.as_ref() == Some(&status) {
         return;
     }
-    emit(WorkerEvent::StatusChanged(status.clone()));
+    emit(WorkerEvent::StatusChanged(Box::new(status.clone())));
     *last_status = Some(status);
 }
 

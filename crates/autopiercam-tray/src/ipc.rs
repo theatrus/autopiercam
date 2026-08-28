@@ -10,14 +10,15 @@ use std::{
     time::Duration,
 };
 
-use autopiercam::AgentMonitor;
+use autopiercam::{AgentMonitor, UploadAdminError};
 use autopiercam_core::{
     ConfigStore, ConfigStoreError,
     config::{Config, ConfigError},
 };
 use autopiercam_protocol::{
     Complete, ConfigReplace, ConfigSaved, ConfigSnapshot as ProtocolConfigSnapshot, ErrorBody,
-    MAX_FRAME_SIZE, Method, PIPE_NAME, Request, Response, RevisionConflictDetails, ValidationError,
+    MAX_FRAME_SIZE, Method, PIPE_NAME, Request, Response, RevisionConflictDetails,
+    UploadListRequest, UploadRequeueRequest, ValidationError,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -279,6 +280,8 @@ fn dispatch(
         Method::ConfigReplace => {
             config_replace_response(request_id, request.payload, commands, config_store)
         }
+        Method::UploadsList => upload_list_response(request_id, request.payload, monitor),
+        Method::UploadsRequeue => upload_requeue_response(request_id, request.payload, monitor),
         Method::CamerasList | Method::ArtifactsList => Response::failure(
             request_id,
             ErrorBody::new(
@@ -290,6 +293,83 @@ fn dispatch(
             ),
         ),
     }
+}
+
+fn upload_list_response(
+    request_id: String,
+    payload: serde_json::Value,
+    monitor: &AgentMonitor,
+) -> Response {
+    let request = match serde_json::from_value::<UploadListRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return Response::failure(
+                request_id,
+                ErrorBody::new(
+                    "invalid_upload_request",
+                    format!("uploads.list payload is invalid: {error}"),
+                ),
+            );
+        }
+    };
+    if let Err(error) = request.validate() {
+        return Response::failure(
+            request_id,
+            ErrorBody::new("invalid_upload_request", error.to_string()),
+        );
+    }
+    match monitor.list_uploads(&request) {
+        Ok(page) => serialize_success(request_id, page, "upload list"),
+        Err(error) => Response::failure(request_id, upload_admin_error(error)),
+    }
+}
+
+fn upload_requeue_response(
+    request_id: String,
+    payload: serde_json::Value,
+    monitor: &AgentMonitor,
+) -> Response {
+    let request = match serde_json::from_value::<UploadRequeueRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return Response::failure(
+                request_id,
+                ErrorBody::new(
+                    "invalid_upload_request",
+                    format!("uploads.requeue payload is invalid: {error}"),
+                ),
+            );
+        }
+    };
+    if let Err(error) = request.validate() {
+        return Response::failure(
+            request_id,
+            ErrorBody::new("invalid_upload_request", error.to_string()),
+        );
+    }
+    match monitor.requeue_upload(&request) {
+        Ok(result) => serialize_success(request_id, result, "upload requeue result"),
+        Err(error) => Response::failure(request_id, upload_admin_error(error)),
+    }
+}
+
+fn upload_admin_error(error: UploadAdminError) -> ErrorBody {
+    let code = match error {
+        UploadAdminError::ServiceUnavailable => "upload_service_unavailable",
+        UploadAdminError::InvalidRequest => "invalid_upload_request",
+        UploadAdminError::InvalidCursor => "invalid_upload_cursor",
+        UploadAdminError::StaleCursor => "stale_upload_cursor",
+        UploadAdminError::CursorParametersMismatch => "upload_cursor_mismatch",
+        UploadAdminError::LedgerMismatch => "upload_ledger_conflict",
+        UploadAdminError::JobNotFound => "upload_job_not_found",
+        UploadAdminError::WrongState => "upload_state_conflict",
+        UploadAdminError::StaleJobRevision => "upload_revision_conflict",
+        UploadAdminError::DeliveryBindingMismatch => "upload_delivery_conflict",
+        UploadAdminError::ArtifactUnavailable => "upload_artifact_unavailable",
+        UploadAdminError::ArtifactChanged => "upload_artifact_changed",
+        UploadAdminError::Internal => "internal_error",
+    };
+    ErrorBody::new(code, error.to_string())
 }
 
 fn command_response(
@@ -686,7 +766,9 @@ fn wide_pointer_to_string(pointer: PWSTR) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopiercam_protocol::{AgentState, PROTOCOL_VERSION};
+    use autopiercam_protocol::{
+        AgentState, CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, PROTOCOL_VERSION,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -765,6 +847,12 @@ mod tests {
         assert_eq!(
             response.result.expect("status result")["state"],
             serde_json::json!(AgentState::Starting)
+        );
+
+        let status = monitor.snapshot();
+        assert_eq!(
+            status.capabilities,
+            [CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE]
         );
 
         let response = dispatch(
@@ -970,5 +1058,54 @@ mod tests {
         );
         assert!(response.result.is_none());
         assert_eq!(response.error.expect("error").code, "not_implemented");
+    }
+
+    #[test]
+    fn upload_administration_validates_payloads_and_reports_unavailable_service() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let commands = TestCommands::default();
+        let monitor = AgentMonitor::new();
+
+        let unavailable = dispatch(
+            Request::new("uploads-list-1", Method::UploadsList),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert!(unavailable.result.is_none());
+        assert_eq!(
+            unavailable.error.expect("unavailable error").code,
+            "upload_service_unavailable"
+        );
+
+        let invalid_list = dispatch(
+            Request::new("uploads-list-invalid", Method::UploadsList)
+                .with_payload(serde_json::json!({ "page_size": 0 })),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert_eq!(
+            invalid_list.error.expect("invalid list error").code,
+            "invalid_upload_request"
+        );
+
+        let invalid_requeue = dispatch(
+            Request::new("uploads-requeue-invalid", Method::UploadsRequeue).with_payload(
+                serde_json::json!({
+                    "ledger_id": "ledger",
+                    "job_id": 0,
+                    "expected_job_revision": 1
+                }),
+            ),
+            &commands,
+            &monitor,
+            &store,
+        );
+        assert_eq!(
+            invalid_requeue.error.expect("invalid requeue error").code,
+            "invalid_upload_request"
+        );
     }
 }
