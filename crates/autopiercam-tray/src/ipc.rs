@@ -24,6 +24,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
     runtime::Builder,
+    task::{self, JoinSet},
     time::timeout,
 };
 use tracing::{info, warn};
@@ -49,6 +50,26 @@ const CONTROL_PIPE_PATH: &str = r"\\.\pipe\autopiercam-control-v1";
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IN_FLIGHT_CONNECTIONS: usize = 8;
+
+#[derive(Clone)]
+struct DispatchContext {
+    worker: WorkerClient,
+    monitor: AgentMonitor,
+    config_store: ConfigStore,
+}
+
+impl DispatchContext {
+    fn dispatch(&self, request: Request) -> Response {
+        dispatch(request, &self.worker, &self.monitor, &self.config_store)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionOutcome {
+    Served,
+    ShutdownAccepted,
+}
 
 pub(crate) struct ControlServer {
     stop: Arc<AtomicBool>,
@@ -91,8 +112,12 @@ impl ControlServer {
                         return;
                     }
                     info!(pipe = CONTROL_PIPE_PATH, "local control pipe is ready");
-                    if let Err(error) =
-                        serve(server, &worker, &monitor, &config_store, &server_stop).await
+                    let context = DispatchContext {
+                        worker,
+                        monitor,
+                        config_store,
+                    };
+                    if let Err(error) = serve(server, context, server_stop).await
                         && error.kind() != io::ErrorKind::Interrupted
                     {
                         warn!(%error, "local control pipe stopped with an error");
@@ -139,61 +164,112 @@ impl Drop for ControlServer {
 
 async fn serve(
     mut server: NamedPipeServer,
-    worker: &WorkerClient,
-    monitor: &AgentMonitor,
-    config_store: &ConfigStore,
-    stop: &AtomicBool,
+    context: DispatchContext,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    loop {
-        wait_for_connection(&server, stop).await?;
-        let mut connected_client = server;
-        // Always publish the next instance before servicing this client. A
-        // client can connect to it before ConnectNamedPipe is awaited, which
-        // avoids a stale/broken connection between one-shot Viewer requests.
-        server = create_control_pipe(false)?;
-        let connection_result =
-            serve_connection(&mut connected_client, worker, monitor, config_store, stop).await;
-        drop(connected_client);
-
-        match connection_result {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            // Client-local failures must not take down the well-known listener.
-            // Windows maps disconnects to several codes (109, 232, and 233)
-            // depending on whether a read was pending.
-            Err(error) => {
-                warn!(%error, "local control client disconnected or sent an invalid frame");
+    let mut clients = JoinSet::new();
+    let accept_result = async {
+        loop {
+            reap_finished_connections(&mut clients);
+            if should_stop(&stop) {
+                return Ok(());
             }
-        }
 
+            while clients.len() >= MAX_IN_FLIGHT_CONNECTIONS {
+                wait_for_connection_capacity(&mut clients, &stop).await;
+                if should_stop(&stop) {
+                    return Ok(());
+                }
+            }
+
+            if !wait_for_connection(&server, &stop, &mut clients).await? {
+                return Ok(());
+            }
+
+            let mut connected_client = server;
+            // Always publish the next instance before servicing this client. A
+            // client can connect to it before ConnectNamedPipe is awaited, which
+            // avoids a stale/broken connection between one-shot Viewer requests.
+            server = create_control_pipe(false)?;
+            let client_context = context.clone();
+            let client_stop = Arc::clone(&stop);
+            clients.spawn(async move {
+                serve_connection(&mut connected_client, client_context, client_stop).await
+            });
+        }
+    }
+    .await;
+
+    // An acceptance failure is terminal, so interrupt clients that are still
+    // reading. Requests already in blocking dispatch are allowed to finish.
+    if accept_result.is_err() {
+        stop.store(true, Ordering::Release);
+    }
+    while let Some(completion) = clients.join_next().await {
+        report_connection_completion(completion);
+    }
+    accept_result
+}
+
+async fn wait_for_connection(
+    server: &NamedPipeServer,
+    stop: &AtomicBool,
+    clients: &mut JoinSet<io::Result<ConnectionOutcome>>,
+) -> io::Result<bool> {
+    let mut connect = Box::pin(server.connect());
+    loop {
+        reap_finished_connections(clients);
         if should_stop(stop) {
-            return Ok(());
+            return Ok(false);
+        }
+        if let Ok(result) = timeout(IO_POLL_INTERVAL, connect.as_mut()).await {
+            result?;
+            return Ok(true);
         }
     }
 }
 
-async fn wait_for_connection(server: &NamedPipeServer, stop: &AtomicBool) -> io::Result<()> {
-    let mut connect = Box::pin(server.connect());
-    loop {
-        if should_stop(stop) {
-            return Err(stopping_error());
+async fn wait_for_connection_capacity(
+    clients: &mut JoinSet<io::Result<ConnectionOutcome>>,
+    stop: &AtomicBool,
+) {
+    if should_stop(stop) {
+        return;
+    }
+    if let Ok(Some(completion)) = timeout(IO_POLL_INTERVAL, clients.join_next()).await {
+        report_connection_completion(completion);
+    }
+}
+
+fn reap_finished_connections(clients: &mut JoinSet<io::Result<ConnectionOutcome>>) {
+    while let Some(completion) = clients.try_join_next() {
+        report_connection_completion(completion);
+    }
+}
+
+fn report_connection_completion(
+    completion: Result<io::Result<ConnectionOutcome>, tokio::task::JoinError>,
+) {
+    match completion {
+        Ok(Ok(ConnectionOutcome::Served | ConnectionOutcome::ShutdownAccepted)) => {}
+        // Client-local failures must not take down the well-known listener.
+        // Windows maps disconnects to several codes (109, 232, and 233)
+        // depending on whether a read was pending.
+        Ok(Err(error)) => {
+            warn!(%error, "local control client disconnected or sent an invalid frame");
         }
-        if let Ok(result) = timeout(IO_POLL_INTERVAL, connect.as_mut()).await {
-            return result;
-        }
+        Err(error) => warn!(%error, "local control client task failed"),
     }
 }
 
 async fn serve_connection(
     server: &mut NamedPipeServer,
-    worker: &WorkerClient,
-    monitor: &AgentMonitor,
-    config_store: &ConfigStore,
-    stop: &AtomicBool,
-) -> io::Result<()> {
+    context: DispatchContext,
+    stop: Arc<AtomicBool>,
+) -> io::Result<ConnectionOutcome> {
     // Protocol v1 deliberately serves one request per connection. This keeps
     // an idle client from monopolizing the listener used by status and Quit.
-    let Some(request) = timeout(CLIENT_REQUEST_TIMEOUT, read_request(server, stop))
+    let Some(request) = timeout(CLIENT_REQUEST_TIMEOUT, read_request(server, &stop))
         .await
         .map_err(|_| {
             io::Error::new(
@@ -202,16 +278,38 @@ async fn serve_connection(
             )
         })??
     else {
-        return Ok(());
+        return Ok(ConnectionOutcome::Served);
     };
     let is_shutdown = request.method == Method::AgentShutdown;
-    let response = dispatch(request, worker, monitor, config_store);
+    let response = run_blocking_dispatch(request, move |request| context.dispatch(request)).await?;
     let shutdown_accepted = is_shutdown && response.error.is_none();
-    write_response(server, &response).await?;
+    send_response_and_finish(server, &response, shutdown_accepted, &stop).await
+}
+
+async fn run_blocking_dispatch<F>(request: Request, dispatch: F) -> io::Result<Response>
+where
+    F: FnOnce(Request) -> Response + Send + 'static,
+{
+    task::spawn_blocking(move || dispatch(request))
+        .await
+        .map_err(|error| io::Error::other(format!("control request dispatch failed: {error}")))
+}
+
+async fn send_response_and_finish(
+    server: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: &Response,
+    shutdown_accepted: bool,
+    stop: &AtomicBool,
+) -> io::Result<ConnectionOutcome> {
+    write_response(server, response).await?;
     if shutdown_accepted {
-        return Err(stopping_error());
+        // Publish shutdown only after the response is flushed so AgentShutdown
+        // never tears down its own connection before acknowledging the caller.
+        stop.store(true, Ordering::Release);
+        Ok(ConnectionOutcome::ShutdownAccepted)
+    } else {
+        Ok(ConnectionOutcome::Served)
     }
-    Ok(())
 }
 
 trait CommandSink {
@@ -559,7 +657,10 @@ async fn read_some(
     }
 }
 
-async fn write_response(server: &mut NamedPipeServer, response: &Response) -> io::Result<()> {
+async fn write_response(
+    server: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: &Response,
+) -> io::Result<()> {
     response
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -597,7 +698,7 @@ fn create_control_pipe(first_instance: bool) -> io::Result<NamedPipeServer> {
         PipeAccess::Duplex,
         MAX_FRAME_SIZE as u32,
         MAX_FRAME_SIZE as u32,
-        None,
+        Some(MAX_IN_FLIGHT_CONNECTIONS + 1),
     )
 }
 
@@ -827,6 +928,104 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn slow_blocking_dispatch_does_not_stall_another_client_task() {
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            let slow_started = Arc::new(AtomicBool::new(false));
+            let release_slow = Arc::new(AtomicBool::new(false));
+            let mut clients = JoinSet::new();
+
+            let slow_started_in_task = Arc::clone(&slow_started);
+            let release_slow_in_task = Arc::clone(&release_slow);
+            clients.spawn(run_blocking_dispatch(
+                Request::new("slow", Method::UploadsRequeue),
+                move |request| {
+                    slow_started_in_task.store(true, Ordering::Release);
+                    while !release_slow_in_task.load(Ordering::Acquire) {
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Response::success(request.request_id, serde_json::json!({ "done": true }))
+                },
+            ));
+
+            let started = timeout(Duration::from_secs(1), async {
+                while !slow_started.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            if started.is_err() {
+                release_slow.store(true, Ordering::Release);
+                let _ = clients.join_next().await;
+                panic!("slow dispatch did not start");
+            }
+
+            clients.spawn(run_blocking_dispatch(
+                Request::new("fast", Method::StatusGet),
+                |request| {
+                    Response::success(request.request_id, serde_json::json!({ "ready": true }))
+                },
+            ));
+            let fast_completion = timeout(Duration::from_secs(1), clients.join_next()).await;
+
+            // Release the slow task before asserting so a failure cannot leave
+            // a blocking-pool thread stranded during runtime shutdown.
+            release_slow.store(true, Ordering::Release);
+            let slow_completion = timeout(Duration::from_secs(1), clients.join_next()).await;
+
+            let fast_response = fast_completion
+                .expect("fast dispatch should stay responsive")
+                .expect("fast task should be present")
+                .expect("fast task should not panic")
+                .expect("fast dispatch should succeed");
+            assert_eq!(fast_response.request_id, "fast");
+
+            let slow_response = slow_completion
+                .expect("slow dispatch should finish after release")
+                .expect("slow task should be present")
+                .expect("slow task should not panic")
+                .expect("slow dispatch should succeed");
+            assert_eq!(slow_response.request_id, "slow");
+        });
+    }
+
+    #[test]
+    fn shutdown_stops_acceptance_only_after_its_response_is_written() {
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = Response::success("shutdown-1", serde_json::json!({ "accepted": true }));
+            let stop = AtomicBool::new(false);
+            let mut frame = Vec::new();
+
+            let outcome = send_response_and_finish(&mut frame, &response, true, &stop)
+                .await
+                .expect("shutdown response should be written");
+
+            assert_eq!(outcome, ConnectionOutcome::ShutdownAccepted);
+            assert!(stop.load(Ordering::Acquire));
+            let frame_length = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+            assert_eq!(frame_length, frame.len() - 4);
+            let decoded: Response = serde_json::from_slice(&frame[4..]).unwrap();
+            assert_eq!(decoded.request_id, "shutdown-1");
+            assert!(decoded.error.is_none());
+
+            let failed_stop = AtomicBool::new(false);
+            let (mut broken_writer, reader) = tokio::io::duplex(64);
+            drop(reader);
+            assert!(
+                send_response_and_finish(&mut broken_writer, &response, true, &failed_stop)
+                    .await
+                    .is_err()
+            );
+            assert!(!failed_stop.load(Ordering::Acquire));
+        });
     }
 
     #[test]
