@@ -172,10 +172,12 @@ Rows transition through `pending`, `in_progress`, `retrying`, `completed`, and
 `permanently_failed`. Retry deadlines, attempt counts, acknowledgements, and
 failure details persist. Startup returns abandoned `in_progress` claims to
 `pending`; completed and terminal rows remain as history. Before HTTP, the
-worker opens and verifies the exact recorded file size and SHA-256. Missing or
-changed artifacts become permanent failures so different bytes cannot reuse an
-existing identity. A direct path conflict is accepted as already recorded only
-when its complete stored identity matches.
+worker copies the source into a private anonymous snapshot with a bounded
+buffer, then verifies the copied size and SHA-256 before HTTP begins. Only the
+verified snapshot is streamed, so later source mutation cannot change bytes
+under an existing identity. Missing or changed artifacts become permanent
+failures. A direct path conflict is accepted as already recorded only when its
+complete stored identity matches.
 
 The dedicated thread streams the verified file with `PUT` to the validated
 endpoint after standard URL normalization, explicit JPEG content type and

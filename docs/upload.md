@@ -97,12 +97,13 @@ later claim. Attempt results are committed before the worker reacts to a
 shutdown request. A worker failure faults the capture attempt so the supervisor
 can restart it; the durable rows remain available to the next worker.
 
-Before every request, the uploader opens the exact file it will stream and
-verifies that its size and SHA-256 still match the recorded identity. Missing,
-replaced, symlinked, or non-regular artifacts become permanent failures rather
-than sending different bytes under an existing idempotency key. On Windows,
-the verified read handle also denies later write and delete opens for the life
-of the request.
+Before every request, the uploader copies the source through a bounded 64 KiB
+buffer into a private anonymous temporary file. It verifies the copied size and
+SHA-256 against the recorded identity before HTTP can begin, closes the source,
+and streams only that verified snapshot. Missing, replaced, symlinked,
+non-regular, or identity-mismatched artifacts become permanent failures rather
+than sending different bytes under an existing idempotency key. Later source
+mutation or replacement cannot change the bytes in flight on Windows or Unix.
 
 The uploader never deletes a local JPEG. It also never removes completed or
 permanently failed rows. The configured `capture.retention_days` and
