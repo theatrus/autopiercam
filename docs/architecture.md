@@ -22,8 +22,8 @@ The intended process and data flow is:
       preview     stills     video sampler
          |          |          |
          +------ durable spool-+
-                         |
-                 durable upload queue
+                    |           |
+             safe retention   durable upload queue
 
 Only the camera thread calls ASICamera2. The UI never loads the vendor DLL or
 opens a camera.
@@ -84,10 +84,14 @@ enablement. It preserves all hidden configuration fields when it writes a
 complete replacement. The preview UI reports connecting, waiting, live,
 reconnecting, stale, and malformed-frame conditions. A separate upload card
 shows durable pending, active, retrying, completed, and permanently failed
-counts plus the most recent success and failure details. Planned additions
-include:
+counts plus the most recent success and failure details. Its capability-gated
+outbox dialog pages through durable jobs and can submit a confirmed, revision-
+fenced requeue for an eligible permanent failure. A storage card shows managed,
+protected, and reclaimable bytes, volume free space, pressure, the latest sweep,
+and scheduled-capture suspension. The two optional byte limits are editable only
+when the connected agent advertises retention support. Planned additions include:
 
-- temperature and disk status;
+- camera temperature;
 - camera and output settings with capability-aware ranges;
 - segmented-video settings;
 - recent artifacts and recoverable errors.
@@ -115,6 +119,9 @@ continuously. Consumers have independent policies:
 - Upload: SQLite owns a durable outbox of finalized artifacts. A bounded
   nonblocking channel carries coalesced wake hints only; one dedicated thread
   claims due rows and performs HTTP.
+- Retention: a one-slot wake queue coalesces notifications after durable still
+  finalization; a dedicated worker inventories and safely reclaims authorized
+  files without blocking camera draining.
 
 No filesystem, HTTP, database, UI, or encoder operation runs on the camera
 thread.
@@ -190,10 +197,14 @@ five and fifteen seconds.
 Transport failures, HTTP 408/425/429, and 5xx responses retry with bounded
 deterministic jitter; numeric `Retry-After` seconds act as a capped lower bound.
 Other non-2xx responses are permanent. Neither completion nor failure removes
-the local artifact. During shutdown, the active bounded request finishes and
-its outcome is committed, an unsubmitted claim is released, retry waits are
-interrupted, and all other intents remain durable. The full contract and
-operator caveats are in `docs/upload.md`.
+the local artifact. The capability-gated operator API provides bounded,
+revision-stable, newest-first list pages without exposing paths. It permits only
+an exact `permanently_failed` row to be requeued after ledger, revision,
+delivery-binding, size, and SHA-256 verification; completed rows and immutable
+identity fields cannot be changed. During shutdown, the active bounded request
+finishes and its outcome is committed, an unsubmitted claim is released, retry
+waits are interrupted, and all other intents remain durable. The full contract
+and operator caveats are in `docs/upload.md`.
 
 Planned security video starts with an FFmpeg child process receiving sampled
 raw or RGB frames. It writes short H.264 Matroska segments because each
@@ -201,10 +212,30 @@ completed segment is independently usable after a crash. A segment is finalized
 and validated before it is renamed and queued. Optional MP4 remuxing happens
 after close.
 
-Retention remains a later milestone. The current uploader never deletes a local
-artifact or ledger row, and the configured age/keep-latest fields are not yet
-enforced. Planned retention will account for both age and disk quota and must
-never delete unacknowledged data silently.
+Retention starts with a synchronous sweep before the camera is opened, then runs
+every 60 seconds and after each writer result has been published and durably
+recorded for upload. It inventories only regular direct-child JPEGs with the
+exact generated capture grammar. Age-expired reclaimable files are selected
+first; the oldest remaining reclaimable files are then selected until the
+optional maximum-managed-byte and minimum-free-byte targets are both met.
+`keep_latest` protects the newest managed capture.
+
+Without an upload ledger, matching local captures are reclaimable. With an
+active ledger, only completed rows and preactivation history are candidates;
+pending, in-progress, retrying, permanently failed, unknown, and crash-gap
+artifacts are protected. Classification is followed by a synchronized final row
+and identity recheck. The Windows deleter holds an opened, non-reparse-point,
+write-denied file handle while it verifies size and, for completed rows,
+SHA-256, then assigns delete disposition to that exact handle. If upload is
+disabled while any prior ledger artifact exists, all managed captures remain
+protected because retention cannot prove acknowledgement state.
+
+Each sweep publishes managed/protected/reclaimable bytes, free space, reclaimed
+counts, pressure, and an optional error through `status.get`. If protected data
+or an unavailable safety check leaves a configured byte target unsatisfied,
+pressure becomes blocked and scheduled still persistence pauses. Preview and
+camera draining continue, and Capture now remains an explicit override. The
+complete policy and safety contract are in `docs/retention.md`.
 
 ## Local IPC and security
 
@@ -213,7 +244,12 @@ remote clients rejected. Unix builds can use a Unix-domain socket behind the
 same protocol.
 
 Control messages are length-prefixed UTF-8 JSON envelopes containing protocol
-version, request id, method, and payload. Preview data uses the separate
+version, request id, method, and payload. The control server publishes a
+replacement listening pipe before dispatching each one-request connection,
+serves at most eight connections concurrently, and moves blocking dispatch off
+the accept loop. Consequently, a slow outbox artifact verification does not
+serialize unrelated status, configuration, or shutdown requests. Five-second
+read and write bounds evict stalled clients. Preview data uses the separate
 outbound-only `autopiercam-preview-v1` pipe with the same current-user DACL,
 remote-client rejection, and first-instance ownership. Each latest-only record
 contains a bounded JSON metadata length and body (4 KiB maximum), followed by a
@@ -235,23 +271,33 @@ Windows builds will use Credential Manager or DPAPI.
 
 Ordered shutdown:
 
-1. Stop accepting work and set cancellation.
-2. Stop and close the camera on its owner thread.
-3. Drain and close the still writer.
-4. Finish and commit the active bounded HTTP result, release any claim not yet
-   submitted, and leave pending/retrying rows in SQLite.
-5. Close local IPC, remove the tray icon, and exit its event loop.
+1. Reject new tray capture actions, publish stopping state, and signal the
+   camera owner.
+2. Stop and close the camera, then close the still queue on its owner thread.
+3. Drain the still writer so every accepted JPEG is atomically published,
+   durably recorded when upload is enabled, and followed by a retention wake.
+4. Complete the queued final retention sweep and stop retention while its shared
+   ledger authority is still valid.
+5. Revoke upload-administration sessions and wait for already accepted list or
+   requeue operations to leave the shared ledger.
+6. Finish and commit the active bounded HTTP result, release any claim not yet
+   submitted, interrupt retry waits, and leave all remaining intents durable.
+7. Join the preview encoder and capture supervisor. The tray then stops the
+   preview and control pipes, removes the notification icon, and exits its event
+   loop.
 
 Future durable video work will also finalize the current video segment before
 exit.
 
-The implemented startup path validates configuration, begins camera connection,
-and automatically retries startup or runtime faults. When upload is enabled it
-opens and validates the bound ledger, recovers abandoned claims, reconciles the
-capture directory against the activation watermark, and resumes due attempts.
-Future startup work will quarantine incomplete stills and validate recoverable
-video segments. An at-logon Scheduled Task with restart-on-failure is
-appropriate for an unattended pier machine.
+The implemented startup path validates configuration and automatically retries
+startup or runtime faults. When upload is enabled it opens and validates the
+bound ledger, recovers abandoned claims, reconciles the capture directory
+against the activation watermark, and resumes due attempts. It then completes
+an initial retention sweep before opening the camera. When uploads are disabled
+but a prior ledger or sidecar is present, that sweep protects all managed files
+rather than guessing their delivery state. Future startup work will quarantine
+incomplete stills and validate recoverable video segments. An at-logon Scheduled
+Task with restart-on-failure is appropriate for an unattended pier machine.
 
 ## Delivery sequence
 
@@ -261,13 +307,15 @@ appropriate for an unattended pier machine.
 4. WinUI preview and configuration.
 5. Deterministic day/night controller and RAW16 characterization.
 6. Atomic still spool and durable HTTP upload queue.
-7. FFmpeg segmented recording, recovery, retention, and packaging.
+7. FFmpeg segmented recording, recovery, and packaging.
 
 The repository has completed item 1 and the reusable-buffer, bounded-writer,
 auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
 real tray host, secured one-request protocol-v1 control, atomic revisioned
 configuration persistence, and restart application. Item 4 now has a live
 WinUI preview, status, capture-now, and configuration client; artifact browsing
-remains. Item 6 has atomic still publication and a durable SQLite HTTP outbox
-with restart recovery, acknowledgements, retry state, terminal failure state,
-and Viewer telemetry. Automated retention remains.
+remains. Item 6 has atomic still publication, a durable SQLite HTTP outbox with
+restart recovery and revision-fenced operator list/requeue, and safe automated
+retention with age/byte policies, upload-ledger protection, pressure telemetry,
+and scheduled-capture suspension. Security video remains the next major storage
+sink.

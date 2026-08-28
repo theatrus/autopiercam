@@ -23,11 +23,16 @@ The repository now contains a hardware-validated background capture slice:
 - a separate secured, outbound-only preview pipe backed by a bounded latest-frame
   producer;
 - a durable SQLite HTTP outbox that records atomically published JPEGs, resumes
-  retries after restart, and never delays capture for network work;
+  retries after restart, and supports bounded operator inspection and safe,
+  revision-fenced requeue without delaying capture for network work;
+- a Windows-safe retention worker with age, managed-byte, and minimum-free-space
+  policies, upload-ledger protection, and scheduled-capture suspension when
+  protected data makes a byte target impossible;
 - atomic, content-revisioned configuration replacement through that pipe;
 - a buildable unpackaged WinUI 3 viewer that shows live status, requests an
-  immediate capture, renders the latest JPEG preview, and edits the supported
-  live configuration fields.
+  immediate capture, renders the latest JPEG preview, manages the durable
+  outbox, reports storage pressure, and edits the supported live configuration
+  fields.
 
 ## Quick start
 
@@ -65,6 +70,8 @@ camera driver is installed separately.
 - apps/AutoPierCam.Viewer: unpackaged WinUI 3 status/settings application.
 - docs/architecture.md: target agent, UI, storage, video, and upload design.
 - docs/upload.md: implemented HTTP request, retry, and durability contract.
+- docs/retention.md: implemented retention policy, upload-ledger safety, and
+  storage-pressure behavior.
 - autopiercam.example.toml: initial configuration contract.
 
 ## Current hardware result
@@ -97,12 +104,30 @@ healthy.
 - HTTP upload intents, retry deadlines, acknowledgements, and terminal failures
   are persisted in a SQLite ledger beside the configuration file. The bounded
   in-process upload channel carries coalesced wake hints only, so a full channel
-  does not lose a durable intent. The uploader never deletes the local JPEG.
+  does not lose a durable intent. The upload worker never deletes a local JPEG;
+  the independent retention worker may delete only a separately authorized
+  artifact.
 - A ledger is bound to the canonical capture directory, normalized HTTP
   endpoint, and a one-way authorization identity. Root or endpoint changes
   fail closed. Credential rotation is accepted only after every upload is
   terminal and no crash-gap artifact awaits reconciliation; see
   `docs/upload.md` for the recovery and operator contract.
+- Retention inventories only regular direct-child JPEGs with AutoPierCam's exact
+  generated filename grammar. Age deletion is controlled by
+  `capture.retention_days`; optional `capture.retention_max_bytes` and
+  `capture.retention_min_free_bytes` limits reclaim the oldest eligible files
+  until both byte targets are met. `capture.keep_latest` always protects the
+  newest managed image. See `docs/retention.md` for the fail-closed ledger
+  rules.
+- Pending, active, retrying, permanently failed, unknown crash-gap, and otherwise
+  unverified upload artifacts are protected from retention. Completed uploads
+  and preactivation history can be reclaimed after an exact state and file
+  identity recheck. With uploads disabled, any existing ledger or sidecar makes
+  retention protect all managed captures.
+- If protected data prevents a configured byte target from being met, status
+  reports blocked storage pressure and scheduled still persistence pauses.
+  Preview, camera draining, and an explicit Capture now request remain
+  available.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
   off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.
@@ -112,7 +137,10 @@ healthy.
   converts accordingly.
 - The Viewer renders the live preview and marks it stale after five seconds
   without a new frame. Its camera selector remains read-only. Max exposure,
-  max gain, still interval, upload endpoint/enable, and video enable are backed
-  by versioned configuration replacement. It also reports durable upload
-  pending, active, retrying, completed, and permanently failed counts. Security
-  video remains a designed seam rather than an active sink.
+  max gain, still interval, managed-image and minimum-free-space limits, upload
+  endpoint/enable, and video enable are backed by versioned configuration
+  replacement. Capability checks keep new retention fields safe when the Viewer
+  talks to an older agent. It reports durable upload counts, offers newest-first
+  outbox inspection and confirmed requeue of eligible permanent failures, and
+  shows managed/protected/reclaimable bytes plus the latest retention sweep.
+  Security video remains a designed seam rather than an active sink.

@@ -17,11 +17,12 @@ The Windows control endpoint is `\\.\pipe\autopiercam-control-v1`. The tray
 creates it with a protected DACL granting the current logon SID access and sets
 `PIPE_REJECT_REMOTE_CLIENTS`. It also requests the first pipe instance so a
 second tray process cannot silently claim the same endpoint. A fresh listening
-instance is created before each connected client is serviced, allowing
-short-lived Viewer requests to reconnect without a gap. Protocol v1 serves one
-request per connection, and disconnects a client that does not finish sending
-that request within five seconds so an idle connection cannot monopolize the
-control endpoint.
+instance is published before each connected client is dispatched. Up to eight
+connections can be active, each serving one protocol-v1 request; blocking work
+is moved off the asynchronous accept loop. A long artifact verification for an
+outbox requeue therefore does not prevent another client from requesting status,
+configuration, or shutdown. Request reads and response writes are each bounded
+to five seconds, so idle or stalled clients release their connection slot.
 
 Implemented methods:
 
@@ -31,6 +32,8 @@ Implemented methods:
 - capture.now
 - config.get
 - config.replace
+- uploads.list
+- uploads.requeue
 - agent.shutdown
 
 Reserved methods currently return a structured `not_implemented` error:
@@ -55,16 +58,44 @@ Reserved methods currently return a structured `not_implemented` error:
         "last_success_unix_ms": 1787952000000,
         "last_failure_unix_ms": 1787951940000,
         "last_error": "HTTP endpoint requested a retry"
-      }
+      },
+      "storage": {
+        "managed_bytes": 1352914698,
+        "protected_bytes": 814219210,
+        "reclaimable_bytes": 538695488,
+        "free_bytes": 8589934592,
+        "last_sweep_unix_ms": 1787952005000,
+        "last_reclaimed_files": 2,
+        "last_reclaimed_bytes": 4423350,
+        "pressure": "ok",
+        "capture_suspended": false
+      },
+      "capabilities": [
+        "uploads.list",
+        "uploads.requeue",
+        "storage.retention"
+      ]
     }
 
-`camera`, `last_artifact`, `last_error`, and `upload` are omitted when
-unavailable. The upload object is published while the durable uploader is
-enabled. Its five counters are always present; the last-success, last-failure,
-and upload-error fields are omitted until available. `active` counts a row
-currently fenced to an HTTP attempt, while `retrying` counts rows waiting for a
-persisted retry deadline. Completed and permanently failed rows remain in the
-ledger and therefore remain in these cumulative counts across restarts.
+`camera`, `last_artifact`, the agent-level `last_error`, `upload`, and `storage`
+are omitted when unavailable. `capabilities` is omitted only when empty; clients
+must gate optional operations on exact advertised strings so they remain safe
+with older protocol-v1 agents.
+
+The upload object is published while the durable uploader is enabled. Its five
+counters are always present; the last-success, last-failure, and upload-error
+fields are omitted until available. `active` counts a row currently fenced to
+an HTTP attempt, while `retrying` counts rows waiting for a persisted retry
+deadline. Completed and permanently failed rows remain in the ledger and
+therefore remain in these cumulative counts across restarts.
+
+The storage object is the latest completed retention sweep. It separates all
+managed bytes into protected and reclaimable portions, reports capture-volume
+free space when available, and describes only the most recent sweep's reclaimed
+file/byte counts. Pressure is `ok`, `cleanup_needed`, or `blocked`. When
+`capture_suspended` is true, scheduled still persistence is paused but Capture
+now remains available. Details are in [Capture retention and storage
+pressure](retention.md).
 
 The Viewer opens one pipe connection per request and serializes its requests.
 It enforces a 2-second connection timeout, 30-second response timeout, matching
@@ -87,11 +118,14 @@ configuration document:
     }
 
 `config.replace` carries `expected_revision` and a complete configuration
-document. Complete means every field emitted by the current schema is present,
-including optional fields whose value is null; unknown fields are rejected.
-The agent validates the document and expected revision, syncs a unique temporary
-file, atomically replaces the TOML file, and schedules a controlled camera
-restart. Success is precise about those two completed/accepted steps:
+document; unknown fields are rejected. The optional
+`capture.retention_max_bytes` and `capture.retention_min_free_bytes` fields may
+be omitted when disabled for compatibility with older agents. The Viewer edits
+them only when `storage.retention` is advertised and otherwise preserves any
+loaded non-null values unchanged. The agent validates the document and expected
+revision, syncs a unique temporary file, atomically replaces the TOML file, and
+schedules a controlled camera restart. Success is precise about those two
+completed/accepted steps:
 
     { "revision": 42, "saved": true, "restart_scheduled": true }
 
@@ -101,6 +135,47 @@ can retain the same revision. A stale write returns `revision_conflict` with
 the worker has already stopped, the response is the structured
 `config_saved_agent_stopped` error with the persisted revision; clients must
 refresh before another edit.
+
+## Durable outbox administration
+
+`uploads.list` accepts an optional unique list of job states, a page size from 1
+through 100, and an opaque continuation cursor:
+
+    {
+      "states": ["pending", "retrying", "permanently_failed"],
+      "page_size": 50
+    }
+
+An empty state list means all states. The result carries a random immutable
+ledger id, newest-first path-free job summaries, and `next_cursor` when another
+page exists. Each summary includes `job_id`, `job_revision`, filename, state,
+recorded size, attempt/requeue counts, audit timestamps, optional HTTP/error
+details, and `requeue_eligible`. Cursors bind the ledger, global revision,
+filter, page size, and high-water row; a durable mutation returns
+`stale_upload_cursor`, and changing cursor parameters returns
+`upload_cursor_mismatch`. Clients must restart pagination after either error.
+
+`uploads.requeue` requires all three operator fences:
+
+    {
+      "ledger_id": "0123456789abcdef0123456789abcdef",
+      "job_id": 41,
+      "expected_job_revision": 7
+    }
+
+Only an eligible `permanently_failed` job can transition to `pending`. The
+agent atomically rechecks the ledger id, state, revision, immutable delivery
+binding, and the exact local file size/SHA-256 before committing. The result
+returns the updated job plus `worker_notified`; a false notification flag does
+not undo the durable requeue. Conflicts have distinct structured codes for
+ledger, state, revision, delivery binding, unavailable artifact, and changed
+artifact. No administration method edits identity fields, requeues a completed
+row, or deletes history.
+
+The Viewer displays Manage outbox only when both upload capabilities are
+advertised, disables it while the upload service is unavailable, confirms an
+eligible requeue, and refreshes revision-stable pages after any mutation or
+stale cursor.
 
 ## Preview stream v1
 

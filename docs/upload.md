@@ -107,11 +107,14 @@ non-regular, or identity-mismatched artifacts become permanent failures rather
 than sending different bytes under an existing idempotency key. Later source
 mutation or replacement cannot change the bytes in flight on Windows or Unix.
 
-The uploader never deletes a local JPEG. It also never removes completed or
-permanently failed rows. The configured `capture.retention_days` and
-`capture.keep_latest` fields are not yet enforced by a retention worker, so
-operators must currently plan disk capacity and preserve any file needed for
-manual recovery.
+The upload worker never deletes a local JPEG or removes a ledger row. A separate
+retention worker can reclaim only a preactivation artifact or an artifact whose
+row is still `completed` with the exact recorded path, revision, size, and
+SHA-256. Pending, in-progress, retrying, permanently failed, unknown, and
+publish/record crash-gap artifacts are protected. The final state and identity
+are rechecked while the ledger is synchronized immediately before the opened
+file handle is deleted. See [Capture retention and storage
+pressure](retention.md) for age, byte-quota, and upload-disabled behavior.
 
 ## Request and idempotency contract
 
@@ -137,8 +140,37 @@ minimum delay and is also capped at five minutes; HTTP-date values are not
 interpreted. Retryable failures continue indefinitely at the capped delay.
 
 Other non-2xx statuses are permanent failures. Local identity failures such as
-a missing or changed file are also permanent. There is not yet an operator
-command to edit, delete, or requeue a terminal row.
+a missing or changed file are also permanent.
+
+## Operator inspection and requeue
+
+Current agents advertise `uploads.list` and `uploads.requeue` in the status
+capability list. The Viewer uses those methods for its Manage outbox dialog; it
+does not open SQLite directly.
+
+`uploads.list` returns a path-free, newest-first projection containing the
+ledger id, job and revision ids, generated filename, state, recorded byte size,
+attempt and requeue counts, audit timestamps, most recent HTTP/error details,
+and current requeue eligibility. Requests can filter by state and select a page
+size from 1 through 100. Pagination cursors are opaque and bind the ledger,
+filter, page size, high-water job, and global ledger revision. Any durable
+mutation invalidates an outstanding cursor, so clients must refresh rather than
+combine rows from different ledger states. The Viewer does this automatically.
+
+`uploads.requeue` accepts exactly one ledger id, job id, and expected job
+revision. It succeeds only for a `permanently_failed` row whose immutable
+delivery binding still matches the running worker. While holding the publication
+and ledger fences, the agent rechecks the row and verifies that the canonical,
+regular local file still has its recorded size and SHA-256. A missing, replaced,
+changed, wrong-ledger, wrong-state, or stale-revision artifact is rejected
+without changing durable state.
+
+An accepted requeue moves the row to `pending`, increments its job revision and
+requeue count, records the requeue time, and sends a coalesced worker wake when
+the uploader is available. Attempt and failure history are retained. Completed
+rows are immutable, and pending/in-progress/retrying rows cannot be manually
+requeued. The Viewer requires a confirmation before submitting the revision-
+fenced request and refreshes after either success or conflict.
 
 ## Backpressure and status telemetry
 
@@ -165,12 +197,19 @@ shows the same aggregate state:
 The three last-detail fields are omitted until available. `last_error`
 describes the most recently recorded failure and is not cleared merely because
 a later upload succeeds. When upload is disabled, the optional `upload` object
-is absent because no ledger worker is active.
+is absent because no ledger worker is active. Outbox methods then return a
+service-unavailable error, and the capability-aware Viewer leaves Manage outbox
+visible but disabled so an operator can distinguish an unavailable worker from
+an older agent.
 
 ## Shutdown and operator caveats
 
 Ordered shutdown drains the still-writer queue first, so every published JPEG
-it completes is recorded. The uploader then:
+it completes is recorded and its retention wake is queued. Retention completes
+that queued final sweep and exits while the ledger is still available. The
+agent then revokes upload-administration access and waits for any already
+accepted list/requeue operation to leave the shared ledger before stopping the
+uploader. The uploader:
 
 1. finishes an HTTP request already in flight and persists its outcome;
 2. releases a claim that was fenced but not yet submitted back to `pending`;
@@ -201,6 +240,8 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
   authorization identity.
 - If the configuration file is moved, keep track of its old sidecar. The new
   path will not automatically discover or resume the old outbox.
-- A permanently failed row remains terminal even if its local file is later
-  restored. Preserve the ledger and artifact for manual investigation until a
-  supported requeue workflow is implemented.
+- A permanently failed row remains terminal if its local file is merely
+  restored. Preserve the ledger and artifact, inspect it in Manage outbox, and
+  explicitly requeue it only after the cause is understood. The requeue still
+  requires the original bytes and current ledger/delivery identity; it cannot
+  substitute a repaired or regenerated file under the old idempotency key.
