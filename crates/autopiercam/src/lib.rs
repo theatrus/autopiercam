@@ -8,8 +8,9 @@ use autopiercam_core::{
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
 use autopiercam_protocol::{
-    AgentState, AgentStatus, CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, StatusCamera,
-    StatusUpload, UploadListRequest, UploadListResponse, UploadRequeueRequest, UploadRequeueResult,
+    AgentState, AgentStatus, CAPABILITY_STORAGE_RETENTION, CAPABILITY_UPLOADS_LIST,
+    CAPABILITY_UPLOADS_REQUEUE, StatusCamera, StatusStorage, StatusUpload, StoragePressure,
+    UploadListRequest, UploadListResponse, UploadRequeueRequest, UploadRequeueResult,
 };
 use image::{
     ColorType, ImageEncoder,
@@ -29,14 +30,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 mod preview;
+mod retention;
 mod upload;
 
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
+use retention::{
+    LocalOnlyRetentionAuthority, ProtectAllRetentionAuthority, RetentionAuthority,
+    RetentionObserver, RetentionPolicy, RetentionPressure, RetentionSink, RetentionTelemetry,
+    RetentionWakeResult, RetentionWorker,
+};
 pub use upload::UploadAdminError;
 use upload::{
     BearerAuthorization, UploadAdmin, UploadEnqueueResult, UploadHealth, UploadObserver,
     UploadOptions, UploadSink, UploadTelemetry, UploadWorker, bearer_authorization,
+    parse_generated_capture_filename,
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -276,6 +284,7 @@ impl AgentMonitor {
         status.capabilities = vec![
             CAPABILITY_UPLOADS_LIST.to_owned(),
             CAPABILITY_UPLOADS_REQUEUE.to_owned(),
+            CAPABILITY_STORAGE_RETENTION.to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
@@ -384,6 +393,7 @@ impl AgentMonitor {
         status.camera = None;
         status.last_error = None;
         status.upload = None;
+        status.storage = None;
     }
 
     fn set_camera(&self, info: &CameraInfo) {
@@ -431,6 +441,25 @@ impl AgentMonitor {
             last_success_unix_ms: telemetry.last_success_unix_ms,
             last_failure_unix_ms: telemetry.last_failure_unix_ms,
             last_error: telemetry.last_error,
+        });
+    }
+
+    fn retention_telemetry(&self, telemetry: RetentionTelemetry) {
+        self.write().storage = Some(StatusStorage {
+            managed_bytes: telemetry.managed_bytes,
+            protected_bytes: telemetry.protected_bytes,
+            reclaimable_bytes: telemetry.reclaimable_bytes,
+            free_bytes: telemetry.free_bytes,
+            last_sweep_unix_ms: Some(telemetry.swept_at_unix_ms),
+            last_reclaimed_files: telemetry.reclaimed_file_count,
+            last_reclaimed_bytes: telemetry.reclaimed_bytes,
+            pressure: match telemetry.pressure {
+                RetentionPressure::Ok => StoragePressure::Ok,
+                RetentionPressure::CleanupNeeded => StoragePressure::CleanupNeeded,
+                RetentionPressure::Blocked => StoragePressure::Blocked,
+            },
+            capture_suspended: telemetry.blocked_pressure,
+            last_error: telemetry.error,
         });
     }
 
@@ -695,6 +724,16 @@ fn run_agent_inner(
     let upload_admin_registration = upload_sink
         .as_ref()
         .map(|sink| monitor.register_upload_admin(sink.admin()));
+    let (retention_worker, retention_sink) = match start_retention_worker(
+        &config,
+        &upload_ledger_path,
+        &capture_directory,
+        upload_sink.as_ref(),
+        monitor,
+    )? {
+        Some((worker, sink)) => (Some(worker), Some(sink)),
+        None => (None, None),
+    };
     let info = select_configured_camera(sdk, &config.camera)?;
     monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
@@ -730,10 +769,18 @@ fn run_agent_inner(
 
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let upload_health = upload_sink.as_ref().map(UploadSink::health);
+    let writer_retention_sink = retention_sink.clone();
     let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
-        .spawn(move || writer_loop(writer_rx, &writer_monitor, upload_sink.as_ref()))
+        .spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_monitor,
+                upload_sink.as_ref(),
+                writer_retention_sink.as_ref(),
+            )
+        })
         .context("starting still writer")?;
     let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
@@ -757,6 +804,7 @@ fn run_agent_inner(
         monitor,
         &writer_tx,
         upload_health.as_ref(),
+        retention_sink.as_ref(),
         preview_sink.as_ref(),
         capture_session_nonce,
     );
@@ -765,6 +813,9 @@ fn run_agent_inner(
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("still-writer thread panicked"));
+    let retention_result = retention_worker
+        .map(RetentionWorker::stop_and_join)
+        .unwrap_or(Ok(()));
     drop(upload_admin_registration);
     let upload_result = upload_worker
         .map(UploadWorker::stop_and_join)
@@ -774,6 +825,7 @@ fn run_agent_inner(
         .unwrap_or(Ok(()));
     capture_result?;
     writer_result??;
+    retention_result.context("stopping capture retention worker")?;
     upload_result.context("stopping HTTP upload worker")?;
     preview_result?;
     info!("continuous capture worker stopped cleanly");
@@ -792,6 +844,7 @@ fn capture_loop(
     monitor: &AgentMonitor,
     writer: &SyncSender<CaptureJob>,
     upload_health: Option<&UploadHealth>,
+    retention: Option<&RetentionSink>,
     preview: Option<&PreviewSink>,
     capture_session_nonce: CaptureSessionNonce,
 ) -> Result<()> {
@@ -825,6 +878,9 @@ fn capture_loop(
         while !control.is_shutdown() {
             if upload_health.is_some_and(UploadHealth::is_stopped) {
                 bail!("durable upload worker stopped unexpectedly");
+            }
+            if retention.is_some_and(RetentionSink::is_stopped) {
+                bail!("capture retention worker stopped unexpectedly");
             }
             let exposure_us = camera
                 .control_value(ControlType::EXPOSURE)
@@ -867,7 +923,9 @@ fn capture_loop(
             if capture_requested {
                 seen_capture_generation = seen_capture_generation.wrapping_add(1);
             }
-            let periodic_capture_due = !control.is_paused() && now >= next_capture;
+            let periodic_capture_due = !control.is_paused()
+                && !retention.is_some_and(RetentionSink::capture_suspended)
+                && now >= next_capture;
             if !capture_requested && !periodic_capture_due {
                 continue;
             }
@@ -1070,6 +1128,73 @@ fn start_upload_worker(
     })
 }
 
+fn start_retention_worker(
+    config: &Config,
+    upload_ledger_path: &Path,
+    capture_directory: &Path,
+    upload_sink: Option<&UploadSink>,
+    monitor: &AgentMonitor,
+) -> Result<Option<(RetentionWorker, RetentionSink)>> {
+    let policy = RetentionPolicy::from_capture_config(&config.capture);
+    if !policy.is_enabled() {
+        return Ok(None);
+    }
+
+    let authority: Arc<dyn RetentionAuthority> = if let Some(upload_sink) = upload_sink {
+        upload_sink.retention_authority()
+    } else if upload_ledger_artifacts_exist(upload_ledger_path)? {
+        warn!(
+            ledger = %upload_ledger_path.display(),
+            "uploads are disabled but a prior ledger exists; retention will protect all managed captures"
+        );
+        Arc::new(ProtectAllRetentionAuthority)
+    } else {
+        Arc::new(LocalOnlyRetentionAuthority)
+    };
+    let retention_monitor = monitor.clone();
+    let observer: RetentionObserver = Arc::new(move |telemetry| {
+        retention_monitor.retention_telemetry(telemetry);
+    });
+    RetentionWorker::start(
+        policy,
+        capture_directory.to_path_buf(),
+        Arc::new(parse_generated_capture_filename),
+        authority,
+        observer,
+    )
+    .map(Some)
+    .with_context(|| {
+        format!(
+            "starting capture retention worker for {}",
+            capture_directory.display()
+        )
+    })
+}
+
+fn upload_ledger_artifacts_exist(database_path: &Path) -> Result<bool> {
+    let mut candidates = vec![database_path.to_path_buf()];
+    for suffix in ["-wal", "-shm", ".maintenance"] {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(suffix);
+        candidates.push(PathBuf::from(path));
+    }
+    for candidate in candidates {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "checking for prior upload-ledger artifact {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn load_bearer_authorization(variable: &str) -> Result<BearerAuthorization> {
     let token = match std::env::var(variable) {
         Ok(token) => token,
@@ -1096,6 +1221,7 @@ fn writer_loop(
     receiver: Receiver<CaptureJob>,
     monitor: &AgentMonitor,
     upload: Option<&UploadSink>,
+    retention: Option<&RetentionSink>,
 ) -> Result<()> {
     for job in receiver {
         let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
@@ -1119,6 +1245,14 @@ fn writer_loop(
                     });
                 }
             }
+        }
+        if let Some(retention) = retention
+            && retention.try_wake() == RetentionWakeResult::Stopped
+        {
+            bail!(
+                "capture retention worker stopped after finalizing {}",
+                job.output.display()
+            );
         }
         info!(
             sequence = job.sequence,
@@ -1527,6 +1661,18 @@ mod tests {
             last_failure_unix_ms: Some(20),
             last_error: Some("HTTP endpoint requested a retry".to_owned()),
         });
+        monitor.retention_telemetry(RetentionTelemetry {
+            swept_at_unix_ms: 30,
+            managed_bytes: 1_000,
+            protected_bytes: 600,
+            reclaimable_bytes: 400,
+            free_bytes: Some(2_000),
+            reclaimed_file_count: 2,
+            reclaimed_bytes: 300,
+            blocked_pressure: true,
+            pressure: RetentionPressure::Blocked,
+            error: Some("protected uploads prevent cleanup".to_owned()),
+        });
 
         let status = monitor.snapshot();
         assert_eq!(status.state, AgentState::Capturing);
@@ -1538,7 +1684,8 @@ mod tests {
             status.capabilities,
             [
                 CAPABILITY_UPLOADS_LIST.to_owned(),
-                CAPABILITY_UPLOADS_REQUEUE.to_owned()
+                CAPABILITY_UPLOADS_REQUEUE.to_owned(),
+                CAPABILITY_STORAGE_RETENTION.to_owned()
             ]
         );
         let upload = status.upload.expect("upload telemetry");
@@ -1553,6 +1700,20 @@ mod tests {
             upload.last_error.as_deref(),
             Some("HTTP endpoint requested a retry")
         );
+        let storage = status.storage.expect("storage telemetry");
+        assert_eq!(storage.managed_bytes, 1_000);
+        assert_eq!(storage.protected_bytes, 600);
+        assert_eq!(storage.reclaimable_bytes, 400);
+        assert_eq!(storage.free_bytes, Some(2_000));
+        assert_eq!(storage.last_sweep_unix_ms, Some(30));
+        assert_eq!(storage.last_reclaimed_files, 2);
+        assert_eq!(storage.last_reclaimed_bytes, 300);
+        assert_eq!(storage.pressure, StoragePressure::Blocked);
+        assert!(storage.capture_suspended);
+        assert_eq!(
+            storage.last_error.as_deref(),
+            Some("protected uploads prevent cleanup")
+        );
 
         monitor.report_fault("camera disconnected");
         monitor.begin_attempt();
@@ -1561,6 +1722,7 @@ mod tests {
         assert!(retry_status.camera.is_none());
         assert!(retry_status.last_error.is_none());
         assert!(retry_status.upload.is_none());
+        assert!(retry_status.storage.is_none());
         assert_eq!(retry_status.frames_captured, 1);
         assert_eq!(retry_status.frames_saved, 1);
         assert_eq!(

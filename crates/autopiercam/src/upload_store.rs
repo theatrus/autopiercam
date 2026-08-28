@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -432,6 +433,9 @@ pub(crate) enum UploadStoreError {
 
     #[error("upload job {0} has exhausted SQLite's requeue counter")]
     RequeueCountOverflow(UploadJobId),
+
+    #[error("the upload preactivation inventory contains an invalid artifact path")]
+    CorruptPreactivationArtifact,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -703,6 +707,34 @@ pub(crate) struct UploadStoreSnapshot {
     pub(crate) last_failure_at_unix_ms: Option<u64>,
     pub(crate) last_error: Option<String>,
     pub(crate) next_due_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UploadRetentionBinding {
+    /// Acknowledged bytes may be reclaimed only while this exact immutable job
+    /// remains completed at the same revision.
+    Completed {
+        job_id: UploadJobId,
+        job_revision: u64,
+        file_size: u64,
+        sha256: [u8; 32],
+    },
+    /// Captures present before this ledger was activated were never intended
+    /// for its destination and may follow local retention policy.
+    Preactivation,
+    /// Nonterminal, permanently failed, or otherwise unacknowledged work.
+    Protected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadRetentionEntry {
+    pub(crate) artifact_path: PathBuf,
+    pub(crate) binding: UploadRetentionBinding,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UploadRetentionSnapshot {
+    pub(crate) entries: Vec<UploadRetentionEntry>,
 }
 
 type AggregateSnapshotRow = (
@@ -1125,6 +1157,134 @@ impl UploadStore {
             last_error: aggregate.7,
             next_due_at_unix_ms: optional_database_u64("next due time", next_due)?,
         })
+    }
+
+    /// Returns a filesystem-free classification of every path known to the
+    /// owned ledger. Directory enumeration and hashing happen after the store
+    /// mutex is released; this method holds SQLite only long enough to copy and
+    /// validate immutable row identities.
+    pub(crate) fn retention_snapshot(&self) -> Result<UploadRetentionSnapshot, UploadStoreError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT id, artifact_path, filename, idempotency_key,
+                   file_size, sha256, delivery_binding_sha256,
+                   state, attempt_count, next_attempt_at_ms,
+                   last_http_status, last_error, created_at_ms,
+                   updated_at_ms, completed_at_ms, last_failure_at_ms,
+                   job_revision, requeue_count, last_requeued_at_ms
+            FROM upload_jobs
+            ORDER BY id
+            "#,
+        )?;
+        let jobs = collect_list_items(
+            statement.query_map([], RawUploadJob::from_row)?,
+            &self.capture_root,
+            self.delivery_binding,
+        )?;
+        let mut entries = Vec::with_capacity(jobs.len());
+        let mut recorded_paths = HashSet::with_capacity(jobs.len());
+        for job in jobs {
+            recorded_paths.insert(job.artifact_path.clone());
+            let binding = if job.state == UploadState::Completed {
+                UploadRetentionBinding::Completed {
+                    job_id: job.job_id,
+                    job_revision: job.job_revision,
+                    file_size: job.file_size,
+                    sha256: job.sha256,
+                }
+            } else {
+                UploadRetentionBinding::Protected
+            };
+            entries.push(UploadRetentionEntry {
+                artifact_path: job.artifact_path,
+                binding,
+            });
+        }
+        drop(statement);
+
+        let mut statement = self.connection.prepare(
+            "SELECT artifact_path FROM upload_preactivation_artifacts ORDER BY artifact_path",
+        )?;
+        let paths = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for path in paths {
+            let path = validate_preactivation_artifact_path(path?, &self.capture_root)?;
+            if recorded_paths.insert(path.clone()) {
+                entries.push(UploadRetentionEntry {
+                    artifact_path: path,
+                    binding: UploadRetentionBinding::Preactivation,
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.artifact_path.cmp(&right.artifact_path));
+        Ok(UploadRetentionSnapshot { entries })
+    }
+
+    /// Rechecks a previously classified artifact immediately before an
+    /// exact-handle deleter runs while the caller still holds the shared store
+    /// mutex. False is a normal race/fence result and must retain the file.
+    pub(crate) fn retention_still_authorized(
+        &self,
+        entry: &UploadRetentionEntry,
+    ) -> Result<bool, UploadStoreError> {
+        let Some(path) = entry.artifact_path.to_str() else {
+            return Ok(false);
+        };
+        match &entry.binding {
+            UploadRetentionBinding::Completed {
+                job_id,
+                job_revision,
+                file_size,
+                sha256,
+            } => {
+                let expected_revision =
+                    i64::try_from(*job_revision).map_err(|_| UploadStoreError::CorruptInteger {
+                        column: "job_revision",
+                        value: i64::MIN,
+                    })?;
+                let expected_size =
+                    i64::try_from(*file_size).map_err(|_| UploadStoreError::CorruptInteger {
+                        column: "file_size",
+                        value: i64::MIN,
+                    })?;
+                let matches: bool = self.connection.query_row(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM upload_jobs
+                        WHERE id = ?1 AND artifact_path = ?2
+                          AND state = 'completed' AND job_revision = ?3
+                          AND file_size = ?4 AND sha256 = ?5
+                    )
+                    "#,
+                    params![
+                        job_id.0,
+                        path,
+                        expected_revision,
+                        expected_size,
+                        sha256.as_slice()
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok(matches)
+            }
+            UploadRetentionBinding::Preactivation => self
+                .connection
+                .query_row(
+                    r#"
+                    SELECT
+                        EXISTS (
+                            SELECT 1 FROM upload_preactivation_artifacts
+                            WHERE artifact_path = ?1
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM upload_jobs WHERE artifact_path = ?1
+                        )
+                    "#,
+                    [path],
+                    |row| row.get(0),
+                )
+                .map_err(UploadStoreError::from),
+            UploadRetentionBinding::Protected => Ok(false),
+        }
     }
 
     /// Lists a revision-stable, newest-first page. The cursor is intentionally
@@ -2564,6 +2724,24 @@ fn validate_stored_identity(
         Ok(path)
     } else {
         Err(UploadStoreError::CorruptArtifactIdentity(job_id))
+    }
+}
+
+fn validate_preactivation_artifact_path(
+    artifact_path: String,
+    capture_root: &Path,
+) -> Result<PathBuf, UploadStoreError> {
+    let path = PathBuf::from(artifact_path);
+    let valid = path.is_absolute()
+        && path.parent() == Some(capture_root)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_generated_frame_filename);
+    if valid {
+        Ok(path)
+    } else {
+        Err(UploadStoreError::CorruptPreactivationArtifact)
     }
 }
 
@@ -4212,6 +4390,60 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn retention_snapshot_protects_unacknowledged_jobs_and_fences_completed_deletes() {
+        let environment = TestEnvironment::new();
+        let historical = environment.artifact_at(1_000, 1, b"historical local frame");
+        let historical = fs::canonicalize(historical).unwrap();
+        let mut store = environment.open();
+
+        let completed_path = environment.artifact_at(2_000, 2, b"acknowledged frame");
+        store.record_artifact(&completed_path, 2_000).unwrap();
+        let completed_path = fs::canonicalize(completed_path).unwrap();
+        let completed_claim = store.claim_due(2_000).unwrap().unwrap();
+        store.mark_completed(&completed_claim, 2_100, 204).unwrap();
+        let pending_path = environment.artifact_at(3_000, 3, b"pending frame");
+        store.record_artifact(&pending_path, 3_000).unwrap();
+        let pending_path = fs::canonicalize(pending_path).unwrap();
+
+        let snapshot = store.retention_snapshot().unwrap();
+        let historical_entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.artifact_path == historical)
+            .unwrap();
+        assert_eq!(
+            historical_entry.binding,
+            UploadRetentionBinding::Preactivation
+        );
+        assert!(store.retention_still_authorized(historical_entry).unwrap());
+
+        let completed_entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.artifact_path == completed_path)
+            .unwrap();
+        assert!(matches!(
+            completed_entry.binding,
+            UploadRetentionBinding::Completed { .. }
+        ));
+        assert!(store.retention_still_authorized(completed_entry).unwrap());
+        let mut stale_completed = completed_entry.clone();
+        if let UploadRetentionBinding::Completed { job_revision, .. } = &mut stale_completed.binding
+        {
+            *job_revision += 1;
+        }
+        assert!(!store.retention_still_authorized(&stale_completed).unwrap());
+
+        let pending_entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.artifact_path == pending_path)
+            .unwrap();
+        assert_eq!(pending_entry.binding, UploadRetentionBinding::Protected);
+        assert!(!store.retention_still_authorized(pending_entry).unwrap());
     }
 
     #[test]

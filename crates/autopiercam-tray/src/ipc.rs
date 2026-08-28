@@ -868,7 +868,8 @@ fn wide_pointer_to_string(pointer: PWSTR) -> io::Result<String> {
 mod tests {
     use super::*;
     use autopiercam_protocol::{
-        AgentState, CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, PROTOCOL_VERSION,
+        AgentState, CAPABILITY_STORAGE_RETENTION, CAPABILITY_UPLOADS_LIST,
+        CAPABILITY_UPLOADS_REQUEUE, PROTOCOL_VERSION,
     };
     use std::{
         fs,
@@ -1051,7 +1052,11 @@ mod tests {
         let status = monitor.snapshot();
         assert_eq!(
             status.capabilities,
-            [CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE]
+            [
+                CAPABILITY_UPLOADS_LIST,
+                CAPABILITY_UPLOADS_REQUEUE,
+                CAPABILITY_STORAGE_RETENTION
+            ]
         );
 
         let response = dispatch(

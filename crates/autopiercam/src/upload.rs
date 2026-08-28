@@ -1,5 +1,6 @@
 use std::{
-    io,
+    collections::HashMap,
+    fs, io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -33,7 +34,13 @@ mod upload_store;
 use upload_store::{
     ArtifactVerification, ClaimedUpload, RecordDisposition, RequeueUploadRequest,
     SnapshottedClaimedArtifact, UploadAuthorizationFingerprint, UploadJobId, UploadListItem,
-    UploadState, UploadStore, UploadStoreError, UploadStoreSnapshot, snapshot_claimed_artifact,
+    UploadRetentionBinding, UploadRetentionEntry, UploadState, UploadStore, UploadStoreError,
+    UploadStoreSnapshot, snapshot_claimed_artifact,
+};
+
+use crate::retention::{
+    ExactDeleteOutcome, ManagedArtifact, RetentionAuthority, RetentionAuthorization,
+    RetentionCandidate, RetentionDeletionOutcome, RetentionPlatform,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,6 +222,107 @@ pub enum UploadAdminError {
 
 type SharedStore = Arc<Mutex<UploadStore>>;
 type PublishLock = Arc<Mutex<()>>;
+
+/// Retention view over the already-open upload ledger. The worker first copies
+/// immutable classifications without touching the filesystem, then this
+/// adapter closes the final state-check/delete race under the same publication
+/// and store locks used by upload mutations.
+struct UploadRetentionAuthority {
+    store: SharedStore,
+    publish_lock: PublishLock,
+    classified: Mutex<HashMap<PathBuf, UploadRetentionEntry>>,
+}
+
+impl UploadRetentionAuthority {
+    fn new(store: SharedStore, publish_lock: PublishLock) -> Self {
+        Self {
+            store,
+            publish_lock,
+            classified: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RetentionAuthority for UploadRetentionAuthority {
+    fn classify_inventory(
+        &self,
+        inventory: &[ManagedArtifact],
+    ) -> Result<Vec<RetentionAuthorization>, String> {
+        let snapshot = lock_store(&self.store)
+            .map_err(|error| error.to_string())?
+            .retention_snapshot()
+            .map_err(|error| error.to_string())?;
+        let by_canonical_path = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| (entry.artifact_path.clone(), entry))
+            .collect::<HashMap<_, _>>();
+
+        let mut classified = self
+            .classified
+            .lock()
+            .map_err(|_| "the retention classification lock was poisoned".to_owned())?;
+        classified.clear();
+        let authorizations = inventory
+            .iter()
+            .map(|artifact| {
+                let Some(entry) = fs::canonicalize(&artifact.path)
+                    .ok()
+                    .and_then(|path| by_canonical_path.get(&path))
+                else {
+                    return RetentionAuthorization::protected();
+                };
+                let authorization = match &entry.binding {
+                    UploadRetentionBinding::Completed {
+                        file_size, sha256, ..
+                    } => RetentionAuthorization::reclaimable(Some(*file_size), Some(*sha256)),
+                    UploadRetentionBinding::Preactivation => {
+                        RetentionAuthorization::reclaimable(Some(artifact.file_size_bytes), None)
+                    }
+                    UploadRetentionBinding::Protected => RetentionAuthorization::protected(),
+                };
+                if authorization.classification
+                    == crate::retention::RetentionClassification::Reclaimable
+                {
+                    classified.insert(artifact.path.clone(), entry.clone());
+                }
+                authorization
+            })
+            .collect();
+        Ok(authorizations)
+    }
+
+    fn delete_if_still_authorized(
+        &self,
+        candidate: &RetentionCandidate,
+        platform: &dyn RetentionPlatform,
+    ) -> Result<RetentionDeletionOutcome, String> {
+        let entry = self
+            .classified
+            .lock()
+            .map_err(|_| "the retention classification lock was poisoned".to_owned())?
+            .remove(&candidate.path);
+        let Some(entry) = entry else {
+            return Ok(RetentionDeletionOutcome::Protected);
+        };
+
+        let _publication = lock_publish(&self.publish_lock).map_err(|error| error.to_string())?;
+        let store = lock_store(&self.store).map_err(|error| error.to_string())?;
+        if !store
+            .retention_still_authorized(&entry)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(RetentionDeletionOutcome::Protected);
+        }
+        platform
+            .delete_exact(candidate, candidate.authorization)
+            .map(|outcome| match outcome {
+                ExactDeleteOutcome::Deleted => RetentionDeletionOutcome::Deleted,
+                ExactDeleteOutcome::AlreadyAbsent => RetentionDeletionOutcome::AlreadyAbsent,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
 
 /// Cloneable, in-process administration facade over the already-open durable
 /// ledger. It never opens a second SQLite connection, preserving the
@@ -426,6 +534,13 @@ impl UploadSink {
         }
     }
 
+    pub(crate) fn retention_authority(&self) -> Arc<dyn RetentionAuthority> {
+        Arc::new(UploadRetentionAuthority::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.publish_lock),
+        ))
+    }
+
     /// Records a finalized artifact durably before attempting a nonblocking
     /// wake. `Full` is success because another wake is already pending and the
     /// worker always drains all due ledger rows.
@@ -471,6 +586,10 @@ impl UploadSink {
         self.stop.store(true, Ordering::Release);
         let _ = self.wake_sender.try_send(());
     }
+}
+
+pub(crate) fn parse_generated_capture_filename(filename: &str) -> Option<u64> {
+    upload_store::parse_generated_frame_filename(filename)
 }
 
 /// Owns the single HTTP thread paired with an [`UploadSink`].
@@ -1065,6 +1184,113 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[derive(Default)]
+    struct CountingRetentionPlatform {
+        deletions: AtomicU64,
+    }
+
+    impl RetentionPlatform for CountingRetentionPlatform {
+        fn available_bytes(&self, _directory: &Path) -> io::Result<u64> {
+            Ok(u64::MAX)
+        }
+
+        fn delete_exact(
+            &self,
+            _candidate: &RetentionCandidate,
+            _expectation: RetentionAuthorization,
+        ) -> Result<ExactDeleteOutcome, crate::retention::RetentionDeleteError> {
+            self.deletions.fetch_add(1, Ordering::AcqRel);
+            Ok(ExactDeleteOutcome::Deleted)
+        }
+    }
+
+    fn managed_artifact(path: PathBuf, captured_at_unix_ms: u64) -> ManagedArtifact {
+        ManagedArtifact {
+            file_size_bytes: std::fs::metadata(&path).unwrap().len(),
+            path,
+            captured_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn upload_retention_authority_protects_every_unacknowledged_or_unknown_artifact() {
+        let environment = TestEnvironment::new();
+        let historical = environment.artifact(1, b"preactivation local frame");
+        let mut store = UploadStore::open(
+            &environment.database,
+            &environment.capture,
+            TEST_DESTINATION,
+            UploadAuthorizationFingerprint::anonymous(),
+        )
+        .unwrap();
+        let completed = environment.artifact(2, b"acknowledged upload");
+        store.record_artifact(&completed, 2_000).unwrap();
+        let claim = store.claim_due(2_000).unwrap().unwrap();
+        store.mark_completed(&claim, 2_100, 204).unwrap();
+        let pending = environment.artifact(3, b"pending upload");
+        store.record_artifact(&pending, 3_000).unwrap();
+        let unknown = environment.artifact(4, b"unledgered crash gap");
+
+        let authority =
+            UploadRetentionAuthority::new(Arc::new(Mutex::new(store)), Arc::new(Mutex::new(())));
+        let inventory = vec![
+            managed_artifact(historical, 1_000),
+            managed_artifact(completed.clone(), 2_000),
+            managed_artifact(pending.clone(), 3_000),
+            managed_artifact(unknown, 4_000),
+        ];
+        let authorizations = authority.classify_inventory(&inventory).unwrap();
+        assert_eq!(
+            authorizations
+                .iter()
+                .map(|authorization| authorization.classification)
+                .collect::<Vec<_>>(),
+            [
+                crate::retention::RetentionClassification::Reclaimable,
+                crate::retention::RetentionClassification::Reclaimable,
+                crate::retention::RetentionClassification::Protected,
+                crate::retention::RetentionClassification::Protected,
+            ]
+        );
+        assert!(authorizations[0].expected_sha256.is_none());
+        assert!(authorizations[1].expected_sha256.is_some());
+
+        let platform = CountingRetentionPlatform::default();
+        let completed_candidate = RetentionCandidate {
+            path: completed,
+            captured_at_unix_ms: 2_000,
+            file_size_bytes: inventory[1].file_size_bytes,
+            authorization: authorizations[1],
+        };
+        assert_eq!(
+            authority
+                .delete_if_still_authorized(&completed_candidate, &platform)
+                .unwrap(),
+            RetentionDeletionOutcome::Deleted
+        );
+        assert_eq!(platform.deletions.load(Ordering::Acquire), 1);
+        assert_eq!(
+            authority
+                .delete_if_still_authorized(&completed_candidate, &platform)
+                .unwrap(),
+            RetentionDeletionOutcome::Protected
+        );
+
+        let pending_candidate = RetentionCandidate {
+            path: pending,
+            captured_at_unix_ms: 3_000,
+            file_size_bytes: inventory[2].file_size_bytes,
+            authorization: authorizations[2],
+        };
+        assert_eq!(
+            authority
+                .delete_if_still_authorized(&pending_candidate, &platform)
+                .unwrap(),
+            RetentionDeletionOutcome::Protected
+        );
+        assert_eq!(platform.deletions.load(Ordering::Acquire), 1);
     }
 
     struct ManualClock(AtomicU64);
