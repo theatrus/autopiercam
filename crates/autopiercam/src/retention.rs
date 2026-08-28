@@ -866,6 +866,10 @@ pub(crate) struct RetentionSink {
 }
 
 impl RetentionSink {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     /// True when the latest completed sweep found unsatisfied byte pressure,
     /// or when the worker is no longer available to enforce retention.
     pub(crate) fn capture_suspended(&self) -> bool {
@@ -1493,12 +1497,14 @@ mod tests {
         let initial = telemetry_receiver.recv().unwrap();
         assert_eq!(initial.managed_bytes, 0);
         assert_eq!(initial.pressure, RetentionPressure::Ok);
+        assert!(!sink.is_stopped());
         assert!(!sink.capture_suspended());
         assert!(matches!(
             sink.try_wake(),
             RetentionWakeResult::Queued | RetentionWakeResult::Coalesced
         ));
         worker.stop_and_join().unwrap();
+        assert!(sink.is_stopped());
         assert!(sink.capture_suspended());
         assert_eq!(sink.try_wake(), RetentionWakeResult::Stopped);
     }
