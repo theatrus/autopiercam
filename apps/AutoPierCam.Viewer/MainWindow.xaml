@@ -215,6 +215,13 @@
                                     Visibility="Collapsed" />
                             </Grid>
                             <TextBlock
+                                x:Name="OutboxAvailabilityText"
+                                FontSize="12"
+                                Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                                Text="Outbox management is unavailable because the upload service is not running."
+                                TextWrapping="Wrap"
+                                Visibility="Collapsed" />
+                            <TextBlock
                                 x:Name="UploadActivityStateText"
                                 Text="Unavailable" />
                             <TextBlock
@@ -237,6 +244,42 @@
                                 x:Name="UploadLastFailureText"
                                 FontSize="12"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                TextWrapping="Wrap"
+                                Visibility="Collapsed" />
+                        </StackPanel>
+                    </Border>
+                    <Border
+                        x:Name="StorageStatusCard"
+                        Padding="12"
+                        Style="{StaticResource CardBorderStyle}"
+                        Visibility="Collapsed">
+                        <StackPanel Spacing="4">
+                            <TextBlock
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Storage retention" />
+                            <TextBlock
+                                x:Name="StoragePressureText"
+                                Text="Unavailable" />
+                            <TextBlock
+                                x:Name="StorageBytesText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                TextWrapping="Wrap" />
+                            <TextBlock
+                                x:Name="StorageFreeText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                TextWrapping="Wrap" />
+                            <TextBlock
+                                x:Name="StorageSweepText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                TextWrapping="Wrap" />
+                            <TextBlock
+                                x:Name="StorageErrorText"
+                                FontSize="12"
+                                Foreground="{ThemeResource SystemFillColorCautionBrush}"
                                 TextWrapping="Wrap"
                                 Visibility="Collapsed" />
                         </StackPanel>
@@ -309,6 +352,13 @@
                                 SpinButtonPlacementMode="Compact" />
                         </StackPanel>
                     </Grid>
+                    <TextBlock
+                        x:Name="RetentionSettingsAvailabilityText"
+                        FontSize="12"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                        Text="Retention limits are read-only because this agent does not advertise retention management."
+                        TextWrapping="Wrap"
+                        Visibility="Collapsed" />
                     <ToggleSwitch
                         x:Name="UploadEnabledToggle"
                         Header="HTTP upload"

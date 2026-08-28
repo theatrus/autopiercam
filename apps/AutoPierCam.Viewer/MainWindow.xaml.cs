@@ -385,8 +385,10 @@ public sealed partial class MainWindow : Window
         };
         _latestAgentStatus = null;
         UpdateOutboxControlAvailability();
+        UpdateRetentionControlAvailability();
         _configurationNeedsRefresh = false;
         ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
+        ClearStorageStatus();
         ConfigInfoBar.Title = $"Configuration revision {result.Revision:N0}";
         ConfigInfoBar.Message = "Saved; a camera restart was scheduled.";
         ConfigInfoBar.Severity = InfoBarSeverity.Success;
@@ -401,6 +403,12 @@ public sealed partial class MainWindow : Window
         {
             throw new UserInputException(
                 "This capture agent does not advertise durable outbox management. Refresh after upgrading or restarting the agent.");
+        }
+
+        if (status.Upload is null)
+        {
+            throw new UserInputException(
+                "Durable outbox management is unavailable because the upload service is not running.");
         }
 
         UploadListResult page = await _agentClient.ListUploadsAsync(
@@ -583,6 +591,34 @@ public sealed partial class MainWindow : Window
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
                     dialog.Hide();
+                }
+                catch (AgentRequestException exception) when (exception.IsStaleUploadCursor)
+                {
+                    // Every ledger mutation invalidates pagination. Never keep
+                    // offering a cursor the agent has already rejected.
+                    nextCursor = null;
+                    try
+                    {
+                        UploadListResult refreshed = await _agentClient.ListUploadsAsync(
+                            ManagedOutboxStates,
+                            OutboxPageSize,
+                            cancellationToken: cancellationToken);
+                        ledgerId = refreshed.LedgerId;
+                        jobs = refreshed.Jobs.ToList();
+                        nextCursor = refreshed.NextCursor;
+                        messageBar.Message =
+                            "The outbox changed while pages were loading. Refreshed from the newest jobs.";
+                        messageBar.Severity = InfoBarSeverity.Warning;
+                        messageBar.IsOpen = true;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        dialog.Hide();
+                    }
+                    catch (Exception refreshException)
+                    {
+                        ShowInlineError(refreshException);
+                    }
                 }
                 catch (Exception exception)
                 {
@@ -880,12 +916,22 @@ public sealed partial class MainWindow : Window
             StillIntervalNumberBox.Value,
             1000,
             "Still interval");
-        ulong? retentionMaxBytes = ReadOptionalMebibytes(
-            RetentionMaxMiBNumberBox.Value,
-            "Managed image limit");
-        ulong? retentionMinFreeBytes = ReadOptionalMebibytes(
-            RetentionMinFreeMiBNumberBox.Value,
-            "Minimum disk free");
+        bool retentionEditingSupported =
+            _latestAgentStatus?.HasCapability(
+                AgentPipeClient.StorageRetentionCapability) == true;
+        // A legacy agent may return an existing value without advertising
+        // retention editing. Preserve that exact value, but never synthesize
+        // or change one unless the explicit capability is present.
+        ulong? retentionMaxBytes = retentionEditingSupported
+            ? ReadOptionalMebibytes(
+                RetentionMaxMiBNumberBox.Value,
+                "Managed image limit")
+            : original.Capture.RetentionMaxBytes;
+        ulong? retentionMinFreeBytes = retentionEditingSupported
+            ? ReadOptionalMebibytes(
+                RetentionMinFreeMiBNumberBox.Value,
+                "Minimum disk free")
+            : original.Capture.RetentionMinFreeBytes;
 
         if (maxExposureUs < original.Camera.MinExposureUs)
         {
@@ -984,10 +1030,14 @@ public sealed partial class MainWindow : Window
             $"Rust agent: connected · {PipeDisplayName}";
         _latestAgentStatus = status;
         UpdateOutboxControlAvailability();
+        UpdateRetentionControlAvailability();
         bool? uploadEnabled = _configurationNeedsRefresh
             ? null
             : _configurationSnapshot?.Config.Upload.Enabled;
         ApplyUploadActivity(status.Upload, uploadEnabled);
+        ApplyStorageStatus(
+            status.Storage,
+            status.HasCapability(AgentPipeClient.StorageRetentionCapability));
 
         CameraComboBox.Items.Clear();
         if (status.Camera is null)
@@ -1186,10 +1236,82 @@ public sealed partial class MainWindow : Window
         UploadLastFailureText.Visibility = Visibility.Visible;
     }
 
+    private void ApplyStorageStatus(
+        AgentStorageStatus? storage,
+        bool retentionSupported)
+    {
+        if (storage is null)
+        {
+            StorageStatusCard.Visibility = retentionSupported
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            StoragePressureText.Text = "Unavailable";
+            StorageBytesText.Text = retentionSupported
+                ? "Waiting for the first retention sweep."
+                : string.Empty;
+            StorageFreeText.Text = string.Empty;
+            StorageSweepText.Text = string.Empty;
+            StorageErrorText.Text = string.Empty;
+            StorageErrorText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        StorageStatusCard.Visibility = Visibility.Visible;
+        string pressure = storage.Pressure switch
+        {
+            "ok" => "Storage pressure: OK",
+            "cleanup_needed" => "Storage pressure: cleanup needed",
+            "blocked" => "Storage pressure: blocked",
+            _ => "Storage pressure: unknown",
+        };
+        StoragePressureText.Text = storage.CaptureSuspended
+            ? $"{pressure} · scheduled stills suspended"
+            : pressure;
+        StorageBytesText.Text =
+            $"{FormatByteSize(storage.ManagedBytes)} managed · {FormatByteSize(storage.ProtectedBytes)} protected · {FormatByteSize(storage.ReclaimableBytes)} reclaimable";
+        StorageFreeText.Text = storage.FreeBytes is ulong freeBytes
+            ? $"Capture volume free: {FormatByteSize(freeBytes)}"
+            : "Capture volume free: unavailable";
+
+        string reclaimed = storage.LastReclaimedFiles switch
+        {
+            0 => "no files reclaimed",
+            1 => $"1 file / {FormatByteSize(storage.LastReclaimedBytes)} reclaimed",
+            _ =>
+                $"{storage.LastReclaimedFiles:N0} files / {FormatByteSize(storage.LastReclaimedBytes)} reclaimed",
+        };
+        StorageSweepText.Text = storage.LastSweepUnixMs is ulong lastSweep
+            ? $"Latest sweep: {FormatUnixTimeMilliseconds(lastSweep)} · {reclaimed}"
+            : $"No completed sweep · {reclaimed}";
+
+        string? warning = string.IsNullOrWhiteSpace(storage.LastError)
+            ? storage.CaptureSuspended
+                ? "Scheduled still persistence is paused; Capture now remains available."
+                : null
+            : Compact(storage.LastError);
+        StorageErrorText.Text = warning ?? string.Empty;
+        StorageErrorText.Visibility = warning is null
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    private void ClearStorageStatus()
+    {
+        StorageStatusCard.Visibility = Visibility.Collapsed;
+        StoragePressureText.Text = "Unavailable";
+        StorageBytesText.Text = string.Empty;
+        StorageFreeText.Text = string.Empty;
+        StorageSweepText.Text = string.Empty;
+        StorageErrorText.Text = string.Empty;
+        StorageErrorText.Visibility = Visibility.Collapsed;
+    }
+
     private void ClearUploadActivity(string state, string detail)
     {
         _latestAgentStatus = null;
         UpdateOutboxControlAvailability();
+        UpdateRetentionControlAvailability();
+        ClearStorageStatus();
         SetUploadActivityUnavailable(state, detail);
     }
 
@@ -1218,13 +1340,12 @@ public sealed partial class MainWindow : Window
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
-        RetentionMaxMiBNumberBox.IsEnabled = configurationControlsEnabled;
-        RetentionMinFreeMiBNumberBox.IsEnabled = configurationControlsEnabled;
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled;
         SaveButton.IsEnabled = configurationControlsEnabled;
         UpdateOutboxControlAvailability();
+        UpdateRetentionControlAvailability();
 
         // Camera selection is descriptive in this viewer. Config replacement
         // preserves the agent's complete camera selector unchanged.
@@ -1237,10 +1358,49 @@ public sealed partial class MainWindow : Window
             _latestAgentStatus is { } status &&
             status.HasCapability(AgentPipeClient.UploadsListCapability) &&
             status.HasCapability(AgentPipeClient.UploadsRequeueCapability);
+        bool serviceAvailable = supported && _latestAgentStatus?.Upload is not null;
         ManageOutboxButton.Visibility = supported
             ? Visibility.Visible
             : Visibility.Collapsed;
-        ManageOutboxButton.IsEnabled = supported && !_operationInProgress && !_closed;
+        ManageOutboxButton.IsEnabled =
+            serviceAvailable && !_operationInProgress && !_closed;
+        OutboxAvailabilityText.Visibility = supported && !serviceAvailable
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        ToolTipService.SetToolTip(
+            ManageOutboxButton,
+            !serviceAvailable
+                ? "The upload service is not running, so its durable ledger is unavailable."
+                : _operationInProgress
+                    ? "Wait for the current Viewer operation to finish."
+                    : "Inspect and safely requeue durable upload jobs.");
+    }
+
+    private void UpdateRetentionControlAvailability()
+    {
+        bool settingsLoaded =
+            _configurationSnapshot is not null && !_configurationNeedsRefresh;
+        bool supported =
+            _latestAgentStatus?.HasCapability(
+                AgentPipeClient.StorageRetentionCapability) == true;
+        bool editingEnabled =
+            settingsLoaded && supported && !_operationInProgress && !_closed;
+        RetentionMaxMiBNumberBox.IsEnabled = editingEnabled;
+        RetentionMinFreeMiBNumberBox.IsEnabled = editingEnabled;
+
+        bool showReadOnlyReason = settingsLoaded && !supported;
+        RetentionSettingsAvailabilityText.Visibility = showReadOnlyReason
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        if (showReadOnlyReason)
+        {
+            bool hasExistingLimit =
+                _configurationSnapshot?.Config.Capture.RetentionMaxBytes is not null ||
+                _configurationSnapshot?.Config.Capture.RetentionMinFreeBytes is not null;
+            RetentionSettingsAvailabilityText.Text = hasExistingLimit
+                ? "This agent does not advertise retention editing. Loaded limits are read-only and will be preserved unchanged."
+                : "Retention limits require an agent that advertises storage.retention; blank values will not be sent to this agent.";
+        }
     }
 
     private static long ReadScaledInt64(double value, double scale, string fieldName)

@@ -8,6 +8,7 @@ namespace AutoPierCam.Viewer;
 internal sealed class AgentPipeClient : IAsyncDisposable
 {
     internal const string DefaultPipeName = "autopiercam-control-v1";
+    internal const string StorageRetentionCapability = "storage.retention";
     internal const string UploadsListCapability = "uploads.list";
     internal const string UploadsRequeueCapability = "uploads.requeue";
     private const int ProtocolVersion = 1;
@@ -74,6 +75,8 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         {
             throw new AgentProtocolException("status.get returned an invalid capabilities list.");
         }
+
+        status.Storage?.Validate();
 
         return status;
     }
@@ -608,19 +611,14 @@ internal sealed record UploadJobSummary
     internal void Validate(string method)
     {
         bool knownState = AgentPipeClient.IsKnownUploadState(State);
-        bool historyTimestampsValid =
-            UpdatedAtUnixMs >= CreatedAtUnixMs &&
-            IsHistoryTimestampValid(CompletedAtUnixMs) &&
-            IsHistoryTimestampValid(LastFailureAtUnixMs) &&
-            IsHistoryTimestampValid(LastRequeuedAtUnixMs);
+        // Audit timestamps use the system wall clock, which may move backward.
+        // Validate presence/state relationships, never chronological ordering.
         if (JobId == 0 ||
             JobRevision == 0 ||
             string.IsNullOrWhiteSpace(Filename) ||
             Filename.IndexOfAny(['/', '\\']) >= 0 ||
             !knownState ||
-            !historyTimestampsValid ||
             (State == "retrying") != NextAttemptAtUnixMs.HasValue ||
-            NextAttemptAtUnixMs is ulong nextAttempt && nextAttempt < UpdatedAtUnixMs ||
             (State == "completed") != CompletedAtUnixMs.HasValue ||
             (RequeueCount > 0) != LastRequeuedAtUnixMs.HasValue ||
             RequeueEligible && State != "permanently_failed" ||
@@ -628,14 +626,6 @@ internal sealed record UploadJobSummary
              (httpStatus < 100 || httpStatus > 599)))
         {
             throw new AgentProtocolException($"{method} returned an invalid upload job.");
-        }
-
-        return;
-
-        bool IsHistoryTimestampValid(ulong? timestamp)
-        {
-            return timestamp is null ||
-                   timestamp >= CreatedAtUnixMs && timestamp <= UpdatedAtUnixMs;
         }
     }
 }
@@ -823,9 +813,11 @@ internal sealed record AgentCaptureConfiguration
     public uint RetentionDays { get; init; }
 
     [JsonPropertyName("retention_max_bytes")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ulong? RetentionMaxBytes { get; init; }
 
     [JsonPropertyName("retention_min_free_bytes")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ulong? RetentionMinFreeBytes { get; init; }
 }
 
@@ -894,12 +886,64 @@ internal sealed record AgentStatus
     [JsonPropertyName("upload")]
     public AgentUploadStatus? Upload { get; init; }
 
+    [JsonPropertyName("storage")]
+    public AgentStorageStatus? Storage { get; init; }
+
     [JsonPropertyName("capabilities")]
     public IReadOnlyList<string> Capabilities { get; init; } = Array.Empty<string>();
 
     internal bool HasCapability(string capability)
     {
         return Capabilities.Contains(capability, StringComparer.Ordinal);
+    }
+}
+
+internal sealed record AgentStorageStatus
+{
+    [JsonPropertyName("managed_bytes")]
+    [JsonRequired]
+    public ulong ManagedBytes { get; init; }
+
+    [JsonPropertyName("protected_bytes")]
+    [JsonRequired]
+    public ulong ProtectedBytes { get; init; }
+
+    [JsonPropertyName("reclaimable_bytes")]
+    [JsonRequired]
+    public ulong ReclaimableBytes { get; init; }
+
+    [JsonPropertyName("free_bytes")]
+    public ulong? FreeBytes { get; init; }
+
+    [JsonPropertyName("last_sweep_unix_ms")]
+    public ulong? LastSweepUnixMs { get; init; }
+
+    [JsonPropertyName("last_reclaimed_files")]
+    [JsonRequired]
+    public ulong LastReclaimedFiles { get; init; }
+
+    [JsonPropertyName("last_reclaimed_bytes")]
+    [JsonRequired]
+    public ulong LastReclaimedBytes { get; init; }
+
+    [JsonPropertyName("pressure")]
+    [JsonRequired]
+    public string Pressure { get; init; } = string.Empty;
+
+    [JsonPropertyName("capture_suspended")]
+    [JsonRequired]
+    public bool CaptureSuspended { get; init; }
+
+    [JsonPropertyName("last_error")]
+    public string? LastError { get; init; }
+
+    internal void Validate()
+    {
+        if (Pressure is not ("ok" or "cleanup_needed" or "blocked"))
+        {
+            throw new AgentProtocolException(
+                "status.get returned an unknown storage pressure state.");
+        }
     }
 }
 
@@ -1018,6 +1062,9 @@ internal sealed class AgentRequestException : AgentClientException
 
     internal bool IsSavedWithoutRestart =>
         string.Equals(Code, "config_saved_agent_stopped", StringComparison.Ordinal);
+
+    internal bool IsStaleUploadCursor =>
+        string.Equals(Code, "stale_upload_cursor", StringComparison.Ordinal);
 
     internal static AgentRequestException FromJson(JsonElement error)
     {
