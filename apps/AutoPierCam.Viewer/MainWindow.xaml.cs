@@ -14,7 +14,7 @@ public sealed partial class MainWindow : Window
     private static readonly string[] ManagedOutboxStates =
         ["permanently_failed", "retrying", "pending"];
     private const double BytesPerMebibyte = 1024d * 1024d;
-    private const ushort OutboxPageSize = 50;
+    private const ushort OutboxPageSize = 100;
 
     private readonly AgentPipeClient _agentClient = new();
     private readonly PreviewPipeClient _previewClient = new();
@@ -421,6 +421,28 @@ public sealed partial class MainWindow : Window
         string? notice = null;
         InfoBarSeverity noticeSeverity = InfoBarSeverity.Informational;
 
+        async Task<Exception?> TryRefreshFirstPageAsync()
+        {
+            // A refresh never depends on the old cursor. Clear it before I/O
+            // so a failed refresh cannot leave a known-stale action enabled.
+            nextCursor = null;
+            try
+            {
+                UploadListResult refreshed = await _agentClient.ListUploadsAsync(
+                    ManagedOutboxStates,
+                    OutboxPageSize,
+                    cancellationToken: cancellationToken);
+                ledgerId = refreshed.LedgerId;
+                jobs = refreshed.Jobs.ToList();
+                nextCursor = refreshed.NextCursor;
+                return null;
+            }
+            catch (Exception exception)
+            {
+                return exception;
+            }
+        }
+
         while (!cancellationToken.IsCancellationRequested)
         {
             var dialog = new ContentDialog
@@ -596,28 +618,22 @@ public sealed partial class MainWindow : Window
                 {
                     // Every ledger mutation invalidates pagination. Never keep
                     // offering a cursor the agent has already rejected.
-                    nextCursor = null;
-                    try
+                    Exception? refreshFailure = await TryRefreshFirstPageAsync();
+                    if (refreshFailure is null)
                     {
-                        UploadListResult refreshed = await _agentClient.ListUploadsAsync(
-                            ManagedOutboxStates,
-                            OutboxPageSize,
-                            cancellationToken: cancellationToken);
-                        ledgerId = refreshed.LedgerId;
-                        jobs = refreshed.Jobs.ToList();
-                        nextCursor = refreshed.NextCursor;
                         messageBar.Message =
                             "The outbox changed while pages were loading. Refreshed from the newest jobs.";
                         messageBar.Severity = InfoBarSeverity.Warning;
                         messageBar.IsOpen = true;
                     }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    else if (refreshFailure is OperationCanceledException &&
+                             cancellationToken.IsCancellationRequested)
                     {
                         dialog.Hide();
                     }
-                    catch (Exception refreshException)
+                    else
                     {
-                        ShowInlineError(refreshException);
+                        ShowInlineError(refreshFailure);
                     }
                 }
                 catch (Exception exception)
@@ -659,39 +675,53 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
+            UploadRequeueResult requeue;
             try
             {
-                UploadRequeueResult requeue = await _agentClient.RequeueUploadAsync(
+                requeue = await _agentClient.RequeueUploadAsync(
                     ledgerId,
                     selectedJob.JobId,
                     selectedJob.JobRevision,
                     cancellationToken);
-                UploadListResult refreshed = await _agentClient.ListUploadsAsync(
-                    ManagedOutboxStates,
-                    OutboxPageSize,
-                    cancellationToken: cancellationToken);
-                ledgerId = refreshed.LedgerId;
-                jobs = refreshed.Jobs.ToList();
-                nextCursor = refreshed.NextCursor;
-
-                notice = requeue.WorkerNotified
-                    ? $"{requeue.Job.Filename} was safely requeued and the uploader was notified."
-                    : $"{requeue.Job.Filename} was safely requeued. The durable job will resume when the upload worker is available.";
-                noticeSeverity = requeue.WorkerNotified
-                    ? InfoBarSeverity.Success
-                    : InfoBarSeverity.Warning;
             }
             catch (AgentRequestException exception)
             {
                 notice = FormatAgentError(exception);
                 noticeSeverity = InfoBarSeverity.Error;
-                UploadListResult refreshed = await _agentClient.ListUploadsAsync(
-                    ManagedOutboxStates,
-                    OutboxPageSize,
-                    cancellationToken: cancellationToken);
-                ledgerId = refreshed.LedgerId;
-                jobs = refreshed.Jobs.ToList();
-                nextCursor = refreshed.NextCursor;
+                Exception? refreshFailure = await TryRefreshFirstPageAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (refreshFailure is not null)
+                {
+                    // The rejection is still the primary outcome. Drop rows
+                    // whose revisions could now be stale and preserve both
+                    // messages for the operator.
+                    jobs.Clear();
+                    notice +=
+                        $" The outbox list also could not refresh: {FormatOutboxError(refreshFailure)}";
+                }
+
+                continue;
+            }
+
+            notice = requeue.WorkerNotified
+                ? $"{requeue.Job.Filename} was safely requeued and the uploader was notified."
+                : $"{requeue.Job.Filename} was safely requeued. The durable job will resume when the upload worker is available.";
+            noticeSeverity = requeue.WorkerNotified
+                ? InfoBarSeverity.Success
+                : InfoBarSeverity.Warning;
+
+            // The accepted mutation invalidates every old cursor. Keep the
+            // confirmed job as a safe non-actionable fallback if refreshing
+            // the rest of the list fails.
+            jobs = [requeue.Job];
+            Exception? postRequeueRefreshFailure = await TryRefreshFirstPageAsync();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (postRequeueRefreshFailure is not null)
+            {
+                jobs = [requeue.Job];
+                notice +=
+                    $" The durable requeue succeeded, but the list could not refresh: {FormatOutboxError(postRequeueRefreshFailure)}";
+                noticeSeverity = InfoBarSeverity.Warning;
             }
         }
 
