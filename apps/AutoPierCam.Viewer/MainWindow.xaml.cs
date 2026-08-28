@@ -11,6 +11,10 @@ namespace AutoPierCam.Viewer;
 public sealed partial class MainWindow : Window
 {
     private static readonly TimeSpan PreviewStaleAfter = TimeSpan.FromSeconds(5);
+    private static readonly string[] ManagedOutboxStates =
+        ["permanently_failed", "retrying", "pending"];
+    private const double BytesPerMebibyte = 1024d * 1024d;
+    private const ushort OutboxPageSize = 50;
 
     private readonly AgentPipeClient _agentClient = new();
     private readonly PreviewPipeClient _previewClient = new();
@@ -331,6 +335,11 @@ public sealed partial class MainWindow : Window
         await RunUiOperationAsync("Validating and saving configuration…", SaveConfigurationAsync);
     }
 
+    private async void ManageOutboxButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiOperationAsync("Loading the durable upload outbox…", ManageOutboxAsync);
+    }
+
     private async Task RefreshStatusAndConfigurationAsync(CancellationToken cancellationToken)
     {
         // A Refresh is only complete when both documents are received. Keep
@@ -375,12 +384,382 @@ public sealed partial class MainWindow : Window
             Config = updatedConfiguration,
         };
         _latestAgentStatus = null;
+        UpdateOutboxControlAvailability();
         _configurationNeedsRefresh = false;
         ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
         ConfigInfoBar.Title = $"Configuration revision {result.Revision:N0}";
         ConfigInfoBar.Message = "Saved; a camera restart was scheduled.";
         ConfigInfoBar.Severity = InfoBarSeverity.Success;
         StatusText.Text = $"Configuration revision {result.Revision:N0} saved; camera restart scheduled.";
+    }
+
+    private async Task ManageOutboxAsync(CancellationToken cancellationToken)
+    {
+        if (_latestAgentStatus is not { } status ||
+            !status.HasCapability(AgentPipeClient.UploadsListCapability) ||
+            !status.HasCapability(AgentPipeClient.UploadsRequeueCapability))
+        {
+            throw new UserInputException(
+                "This capture agent does not advertise durable outbox management. Refresh after upgrading or restarting the agent.");
+        }
+
+        UploadListResult page = await _agentClient.ListUploadsAsync(
+            ManagedOutboxStates,
+            OutboxPageSize,
+            cancellationToken: cancellationToken);
+        string ledgerId = page.LedgerId;
+        string? nextCursor = page.NextCursor;
+        var jobs = page.Jobs.ToList();
+        string? notice = null;
+        InfoBarSeverity noticeSeverity = InfoBarSeverity.Informational;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var dialog = new ContentDialog
+            {
+                XamlRoot = Content.XamlRoot,
+                Title = "Durable upload outbox",
+                PrimaryButtonText = "Requeue selected",
+                CloseButtonText = "Close",
+                DefaultButton = ContentDialogButton.Close,
+                IsPrimaryButtonEnabled = false,
+            };
+            var content = new StackPanel
+            {
+                Width = 620,
+                Spacing = 10,
+            };
+            content.Children.Add(new TextBlock
+            {
+                Text = "Pending and retrying jobs are shown for context. Only permanently failed jobs whose exact artifact still verifies can be requeued.",
+                TextWrapping = TextWrapping.Wrap,
+            });
+
+            var messageBar = new InfoBar
+            {
+                IsClosable = false,
+                IsOpen = notice is not null,
+                Message = notice ?? string.Empty,
+                Severity = noticeSeverity,
+            };
+            content.Children.Add(messageBar);
+
+            var toolbar = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+            };
+            var refreshButton = new Button { Content = "Refresh" };
+            var loadMoreButton = new Button { Content = "Load more" };
+            var pageSummary = new TextBlock
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            toolbar.Children.Add(refreshButton);
+            toolbar.Children.Add(loadMoreButton);
+            toolbar.Children.Add(pageSummary);
+            content.Children.Add(toolbar);
+
+            var jobList = new ListView
+            {
+                MaxHeight = 420,
+                SelectionMode = ListViewSelectionMode.Single,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            };
+            content.Children.Add(jobList);
+            dialog.Content = content;
+
+            bool loading = false;
+
+            void UpdateDialogActions()
+            {
+                loadMoreButton.Visibility = nextCursor is null
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+                loadMoreButton.IsEnabled = !loading && nextCursor is not null;
+                refreshButton.IsEnabled = !loading;
+                jobList.IsEnabled = !loading;
+                dialog.IsPrimaryButtonEnabled =
+                    !loading &&
+                    jobList.SelectedItem is ListViewItem
+                    {
+                        Tag: UploadJobSummary { RequeueEligible: true },
+                    };
+            }
+
+            void RenderJobs()
+            {
+                jobList.Items.Clear();
+                foreach (UploadJobSummary job in jobs)
+                {
+                    jobList.Items.Add(new ListViewItem
+                    {
+                        Content = CreateUploadJobRow(job),
+                        HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                        IsEnabled = job.RequeueEligible,
+                        Tag = job,
+                    });
+                }
+
+                pageSummary.Text = jobs.Count switch
+                {
+                    0 => "No pending, retrying, or permanently failed jobs",
+                    1 => "1 job loaded",
+                    _ => $"{jobs.Count:N0} jobs loaded",
+                };
+                UpdateDialogActions();
+            }
+
+            void ShowInlineError(Exception exception)
+            {
+                messageBar.Message = FormatOutboxError(exception);
+                messageBar.Severity = InfoBarSeverity.Error;
+                messageBar.IsOpen = true;
+            }
+
+            jobList.SelectionChanged += (_, _) => UpdateDialogActions();
+            refreshButton.Click += async (_, _) =>
+            {
+                if (loading)
+                {
+                    return;
+                }
+
+                loading = true;
+                RenderJobs();
+                try
+                {
+                    UploadListResult refreshed = await _agentClient.ListUploadsAsync(
+                        ManagedOutboxStates,
+                        OutboxPageSize,
+                        cancellationToken: cancellationToken);
+                    ledgerId = refreshed.LedgerId;
+                    jobs = refreshed.Jobs.ToList();
+                    nextCursor = refreshed.NextCursor;
+                    messageBar.IsOpen = false;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    dialog.Hide();
+                }
+                catch (Exception exception)
+                {
+                    ShowInlineError(exception);
+                }
+                finally
+                {
+                    loading = false;
+                    RenderJobs();
+                }
+            };
+            loadMoreButton.Click += async (_, _) =>
+            {
+                if (loading || nextCursor is null)
+                {
+                    return;
+                }
+
+                loading = true;
+                RenderJobs();
+                try
+                {
+                    UploadListResult continuation = await _agentClient.ListUploadsAsync(
+                        ManagedOutboxStates,
+                        OutboxPageSize,
+                        nextCursor,
+                        cancellationToken);
+                    if (!string.Equals(ledgerId, continuation.LedgerId, StringComparison.Ordinal))
+                    {
+                        throw new AgentProtocolException(
+                            "uploads.list changed ledger identifiers within one paginated result.");
+                    }
+
+                    var knownJobIds = jobs.Select(job => job.JobId).ToHashSet();
+                    jobs.AddRange(
+                        continuation.Jobs.Where(job => knownJobIds.Add(job.JobId)));
+                    nextCursor = continuation.NextCursor;
+                    messageBar.IsOpen = false;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    dialog.Hide();
+                }
+                catch (Exception exception)
+                {
+                    ShowInlineError(exception);
+                }
+                finally
+                {
+                    loading = false;
+                    RenderJobs();
+                }
+            };
+
+            RenderJobs();
+            ContentDialogResult action = await dialog.ShowAsync();
+            if (action is not ContentDialogResult.Primary ||
+                jobList.SelectedItem is not ListViewItem { Tag: UploadJobSummary selectedJob })
+            {
+                break;
+            }
+
+            var confirmation = new ContentDialog
+            {
+                XamlRoot = Content.XamlRoot,
+                Title = "Requeue this upload?",
+                Content = new TextBlock
+                {
+                    Text =
+                        $"{selectedJob.Filename}\n\nThe agent will verify the exact file size, digest, ledger identity, delivery binding, state, and revision before making it pending again.",
+                    TextWrapping = TextWrapping.Wrap,
+                },
+                PrimaryButtonText = "Requeue",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await confirmation.ShowAsync() is not ContentDialogResult.Primary)
+            {
+                notice = null;
+                continue;
+            }
+
+            try
+            {
+                UploadRequeueResult requeue = await _agentClient.RequeueUploadAsync(
+                    ledgerId,
+                    selectedJob.JobId,
+                    selectedJob.JobRevision,
+                    cancellationToken);
+                UploadListResult refreshed = await _agentClient.ListUploadsAsync(
+                    ManagedOutboxStates,
+                    OutboxPageSize,
+                    cancellationToken: cancellationToken);
+                ledgerId = refreshed.LedgerId;
+                jobs = refreshed.Jobs.ToList();
+                nextCursor = refreshed.NextCursor;
+
+                notice = requeue.WorkerNotified
+                    ? $"{requeue.Job.Filename} was safely requeued and the uploader was notified."
+                    : $"{requeue.Job.Filename} was safely requeued. The durable job will resume when the upload worker is available.";
+                noticeSeverity = requeue.WorkerNotified
+                    ? InfoBarSeverity.Success
+                    : InfoBarSeverity.Warning;
+            }
+            catch (AgentRequestException exception)
+            {
+                notice = FormatAgentError(exception);
+                noticeSeverity = InfoBarSeverity.Error;
+                UploadListResult refreshed = await _agentClient.ListUploadsAsync(
+                    ManagedOutboxStates,
+                    OutboxPageSize,
+                    cancellationToken: cancellationToken);
+                ledgerId = refreshed.LedgerId;
+                jobs = refreshed.Jobs.ToList();
+                nextCursor = refreshed.NextCursor;
+            }
+        }
+
+        if (!cancellationToken.IsCancellationRequested)
+        {
+            ApplyStatus(await _agentClient.GetStatusAsync(cancellationToken));
+        }
+    }
+
+    private static FrameworkElement CreateUploadJobRow(UploadJobSummary job)
+    {
+        var row = new StackPanel
+        {
+            Padding = new Thickness(2, 8, 2, 8),
+            Spacing = 3,
+        };
+        row.Children.Add(new TextBlock
+        {
+            Text = job.Filename,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            TextWrapping = TextWrapping.NoWrap,
+        });
+
+        string retry = job.NextAttemptAtUnixMs is ulong nextAttempt
+            ? $" · next {FormatUnixTimeMilliseconds(nextAttempt)}"
+            : string.Empty;
+        row.Children.Add(new TextBlock
+        {
+            Text =
+                $"{FormatUploadState(job.State)} · {FormatByteSize(job.FileSizeBytes)} · {job.AttemptCount:N0} attempts · {job.RequeueCount:N0} requeues{retry}",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        string updated = FormatUnixTimeMilliseconds(job.UpdatedAtUnixMs);
+        string eligibility = job switch
+        {
+            { RequeueEligible: true } => "Select this row to requeue",
+            { State: "permanently_failed" } => "Not eligible for requeue",
+            _ => "Managed automatically by the uploader",
+        };
+        row.Children.Add(new TextBlock
+        {
+            Text = $"Updated {updated} · {eligibility}",
+            FontSize = 12,
+            Opacity = 0.72,
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        if (!string.IsNullOrWhiteSpace(job.LastError))
+        {
+            string status = job.LastHttpStatus is ushort httpStatus
+                ? $"HTTP {httpStatus}: "
+                : string.Empty;
+            row.Children.Add(new TextBlock
+            {
+                Text = status + Compact(job.LastError),
+                FontSize = 12,
+                Opacity = 0.72,
+                TextWrapping = TextWrapping.Wrap,
+            });
+        }
+
+        return row;
+    }
+
+    private static string FormatOutboxError(Exception exception)
+    {
+        return exception switch
+        {
+            AgentRequestException request => FormatAgentError(request),
+            AgentTimeoutException timeout =>
+                $"The request timed out and may still complete. Close the outbox and refresh before retrying: {Compact(timeout.Message)}",
+            AgentClientException client => Compact(client.Message),
+            _ => $"Could not load the upload outbox: {Compact(exception.Message)}",
+        };
+    }
+
+    private static string FormatUploadState(string state)
+    {
+        return state switch
+        {
+            "pending" => "Pending",
+            "in_progress" => "In progress",
+            "retrying" => "Retrying",
+            "completed" => "Completed",
+            "permanently_failed" => "Permanently failed",
+            _ => Compact(state),
+        };
+    }
+
+    private static string FormatByteSize(ulong bytes)
+    {
+        const double kib = 1024d;
+        const double mib = kib * 1024d;
+        const double gib = mib * 1024d;
+        return bytes switch
+        {
+            >= 1024UL * 1024UL * 1024UL => $"{bytes / gib:0.##} GiB",
+            >= 1024UL * 1024UL => $"{bytes / mib:0.##} MiB",
+            >= 1024UL => $"{bytes / kib:0.##} KiB",
+            _ => $"{bytes:N0} bytes",
+        };
     }
 
     private async Task RunUiOperationAsync(
@@ -470,6 +849,13 @@ public sealed partial class MainWindow : Window
         MaxExposureNumberBox.Value = maxExposureMs;
         MaxGainNumberBox.Value = configuration.Camera.MaxGain;
         StillIntervalNumberBox.Value = stillIntervalSeconds;
+        RetentionMaxMiBNumberBox.Value = configuration.Capture.RetentionMaxBytes is ulong maxBytes
+            ? maxBytes / BytesPerMebibyte
+            : double.NaN;
+        RetentionMinFreeMiBNumberBox.Value =
+            configuration.Capture.RetentionMinFreeBytes is ulong minFreeBytes
+                ? minFreeBytes / BytesPerMebibyte
+                : double.NaN;
         UploadEnabledToggle.IsOn = configuration.Upload.Enabled;
         UploadEndpointTextBox.Text = configuration.Upload.Endpoint ?? string.Empty;
         VideoEnabledToggle.IsOn = configuration.Video.Enabled;
@@ -494,6 +880,12 @@ public sealed partial class MainWindow : Window
             StillIntervalNumberBox.Value,
             1000,
             "Still interval");
+        ulong? retentionMaxBytes = ReadOptionalMebibytes(
+            RetentionMaxMiBNumberBox.Value,
+            "Managed image limit");
+        ulong? retentionMinFreeBytes = ReadOptionalMebibytes(
+            RetentionMinFreeMiBNumberBox.Value,
+            "Minimum disk free");
 
         if (maxExposureUs < original.Camera.MinExposureUs)
         {
@@ -549,6 +941,8 @@ public sealed partial class MainWindow : Window
             Capture = original.Capture with
             {
                 IntervalMs = intervalMs,
+                RetentionMaxBytes = retentionMaxBytes,
+                RetentionMinFreeBytes = retentionMinFreeBytes,
             },
             Upload = original.Upload with
             {
@@ -589,6 +983,7 @@ public sealed partial class MainWindow : Window
         AgentConnectionText.Text =
             $"Rust agent: connected · {PipeDisplayName}";
         _latestAgentStatus = status;
+        UpdateOutboxControlAvailability();
         bool? uploadEnabled = _configurationNeedsRefresh
             ? null
             : _configurationSnapshot?.Config.Upload.Enabled;
@@ -794,6 +1189,7 @@ public sealed partial class MainWindow : Window
     private void ClearUploadActivity(string state, string detail)
     {
         _latestAgentStatus = null;
+        UpdateOutboxControlAvailability();
         SetUploadActivityUnavailable(state, detail);
     }
 
@@ -822,14 +1218,29 @@ public sealed partial class MainWindow : Window
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
+        RetentionMaxMiBNumberBox.IsEnabled = configurationControlsEnabled;
+        RetentionMinFreeMiBNumberBox.IsEnabled = configurationControlsEnabled;
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled;
         SaveButton.IsEnabled = configurationControlsEnabled;
+        UpdateOutboxControlAvailability();
 
         // Camera selection is descriptive in this viewer. Config replacement
         // preserves the agent's complete camera selector unchanged.
         CameraComboBox.IsEnabled = false;
+    }
+
+    private void UpdateOutboxControlAvailability()
+    {
+        bool supported =
+            _latestAgentStatus is { } status &&
+            status.HasCapability(AgentPipeClient.UploadsListCapability) &&
+            status.HasCapability(AgentPipeClient.UploadsRequeueCapability);
+        ManageOutboxButton.Visibility = supported
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        ManageOutboxButton.IsEnabled = supported && !_operationInProgress && !_closed;
     }
 
     private static long ReadScaledInt64(double value, double scale, string fieldName)
@@ -878,6 +1289,22 @@ public sealed partial class MainWindow : Window
         }
 
         return (ulong)rounded;
+    }
+
+    private static ulong? ReadOptionalMebibytes(double value, string fieldName)
+    {
+        if (double.IsNaN(value))
+        {
+            return null;
+        }
+
+        ulong bytes = ReadScaledUInt64(value, BytesPerMebibyte, fieldName);
+        if (bytes == 0)
+        {
+            throw new UserInputException($"{fieldName} must be greater than zero or left blank.");
+        }
+
+        return bytes;
     }
 
     private static string? NormalizeOptionalText(string value)

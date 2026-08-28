@@ -8,8 +8,18 @@ namespace AutoPierCam.Viewer;
 internal sealed class AgentPipeClient : IAsyncDisposable
 {
     internal const string DefaultPipeName = "autopiercam-control-v1";
+    internal const string UploadsListCapability = "uploads.list";
+    internal const string UploadsRequeueCapability = "uploads.requeue";
     private const int ProtocolVersion = 1;
     private const int MaxMessageBytes = 1024 * 1024;
+    private static readonly HashSet<string> KnownUploadStates = new(StringComparer.Ordinal)
+    {
+        "pending",
+        "in_progress",
+        "retrying",
+        "completed",
+        "permanently_failed",
+    };
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -59,7 +69,87 @@ internal sealed class AgentPipeClient : IAsyncDisposable
             throw new AgentProtocolException("status.get returned a camera without a name.");
         }
 
+        if (status.Capabilities is null ||
+            status.Capabilities.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new AgentProtocolException("status.get returned an invalid capabilities list.");
+        }
+
         return status;
+    }
+
+    internal async Task<UploadListResult> ListUploadsAsync(
+        IReadOnlyList<string> states,
+        ushort pageSize,
+        string? cursor = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(states);
+        if (pageSize is < 1 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(pageSize),
+                "Upload page size must be between 1 and 100.");
+        }
+
+        if (states.Count == 0 ||
+            states.Any(state => !KnownUploadStates.Contains(state)) ||
+            states.Distinct(StringComparer.Ordinal).Count() != states.Count)
+        {
+            throw new ArgumentException(
+                "At least one non-empty upload state is required.",
+                nameof(states));
+        }
+
+        if (cursor is not null && string.IsNullOrWhiteSpace(cursor))
+        {
+            throw new ArgumentException("Upload cursor cannot be empty.", nameof(cursor));
+        }
+
+        JsonElement result = await RequestAsync(
+                UploadsListCapability,
+                new UploadListRequest(states, pageSize, cursor),
+                cancellationToken)
+            .ConfigureAwait(false);
+        UploadListResult page = DeserializeResult<UploadListResult>(result, UploadsListCapability);
+        page.Validate();
+        return page;
+    }
+
+    internal async Task<UploadRequeueResult> RequeueUploadAsync(
+        string ledgerId,
+        ulong jobId,
+        ulong expectedJobRevision,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ledgerId);
+        if (jobId == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(jobId));
+        }
+
+        if (expectedJobRevision == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedJobRevision));
+        }
+
+        JsonElement result = await RequestAsync(
+                UploadsRequeueCapability,
+                new UploadRequeueRequest(ledgerId, jobId, expectedJobRevision),
+                cancellationToken)
+            .ConfigureAwait(false);
+        UploadRequeueResult requeue =
+            DeserializeResult<UploadRequeueResult>(result, UploadsRequeueCapability);
+        requeue.Validate();
+        if (requeue.Job.JobId != jobId ||
+            requeue.Job.JobRevision <= expectedJobRevision ||
+            !string.Equals(requeue.Job.State, "pending", StringComparison.Ordinal) ||
+            requeue.Job.RequeueEligible)
+        {
+            throw new AgentProtocolException(
+                "uploads.requeue returned a job that does not match the accepted requeue transition.");
+        }
+        return requeue;
     }
 
     internal async Task CaptureNowAsync(CancellationToken cancellationToken = default)
@@ -321,6 +411,11 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         }
     }
 
+    internal static bool IsKnownUploadState(string state)
+    {
+        return KnownUploadStates.Contains(state);
+    }
+
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -376,6 +471,173 @@ internal sealed record AgentConfigurationReplaceResult
     [JsonPropertyName("restart_scheduled")]
     [JsonRequired]
     public bool RestartScheduled { get; init; }
+}
+
+internal sealed record UploadListRequest(
+    [property: JsonPropertyName("states")] IReadOnlyList<string> States,
+    [property: JsonPropertyName("page_size")] ushort PageSize,
+    [property: JsonPropertyName("cursor"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string? Cursor);
+
+internal sealed record UploadListResult
+{
+    [JsonPropertyName("ledger_id")]
+    [JsonRequired]
+    public string LedgerId { get; init; } = string.Empty;
+
+    [JsonPropertyName("jobs")]
+    [JsonRequired]
+    public IReadOnlyList<UploadJobSummary> Jobs { get; init; } = null!;
+
+    [JsonPropertyName("next_cursor")]
+    public string? NextCursor { get; init; }
+
+    internal void Validate()
+    {
+        if (string.IsNullOrWhiteSpace(LedgerId) || Jobs is null)
+        {
+            throw new AgentProtocolException(
+                "uploads.list returned an invalid ledger identifier or jobs list.");
+        }
+
+        if (NextCursor is not null && string.IsNullOrWhiteSpace(NextCursor))
+        {
+            throw new AgentProtocolException("uploads.list returned an empty continuation cursor.");
+        }
+
+
+        if (Jobs.Count > 100 || Jobs.Select(job => job.JobId).Distinct().Count() != Jobs.Count)
+        {
+            throw new AgentProtocolException(
+                "uploads.list returned too many jobs or duplicate job identifiers.");
+        }
+
+        foreach (UploadJobSummary job in Jobs)
+        {
+            job.Validate("uploads.list");
+        }
+    }
+}
+
+internal sealed record UploadRequeueRequest(
+    [property: JsonPropertyName("ledger_id")] string LedgerId,
+    [property: JsonPropertyName("job_id")] ulong JobId,
+    [property: JsonPropertyName("expected_job_revision")] ulong ExpectedJobRevision);
+
+internal sealed record UploadRequeueResult
+{
+    [JsonPropertyName("job")]
+    [JsonRequired]
+    public UploadJobSummary Job { get; init; } = null!;
+
+    [JsonPropertyName("worker_notified")]
+    [JsonRequired]
+    public bool WorkerNotified { get; init; }
+
+    internal void Validate()
+    {
+        if (Job is null)
+        {
+            throw new AgentProtocolException("uploads.requeue returned no upload job.");
+        }
+
+        Job.Validate("uploads.requeue");
+    }
+}
+
+internal sealed record UploadJobSummary
+{
+    [JsonPropertyName("job_id")]
+    [JsonRequired]
+    public ulong JobId { get; init; }
+
+    [JsonPropertyName("job_revision")]
+    [JsonRequired]
+    public ulong JobRevision { get; init; }
+
+    [JsonPropertyName("filename")]
+    [JsonRequired]
+    public string Filename { get; init; } = string.Empty;
+
+    [JsonPropertyName("state")]
+    [JsonRequired]
+    public string State { get; init; } = string.Empty;
+
+    [JsonPropertyName("file_size_bytes")]
+    [JsonRequired]
+    public ulong FileSizeBytes { get; init; }
+
+    [JsonPropertyName("attempt_count")]
+    [JsonRequired]
+    public ulong AttemptCount { get; init; }
+
+    [JsonPropertyName("requeue_count")]
+    [JsonRequired]
+    public ulong RequeueCount { get; init; }
+
+    [JsonPropertyName("created_at_unix_ms")]
+    [JsonRequired]
+    public ulong CreatedAtUnixMs { get; init; }
+
+    [JsonPropertyName("updated_at_unix_ms")]
+    [JsonRequired]
+    public ulong UpdatedAtUnixMs { get; init; }
+
+    [JsonPropertyName("next_attempt_at_unix_ms")]
+    public ulong? NextAttemptAtUnixMs { get; init; }
+
+    [JsonPropertyName("completed_at_unix_ms")]
+    public ulong? CompletedAtUnixMs { get; init; }
+
+    [JsonPropertyName("last_failure_at_unix_ms")]
+    public ulong? LastFailureAtUnixMs { get; init; }
+
+    [JsonPropertyName("last_requeued_at_unix_ms")]
+    public ulong? LastRequeuedAtUnixMs { get; init; }
+
+    [JsonPropertyName("last_http_status")]
+    public ushort? LastHttpStatus { get; init; }
+
+    [JsonPropertyName("last_error")]
+    public string? LastError { get; init; }
+
+    [JsonPropertyName("requeue_eligible")]
+    [JsonRequired]
+    public bool RequeueEligible { get; init; }
+
+    internal void Validate(string method)
+    {
+        bool knownState = AgentPipeClient.IsKnownUploadState(State);
+        bool historyTimestampsValid =
+            UpdatedAtUnixMs >= CreatedAtUnixMs &&
+            IsHistoryTimestampValid(CompletedAtUnixMs) &&
+            IsHistoryTimestampValid(LastFailureAtUnixMs) &&
+            IsHistoryTimestampValid(LastRequeuedAtUnixMs);
+        if (JobId == 0 ||
+            JobRevision == 0 ||
+            string.IsNullOrWhiteSpace(Filename) ||
+            Filename.IndexOfAny(['/', '\\']) >= 0 ||
+            !knownState ||
+            !historyTimestampsValid ||
+            (State == "retrying") != NextAttemptAtUnixMs.HasValue ||
+            NextAttemptAtUnixMs is ulong nextAttempt && nextAttempt < UpdatedAtUnixMs ||
+            (State == "completed") != CompletedAtUnixMs.HasValue ||
+            (RequeueCount > 0) != LastRequeuedAtUnixMs.HasValue ||
+            RequeueEligible && State != "permanently_failed" ||
+            (LastHttpStatus is ushort httpStatus &&
+             (httpStatus < 100 || httpStatus > 599)))
+        {
+            throw new AgentProtocolException($"{method} returned an invalid upload job.");
+        }
+
+        return;
+
+        bool IsHistoryTimestampValid(ulong? timestamp)
+        {
+            return timestamp is null ||
+                   timestamp >= CreatedAtUnixMs && timestamp <= UpdatedAtUnixMs;
+        }
+    }
 }
 
 internal sealed record AgentConfiguration
@@ -437,6 +699,12 @@ internal sealed record AgentConfiguration
         {
             throw new AgentProtocolException(
                 $"{method} returned invalid capture timing, JPEG quality, or writer capacity.");
+        }
+
+        if (Capture.RetentionMaxBytes == 0 || Capture.RetentionMinFreeBytes == 0)
+        {
+            throw new AgentProtocolException(
+                $"{method} returned a zero retention byte limit; use null to disable a limit.");
         }
 
         if (Upload.QueueCapacity == 0)
@@ -553,6 +821,12 @@ internal sealed record AgentCaptureConfiguration
     [JsonPropertyName("retention_days")]
     [JsonRequired]
     public uint RetentionDays { get; init; }
+
+    [JsonPropertyName("retention_max_bytes")]
+    public ulong? RetentionMaxBytes { get; init; }
+
+    [JsonPropertyName("retention_min_free_bytes")]
+    public ulong? RetentionMinFreeBytes { get; init; }
 }
 
 internal sealed record AgentUploadConfiguration
@@ -619,6 +893,14 @@ internal sealed record AgentStatus
 
     [JsonPropertyName("upload")]
     public AgentUploadStatus? Upload { get; init; }
+
+    [JsonPropertyName("capabilities")]
+    public IReadOnlyList<string> Capabilities { get; init; } = Array.Empty<string>();
+
+    internal bool HasCapability(string capability)
+    {
+        return Capabilities.Contains(capability, StringComparer.Ordinal);
+    }
 }
 
 internal sealed record AgentCameraStatus

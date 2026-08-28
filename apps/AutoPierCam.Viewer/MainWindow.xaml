@@ -195,10 +195,25 @@
                     </Border>
                     <Border Padding="12" Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="4">
-                            <TextBlock
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Upload activity" />
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    VerticalAlignment="Center"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Upload activity" />
+                                <Button
+                                    x:Name="ManageOutboxButton"
+                                    Grid.Column="1"
+                                    Padding="8,3"
+                                    Click="ManageOutboxButton_Click"
+                                    Content="Manage outbox"
+                                    FontSize="12"
+                                    Visibility="Collapsed" />
+                            </Grid>
                             <TextBlock
                                 x:Name="UploadActivityStateText"
                                 Text="Unavailable" />
@@ -264,6 +279,36 @@
                             SpinButtonPlacementMode="Compact"
                             Value="10" />
                     </StackPanel>
+                    <Grid ColumnSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Managed image limit" />
+                            <NumberBox
+                                x:Name="RetentionMaxMiBNumberBox"
+                                Header="MiB · blank disables"
+                                IsEnabled="False"
+                                Maximum="8796093022208"
+                                Minimum="1"
+                                PlaceholderText="Disabled"
+                                SmallChange="128"
+                                SpinButtonPlacementMode="Compact" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="6">
+                            <TextBlock Text="Minimum disk free" />
+                            <NumberBox
+                                x:Name="RetentionMinFreeMiBNumberBox"
+                                Header="MiB · blank disables"
+                                IsEnabled="False"
+                                Maximum="8796093022208"
+                                Minimum="1"
+                                PlaceholderText="Disabled"
+                                SmallChange="128"
+                                SpinButtonPlacementMode="Compact" />
+                        </StackPanel>
+                    </Grid>
                     <ToggleSwitch
                         x:Name="UploadEnabledToggle"
                         Header="HTTP upload"
