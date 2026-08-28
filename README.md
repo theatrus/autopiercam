@@ -47,6 +47,19 @@ From a 64-bit Windows Rust toolchain:
     dotnet build apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj
     dotnet run --project apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj
 
+Offline upload-ledger maintenance does not load the camera SDK. Stop the agent
+first, then migrate an exact legacy v3 ledger (or verify v4) with:
+
+    cargo run --release -p autopiercam -- upload-ledger migrate --config autopiercam.toml
+
+A fully drained v4 ledger can be archived and retired only with its exact
+32-character ledger ID:
+
+    cargo run --release -p autopiercam -- upload-ledger archive --config autopiercam.toml --expected-ledger-id <ledger-id>
+
+The command prints the verified archive/retired paths and archive SHA-256. See
+`docs/upload.md` for refusal conditions and partial-operation recovery.
+
 The tray also accepts `AUTOPIERCAM_CONFIG` and `AUTOPIERCAM_ASI_SDK_PATH`.
 Its menu can open the built Viewer, pause/resume scheduled stills, capture one
 frame immediately, and perform an ordered shutdown. `autopiercam run` remains

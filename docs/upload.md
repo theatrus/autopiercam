@@ -245,3 +245,55 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
   explicitly requeue it only after the cause is understood. The requeue still
   requires the original bytes and current ledger/delivery identity; it cannot
   substitute a repaired or regenerated file under the old idempotency key.
+
+## Offline ledger lifecycle
+
+Ledger maintenance is a camera-independent CLI path. Both commands dispatch
+before the ZWO SDK is loaded, but the tray/console agent must be stopped because
+the live store and maintenance commands take incompatible operating-system file
+leases:
+
+    cargo run --release -p autopiercam -- upload-ledger migrate --config autopiercam.toml
+    cargo run --release -p autopiercam -- upload-ledger archive --config autopiercam.toml --expected-ledger-id <32-lowercase-hex>
+
+`migrate` accepts only the exact released v3 schema or the exact current v4
+schema. An exact v3 ledger is transformed transactionally to v4, assigned a
+random immutable ledger ID, and given per-row delivery bindings and revisions.
+The complete v4 schema and derived fields are verified before that transaction
+can commit. V4 is a verified no-op that prints its existing ledger ID. Every
+other version, altered schema, aggregate mismatch, wrong capture root, unsafe
+database path, or failed integrity check is rejected without migration.
+
+`archive` accepts exact v4 only and requires the operator to repeat the ledger
+ID shown by `migrate` or Manage outbox. It refuses to archive while any row is
+pending, in progress, retrying, or permanently failed, or when a generated JPEG
+is neither a durable job nor known preactivation history. Generated-name
+directories, symlinks, and Windows reparse points fail closed. Retained
+preactivation JPEGs are known exclusions and do not prevent a drained archive.
+
+After a full WAL checkpoint, archive uses SQLite's backup API to create and
+verify a same-directory temporary database. It compares a logical digest with
+the still-locked active database, publishes without replacing an existing
+name, flushes data and name changes, and prints the archive's SHA-256. Only then
+does it durably move the active database to the retired name:
+
+    autopiercam.upload.<ledger-id>.archive.sqlite3
+    autopiercam.upload.<ledger-id>.retired.sqlite3
+
+No active `autopiercam.upload.sqlite3` remains after success, so the next
+upload-enabled start creates a new ledger. The retired source is retained as a
+recoverable second copy; neither output is silently overwritten.
+
+Archive recovery is state-aware. If a verified archive exists beside the
+unchanged active ledger but retirement did not happen, rerunning the same
+command verifies their exact logical contents and finishes retirement. If both
+verified archive and retired files exist and the active file is absent, rerun
+is an idempotent verification. A changed active ledger, an orphan archive or
+retired file, or all three names existing is reported as an incomplete state
+and left untouched for inspection.
+
+The persistent `<database>.maintenance.lock` file is only a coordination inode;
+the held shared/exclusive OS lock is authoritative. Leaving the unlocked file
+in place avoids replacement races, and it is not considered a prior ledger by
+retention. Do not copy it as ledger data or use its mere presence to infer that
+maintenance is running.
