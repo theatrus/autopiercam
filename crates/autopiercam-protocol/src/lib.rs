@@ -188,6 +188,28 @@ pub struct StatusCamera {
     pub name: String,
 }
 
+/// Durable outbox telemetry for the optional HTTP upload worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusUpload {
+    /// Finalized artifacts waiting for their first upload attempt.
+    pub pending: u64,
+    /// Upload requests currently in progress.
+    pub active: u64,
+    /// Upload intents currently waiting for or performing a retry.
+    pub retrying: u64,
+    /// Successful uploads retained in the durable ledger.
+    pub completed: u64,
+    /// Upload intents retained after a permanent failure.
+    pub permanently_failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatus {
     pub state: AgentState,
@@ -199,6 +221,8 @@ pub struct AgentStatus {
     pub last_artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<StatusUpload>,
 }
 
 impl AgentStatus {
@@ -210,6 +234,7 @@ impl AgentStatus {
             frames_saved: 0,
             last_artifact: None,
             last_error: None,
+            upload: None,
         }
     }
 }
@@ -978,6 +1003,71 @@ mod tests {
         assert_eq!(encoded["result"]["camera"]["id"], 0);
         assert_eq!(encoded["result"]["frames_captured"], 42);
         assert!(encoded["result"].get("last_error").is_none());
+        assert!(encoded["result"].get("upload").is_none());
+
+        let legacy: AgentStatus = serde_json::from_value(json!({
+            "state": "capturing",
+            "frames_captured": 42,
+            "frames_saved": 3
+        }))
+        .unwrap();
+        assert!(legacy.upload.is_none());
+    }
+
+    #[test]
+    fn typed_upload_status_is_strict_and_omits_unavailable_details() {
+        let upload = StatusUpload {
+            pending: 2,
+            active: 1,
+            retrying: 1,
+            completed: 7,
+            permanently_failed: 3,
+            last_success_unix_ms: Some(1_725_000_000_123),
+            last_failure_unix_ms: None,
+            last_error: Some("HTTP 413".to_owned()),
+        };
+        let encoded = serde_json::to_value(&upload).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "pending": 2,
+                "active": 1,
+                "retrying": 1,
+                "completed": 7,
+                "permanently_failed": 3,
+                "last_success_unix_ms": 1_725_000_000_123_u64,
+                "last_error": "HTTP 413"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusUpload>(encoded).unwrap(),
+            upload
+        );
+
+        let minimal = json!({
+            "pending": 0,
+            "active": 0,
+            "retrying": 0,
+            "completed": 0,
+            "permanently_failed": 0
+        });
+        assert_eq!(
+            serde_json::from_value::<StatusUpload>(minimal.clone()).unwrap(),
+            StatusUpload::default()
+        );
+
+        let mut missing_required = minimal.clone();
+        missing_required.as_object_mut().unwrap().remove("pending");
+        assert!(serde_json::from_value::<StatusUpload>(missing_required).is_err());
+
+        let mut unknown = minimal;
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<StatusUpload>(unknown).is_err());
+
+        let mut status = AgentStatus::new(AgentState::Capturing);
+        status.upload = Some(upload);
+        let response = Response::success("status-upload", serde_json::to_value(status).unwrap());
+        assert_eq!(response.result.unwrap()["upload"]["active"], 1);
     }
 
     #[test]
