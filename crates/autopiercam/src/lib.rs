@@ -34,6 +34,7 @@ mod preview;
 mod retention;
 mod upload;
 
+use ledger_maintenance::LedgerLease;
 pub use ledger_maintenance::{
     LedgerArchiveReport, LedgerMaintenanceError, LedgerMigrationReport, archive_upload_ledger,
     migrate_upload_ledger,
@@ -717,6 +718,12 @@ fn run_agent_inner(
     let capture_session_nonce = CaptureSessionNonce::random()?;
 
     let upload_ledger_path = config_path.with_extension("upload.sqlite3");
+    // UploadStore owns this shared lifecycle lease while uploads are enabled.
+    // Disabled runs still publish captures and may delete them via retention,
+    // so they must independently exclude offline migration/archive for the
+    // complete writer/retention lifetime.
+    let disabled_upload_ledger_lease =
+        acquire_disabled_upload_ledger_lease(&config.upload, &upload_ledger_path)?;
     let (upload_worker, upload_sink) = match start_upload_worker(
         &config.upload,
         &upload_ledger_path,
@@ -772,23 +779,31 @@ fn run_agent_inner(
     };
     camera.set_roi(roi)?;
 
+    // Start every remaining fallible helper before the writer. Once the writer
+    // is running, execution always reaches the explicit join sequence below,
+    // keeping the ledger lifecycle lease held until publication has drained.
+    let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
+    let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let upload_health = upload_sink.as_ref().map(UploadSink::health);
     let writer_retention_sink = retention_sink.clone();
+    let writer_ledger_lease = disabled_upload_ledger_lease.clone();
     let writer_monitor = monitor.clone();
     let writer = thread::Builder::new()
         .name("autopiercam-writer".to_owned())
         .spawn(move || {
-            writer_loop(
+            let result = writer_loop(
                 writer_rx,
                 &writer_monitor,
                 upload_sink.as_ref(),
                 writer_retention_sink.as_ref(),
-            )
+            );
+            // Also fence publication if an unwinding camera thread detaches
+            // this writer before the normal join sequence can run.
+            drop(writer_ledger_lease);
+            result
         })
         .context("starting still writer")?;
-    let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
-    let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
 
     info!(
         camera = %info.name,
@@ -828,6 +843,7 @@ fn run_agent_inner(
     let preview_result = preview_encoder
         .map(PreviewEncoder::stop_and_join)
         .unwrap_or(Ok(()));
+    drop(disabled_upload_ledger_lease);
     capture_result?;
     writer_result??;
     retention_result.context("stopping capture retention worker")?;
@@ -835,6 +851,25 @@ fn run_agent_inner(
     preview_result?;
     info!("continuous capture worker stopped cleanly");
     Ok(())
+}
+
+fn acquire_disabled_upload_ledger_lease(
+    config: &UploadConfig,
+    database_path: &Path,
+) -> Result<Option<Arc<LedgerLease>>> {
+    if config.enabled {
+        return Ok(None);
+    }
+
+    LedgerLease::acquire_live(database_path)
+        .map(Arc::new)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "acquiring upload-ledger lifecycle lease for disabled uploads at {}",
+                database_path.display()
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1841,6 +1876,59 @@ mod tests {
         .unwrap();
         replacement.stop_and_join().unwrap();
         drop(replacement_sink);
+    }
+
+    #[test]
+    fn disabled_upload_run_lease_blocks_concurrent_offline_maintenance_until_release() {
+        const CONTENDERS: usize = 8;
+
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("captures");
+        std::fs::create_dir(&capture).unwrap();
+        let config_path = root.path().join("autopiercam.toml");
+        std::fs::write(
+            &config_path,
+            "[capture]\ndirectory = \"captures\"\n\n[upload]\nenabled = false\n",
+        )
+        .unwrap();
+        let database = config_path.with_extension("upload.sqlite3");
+        let lease = acquire_disabled_upload_ledger_lease(&UploadConfig::default(), &database)
+            .unwrap()
+            .expect("disabled runs must own the live ledger lease");
+
+        let barrier = Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
+        let contenders = (0..CONTENDERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let config_path = config_path.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    match migrate_upload_ledger(&config_path) {
+                        Err(LedgerMaintenanceError::Lease(message))
+                            if message.contains("upload ledger is active") =>
+                        {
+                            Ok(())
+                        }
+                        result => Err(format!(
+                            "offline maintenance was not excluded by the disabled run: {result:?}"
+                        )),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for contender in contenders {
+            contender.join().unwrap().unwrap();
+        }
+
+        // Production releases this only after the still writer and retention
+        // worker have both joined, so maintenance cannot inspect a capture set
+        // while either publisher is still active.
+        drop(lease);
+        assert!(matches!(
+            migrate_upload_ledger(&config_path),
+            Err(LedgerMaintenanceError::MissingLedger(path)) if path == database
+        ));
     }
 
     #[test]
