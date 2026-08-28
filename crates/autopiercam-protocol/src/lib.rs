@@ -227,6 +227,39 @@ pub struct StatusUpload {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePressure {
+    #[default]
+    Ok,
+    CleanupNeeded,
+    Blocked,
+}
+
+/// Latest bounded retention sweep and capture-volume telemetry.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusStorage {
+    /// Bytes held by exact AutoPierCam capture names, including protected data.
+    pub managed_bytes: u64,
+    /// Managed bytes that retention is currently forbidden to delete.
+    pub protected_bytes: u64,
+    /// Managed bytes currently eligible for automatic retention.
+    pub reclaimable_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_unix_ms: Option<u64>,
+    pub last_reclaimed_files: u64,
+    pub last_reclaimed_bytes: u64,
+    pub pressure: StoragePressure,
+    /// Scheduled still persistence pauses when protected data alone prevents a
+    /// configured byte limit from being met. Capture-now remains available.
+    pub capture_suspended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatus {
     pub state: AgentState,
@@ -240,6 +273,8 @@ pub struct AgentStatus {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload: Option<StatusUpload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StatusStorage>,
     /// Optional operations supported by this agent build. Older v1 agents omit
     /// this field, and older clients can safely ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -256,6 +291,7 @@ impl AgentStatus {
             last_artifact: None,
             last_error: None,
             upload: None,
+            storage: None,
             capabilities: Vec::new(),
         }
     }
@@ -1789,6 +1825,7 @@ mod tests {
         assert_eq!(encoded["result"]["frames_captured"], 42);
         assert!(encoded["result"].get("last_error").is_none());
         assert!(encoded["result"].get("upload").is_none());
+        assert!(encoded["result"].get("storage").is_none());
         assert!(encoded["result"].get("capabilities").is_none());
 
         let legacy: AgentStatus = serde_json::from_value(json!({
@@ -1798,7 +1835,46 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.upload.is_none());
+        assert!(legacy.storage.is_none());
         assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn typed_storage_status_is_strict_and_omits_unavailable_details() {
+        let storage = StatusStorage {
+            managed_bytes: 1_000,
+            protected_bytes: 700,
+            reclaimable_bytes: 300,
+            free_bytes: Some(20_000),
+            last_sweep_unix_ms: Some(1_725_000_000_123),
+            last_reclaimed_files: 2,
+            last_reclaimed_bytes: 250,
+            pressure: StoragePressure::Blocked,
+            capture_suspended: true,
+            last_error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&storage).unwrap(),
+            json!({
+                "managed_bytes": 1_000,
+                "protected_bytes": 700,
+                "reclaimable_bytes": 300,
+                "free_bytes": 20_000,
+                "last_sweep_unix_ms": 1_725_000_000_123_u64,
+                "last_reclaimed_files": 2,
+                "last_reclaimed_bytes": 250,
+                "pressure": "blocked",
+                "capture_suspended": true
+            })
+        );
+        let encoded = serde_json::to_string(&storage).unwrap();
+        assert!(
+            serde_json::from_str::<StatusStorage>(&encoded.replace(
+                "\"capture_suspended\":true",
+                "\"capture_suspended\":true,\"unexpected\":1"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
