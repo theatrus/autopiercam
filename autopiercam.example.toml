@@ -29,7 +29,8 @@ enabled = false
 # Use HTTPS. Bearer authentication requires it.
 # endpoint = "https://example.test/camera/latest"
 # This is the name of an environment variable, not the token itself. A token
-# can rotate only after no upload remains pending, active, or retrying.
+# can rotate only after no upload remains pending, active, or retrying and no
+# finalized crash-gap JPEG is waiting to be reconciled.
 # bearer_token_env = "AUTOPIERCAM_UPLOAD_TOKEN"
 # Capacity must be positive and bounds only coalesced worker wake hints. SQLite
 # owns the durable queue, so a full wake channel does not lose an intent.

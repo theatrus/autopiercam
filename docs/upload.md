@@ -33,12 +33,14 @@ capture name; those paths form the activation boundary. For example:
 
 The ledger stores and validates the canonical capture directory, normalized
 destination, and one-way authorization fingerprint. It will not open with a
-different root or destination. A different authorization identity is accepted
-transactionally only when there are no `pending`, `in_progress`, or `retrying`
-rows; otherwise startup fails closed. This prevents pending artifacts from
-being silently sent to another endpoint, tenant, or account. Completed and
-permanently failed history does not block normal credential rotation. Moving
-or renaming the configuration file selects a different sidecar path.
+different root or destination. Under exclusive ledger ownership, a different
+authorization identity is accepted transactionally only when there are no
+`pending`, `in_progress`, or `retrying` rows and no eligible unledgered JPEG in
+the publish/record crash gap; otherwise startup fails closed. This prevents
+pending or not-yet-reconciled artifacts from being silently sent to another
+endpoint, tenant, or account. Completed and permanently failed history does
+not block normal credential rotation. Moving or renaming the configuration
+file selects a different sidecar path.
 
 Only one active upload worker may own a ledger. It uses SQLite WAL mode,
 `synchronous=FULL`, a five-second busy timeout, an exclusive live connection,
@@ -189,10 +191,12 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
   inventory and will not adopt captures already present at that point. Saving a
   different endpoint in the Viewer does not migrate the old ledger; the
   restarted worker will report a destination mismatch.
-- A bearer token may rotate in place after every row is terminal. If any row is
-  pending, active, or retrying, a different token is rejected because the agent
-  cannot prove that it represents the same remote account. Restore the prior
-  credential or deliberately migrate the outbox before retrying. Renaming the
+- A bearer token may rotate in place after every row is terminal and startup
+  finds no eligible unledgered crash-gap JPEG. If a row is pending, active, or
+  retrying—or a finalized artifact still needs reconciliation—a different
+  token is rejected because the agent cannot prove that it represents the same
+  remote account. Restore the prior credential, let it reconcile and drain the
+  outbox, or deliberately migrate the outbox before retrying. Renaming the
   environment variable while preserving the exact token does not change the
   authorization identity.
 - If the configuration file is moved, keep track of its old sidecar. The new

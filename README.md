@@ -101,7 +101,8 @@ healthy.
 - A ledger is bound to the canonical capture directory, normalized HTTP
   endpoint, and a one-way authorization identity. Root or endpoint changes
   fail closed. Credential rotation is accepted only after every upload is
-  terminal; see `docs/upload.md` for the recovery and operator contract.
+  terminal and no crash-gap artifact awaits reconciliation; see
+  `docs/upload.md` for the recovery and operator contract.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
   off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.

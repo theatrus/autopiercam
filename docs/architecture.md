@@ -226,9 +226,10 @@ Viewer reconnect.
 
 Upload bearer material is never written into TOML or SQLite. Configuration
 names the environment variable from which the current worker loads it; the
-ledger stores only a one-way authorization fingerprint. Credential rotation is
-allowed when every row is terminal and fails closed while live work remains.
-Packaged Windows builds will use Credential Manager or DPAPI.
+ledger stores only a one-way authorization fingerprint. Under exclusive ledger
+ownership, credential rotation is allowed only when every row is terminal and
+no reconcilable crash-gap artifact exists; it fails closed otherwise. Packaged
+Windows builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
 
