@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -500,7 +500,7 @@ pub(crate) enum ArtifactVerification {
     },
 }
 
-pub(crate) enum OpenedClaimedArtifact {
+pub(crate) enum SnapshottedClaimedArtifact {
     Verified(File),
     Rejected(ArtifactVerification),
 }
@@ -971,22 +971,23 @@ impl UploadStore {
 pub(crate) fn verify_claimed_artifact(
     claim: &ClaimedUpload,
 ) -> Result<ArtifactVerification, UploadStoreError> {
-    match open_claimed_artifact(claim)? {
-        OpenedClaimedArtifact::Verified(_) => Ok(ArtifactVerification::Verified),
-        OpenedClaimedArtifact::Rejected(reason) => Ok(reason),
+    match snapshot_claimed_artifact(claim)? {
+        SnapshottedClaimedArtifact::Verified(_) => Ok(ArtifactVerification::Verified),
+        SnapshottedClaimedArtifact::Rejected(reason) => Ok(reason),
     }
 }
 
-/// Opens and verifies the exact file handle that will be streamed. On Windows
-/// the handle denies later write/delete opens while the HTTP request owns it,
-/// preventing a path replacement from changing bytes under an idempotency key.
-pub(crate) fn open_claimed_artifact(
+/// Copies the claimed artifact into a private anonymous file, then verifies the
+/// snapshot's size and digest before returning it for streaming. The source is
+/// closed before HTTP starts, so later mutation or replacement cannot change
+/// the bytes sent under the claim's idempotency key.
+pub(crate) fn snapshot_claimed_artifact(
     claim: &ClaimedUpload,
-) -> Result<OpenedClaimedArtifact, UploadStoreError> {
+) -> Result<SnapshottedClaimedArtifact, UploadStoreError> {
     let metadata = match fs::symlink_metadata(&claim.artifact_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(OpenedClaimedArtifact::Rejected(
+            return Ok(SnapshottedClaimedArtifact::Rejected(
                 ArtifactVerification::Missing,
             ));
         }
@@ -999,12 +1000,12 @@ pub(crate) fn open_claimed_artifact(
         }
     };
     if metadata.file_type().is_symlink() {
-        return Ok(OpenedClaimedArtifact::Rejected(
+        return Ok(SnapshottedClaimedArtifact::Rejected(
             ArtifactVerification::Symlink,
         ));
     }
     if !metadata.is_file() {
-        return Ok(OpenedClaimedArtifact::Rejected(
+        return Ok(SnapshottedClaimedArtifact::Rejected(
             ArtifactVerification::NotRegularFile,
         ));
     }
@@ -1012,7 +1013,7 @@ pub(crate) fn open_claimed_artifact(
     let mut file = match open_artifact_for_read(&claim.artifact_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(OpenedClaimedArtifact::Rejected(
+            return Ok(SnapshottedClaimedArtifact::Rejected(
                 ArtifactVerification::Missing,
             ));
         }
@@ -1030,28 +1031,93 @@ pub(crate) fn open_claimed_artifact(
         source,
     })?;
     if !opened_metadata.is_file() {
-        return Ok(OpenedClaimedArtifact::Rejected(
+        return Ok(SnapshottedClaimedArtifact::Rejected(
             ArtifactVerification::NotRegularFile,
         ));
     }
     if opened_metadata.len() != claim.file_size {
-        return Ok(OpenedClaimedArtifact::Rejected(
+        return Ok(SnapshottedClaimedArtifact::Rejected(
             ArtifactVerification::SizeMismatch {
                 expected: claim.file_size,
                 actual: opened_metadata.len(),
             },
         ));
     }
-    let actual = sha256_open_file(&mut file, &claim.artifact_path)?;
+
+    let mut snapshot = tempfile::tempfile().map_err(|source| UploadStoreError::Io {
+        operation: "create anonymous upload snapshot",
+        path: claim.artifact_path.clone(),
+        source,
+    })?;
+    let (actual_size, actual) = copy_and_hash_snapshot(
+        &mut file,
+        &mut snapshot,
+        claim.file_size,
+        &claim.artifact_path,
+    )?;
+    if actual_size != claim.file_size {
+        return Ok(SnapshottedClaimedArtifact::Rejected(
+            ArtifactVerification::SizeMismatch {
+                expected: claim.file_size,
+                actual: actual_size,
+            },
+        ));
+    }
     if actual != claim.sha256 {
-        return Ok(OpenedClaimedArtifact::Rejected(
+        return Ok(SnapshottedClaimedArtifact::Rejected(
             ArtifactVerification::Sha256Mismatch {
                 expected: claim.sha256,
                 actual,
             },
         ));
     }
-    Ok(OpenedClaimedArtifact::Verified(file))
+    snapshot.rewind().map_err(|source| UploadStoreError::Io {
+        operation: "rewind verified upload snapshot",
+        path: claim.artifact_path.clone(),
+        source,
+    })?;
+    Ok(SnapshottedClaimedArtifact::Verified(snapshot))
+}
+
+fn copy_and_hash_snapshot(
+    source: &mut File,
+    snapshot: &mut File,
+    expected_size: u64,
+    source_path: &Path,
+) -> Result<(u64, [u8; 32]), UploadStoreError> {
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining_with_probe = expected_size.saturating_sub(copied).saturating_add(1);
+        let read_limit = usize::try_from(remaining_with_probe)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let count =
+            source
+                .read(&mut buffer[..read_limit])
+                .map_err(|source| UploadStoreError::Io {
+                    operation: "read artifact into upload snapshot",
+                    path: source_path.to_path_buf(),
+                    source,
+                })?;
+        if count == 0 {
+            break;
+        }
+        copied = copied.saturating_add(count as u64);
+        if copied > expected_size {
+            return Ok((copied, hasher.finalize().into()));
+        }
+        snapshot
+            .write_all(&buffer[..count])
+            .map_err(|source| UploadStoreError::Io {
+                operation: "write anonymous upload snapshot",
+                path: source_path.to_path_buf(),
+                source,
+            })?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok((copied, hasher.finalize().into()))
 }
 
 struct ArtifactValues {
@@ -2283,6 +2349,56 @@ mod tests {
             verify_claimed_artifact(&claim).unwrap(),
             ArtifactVerification::SizeMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn verified_snapshot_keeps_recorded_bytes_after_source_mutation() {
+        let environment = TestEnvironment::new();
+        let recorded_bytes = b"original-jpeg-bytes";
+        let mutated_bytes = b"mutated--jpeg-bytes";
+        assert_eq!(recorded_bytes.len(), mutated_bytes.len());
+        let artifact = environment.artifact(50, recorded_bytes);
+        let mut store = environment.open();
+        store.record_artifact(&artifact, 1).unwrap();
+        let claim = store.claim_due(1).unwrap().unwrap();
+
+        let mut snapshot = match snapshot_claimed_artifact(&claim).unwrap() {
+            SnapshottedClaimedArtifact::Verified(snapshot) => snapshot,
+            SnapshottedClaimedArtifact::Rejected(reason) => {
+                panic!("recorded artifact was unexpectedly rejected: {reason:?}")
+            }
+        };
+        fs::write(&artifact, mutated_bytes).unwrap();
+
+        let mut uploaded_bytes = Vec::new();
+        snapshot.read_to_end(&mut uploaded_bytes).unwrap();
+        assert_eq!(uploaded_bytes, recorded_bytes);
+        assert_eq!(fs::read(&artifact).unwrap(), mutated_bytes);
+    }
+
+    #[test]
+    fn verified_snapshot_keeps_recorded_bytes_after_source_replacement() {
+        let environment = TestEnvironment::new();
+        let recorded_bytes = b"recorded-before-replacement";
+        let replacement_bytes = b"replacement-on-disk";
+        let artifact = environment.artifact(51, recorded_bytes);
+        let mut store = environment.open();
+        store.record_artifact(&artifact, 1).unwrap();
+        let claim = store.claim_due(1).unwrap().unwrap();
+
+        let mut snapshot = match snapshot_claimed_artifact(&claim).unwrap() {
+            SnapshottedClaimedArtifact::Verified(snapshot) => snapshot,
+            SnapshottedClaimedArtifact::Rejected(reason) => {
+                panic!("recorded artifact was unexpectedly rejected: {reason:?}")
+            }
+        };
+        fs::remove_file(&artifact).unwrap();
+        fs::write(&artifact, replacement_bytes).unwrap();
+
+        let mut uploaded_bytes = Vec::new();
+        snapshot.read_to_end(&mut uploaded_bytes).unwrap();
+        assert_eq!(uploaded_bytes, recorded_bytes);
+        assert_eq!(fs::read(&artifact).unwrap(), replacement_bytes);
     }
 
     #[test]

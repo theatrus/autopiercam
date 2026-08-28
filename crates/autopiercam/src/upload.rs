@@ -26,9 +26,9 @@ use ureq::{
 mod upload_store;
 
 use upload_store::{
-    ArtifactVerification, ClaimedUpload, OpenedClaimedArtifact, RecordDisposition,
+    ArtifactVerification, ClaimedUpload, RecordDisposition, SnapshottedClaimedArtifact,
     UploadAuthorizationFingerprint, UploadStore, UploadStoreError, UploadStoreSnapshot,
-    open_claimed_artifact,
+    snapshot_claimed_artifact,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -450,27 +450,29 @@ impl UploadTransport for UreqTransport {
     }
 
     fn upload(&mut self, claim: &ClaimedUpload) -> AttemptOutcome {
-        let file = match open_claimed_artifact(claim) {
-            Ok(OpenedClaimedArtifact::Verified(file)) => file,
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Missing)) => {
+        let file = match snapshot_claimed_artifact(claim) {
+            Ok(SnapshottedClaimedArtifact::Verified(file)) => file,
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::Missing)) => {
                 return AttemptOutcome::permanent(None, MISSING_ARTIFACT_ERROR);
             }
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Symlink)) => {
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::Symlink)) => {
                 return AttemptOutcome::permanent(None, SYMLINK_ARTIFACT_ERROR);
             }
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::NotRegularFile)) => {
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::NotRegularFile)) => {
                 return AttemptOutcome::permanent(None, NON_FILE_ARTIFACT_ERROR);
             }
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::SizeMismatch { .. })) => {
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::SizeMismatch {
+                ..
+            })) => {
                 return AttemptOutcome::permanent(None, ARTIFACT_SIZE_CHANGED_ERROR);
             }
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Sha256Mismatch {
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::Sha256Mismatch {
                 ..
             })) => {
                 return AttemptOutcome::permanent(None, ARTIFACT_CONTENT_CHANGED_ERROR);
             }
             #[cfg(test)]
-            Ok(OpenedClaimedArtifact::Rejected(ArtifactVerification::Verified)) => {
+            Ok(SnapshottedClaimedArtifact::Rejected(ArtifactVerification::Verified)) => {
                 return AttemptOutcome::retry(None, None, UNOPENABLE_ARTIFACT_ERROR);
             }
             Err(_) => return AttemptOutcome::retry(None, None, UNOPENABLE_ARTIFACT_ERROR),
