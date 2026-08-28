@@ -24,7 +24,9 @@ validation uses the platform verifier. Connect timeout is five seconds and the
 total request timeout is fifteen seconds.
 
 When upload is first enabled, AutoPierCam creates a sidecar by replacing the
-configuration filename's extension with `upload.sqlite3`. For example:
+configuration filename's extension with `upload.sqlite3`. The schema-creation
+transaction also inventories every existing direct child with a generated
+capture name; those paths form the activation boundary. For example:
 
     C:\pier\autopiercam.toml
     C:\pier\autopiercam.upload.sqlite3
@@ -55,19 +57,27 @@ before a nonblocking wake is attempted.
 There is necessarily a small filesystem/database boundary between publishing a
 JPEG and inserting its row. Startup reconciliation closes that crash window.
 It scans direct children of the configured capture directory and records
-eligible generated JPEGs that do not already have rows.
+eligible generated JPEGs that have neither a job row nor a preactivation
+inventory entry.
 
-At first ledger creation, AutoPierCam records an activation timestamp. A scan
-only considers names in the generated
-`frame-<unix-seconds>-<three-digit-milliseconds>-<six-or-more-digit-sequence>.jpg`
-grammar (the reconciler also accepts `.jpeg`) whose encoded capture time is at
-or after that watermark. Therefore enabling upload for the first time does not
-adopt older captures already in the directory. Once a ledger exists, later
-startup scans do recover qualifying artifacts created after activation,
-including artifacts published while upload was temporarily disabled.
+New captures use the exact generated grammar
+`frame-<unix-seconds>-<three-digit-milliseconds>-<32-lowercase-hex-session-nonce>-<six-or-more-digit-sequence>.jpg`.
+The 128-bit OS-random nonce makes names collision-resistant across process
+restart and wall-clock correction. Reconciliation also recognizes the legacy
+form without a nonce and accepts `.jpeg` for recovery compatibility.
+
+Because activation records the paths that actually existed rather than
+comparing filename timestamps, enabling upload does not adopt old captures
+whose clocks happen to be in the future, and a backdated file published after
+activation is still recoverable. Once a ledger exists, later startup scans
+recover qualifying artifacts created after activation, including artifacts
+published while upload was temporarily disabled.
 
 Reconciliation ignores nested paths, symlinks, non-files, unrelated names, and
-pre-activation captures. Already recorded paths are skipped before file hashing.
+preactivation inventory paths. Already recorded paths are skipped before file
+hashing. Direct recording returns `AlreadyRecorded` only when filename, size,
+SHA-256, and idempotency identity all match; a reused path with different bytes
+faults rather than silently losing the new intent.
 
 ## Durable state and recovery
 
@@ -175,7 +185,7 @@ Treat the ledger and its `-wal`/`-shm` sidecars as application data:
 - To intentionally change the capture root or endpoint, first drain or account
   for every nonterminal row, stop the agent, archive the existing ledger as a
   unit, then change configuration. The next start creates a fresh activation
-  boundary and will not adopt captures older than that point. Saving a
+  inventory and will not adopt captures already present at that point. Saving a
   different endpoint in the Viewer does not migrate the old ledger; the
   restarted worker will report a destination mismatch.
 - A bearer token may rotate in place after every row is terminal. If any row is

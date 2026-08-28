@@ -156,13 +156,17 @@ the configuration file. A nonblocking channel wake follows the durable insert;
 if that channel is full, the existing wake and periodic poll still drain every
 due ledger row.
 
-The ledger is created only when upload is enabled and records an activation
-boundary, canonical capture root, normalized endpoint, and a domain-separated
-SHA-256 authorization fingerprint. First startup does not adopt older captures.
-Later startup reconciliation scans eligible direct generated JPEG children,
-closing the publish/record crash window and recovering files created while
-upload was temporarily disabled. A ledger refuses a different root,
-destination, live authorization identity, schema, or concurrent owner.
+The ledger is created only when upload is enabled. Its schema transaction
+inventories existing generated capture paths and records the canonical capture
+root, normalized endpoint, and a domain-separated SHA-256 authorization
+fingerprint. First startup therefore does not adopt older captures, regardless
+of their embedded wall-clock timestamps. Later startup reconciliation scans
+eligible direct generated JPEG children not in that inventory, closing the
+publish/record crash window and recovering even backdated files or files
+created while upload was temporarily disabled. New filenames include a 128-bit
+OS-random capture-session nonce so restart and clock correction do not reuse
+paths. A ledger refuses a different root, destination, live authorization
+identity, schema, or concurrent owner.
 
 Rows transition through `pending`, `in_progress`, `retrying`, `completed`, and
 `permanently_failed`. Retry deadlines, attempt counts, acknowledgements, and
@@ -170,7 +174,8 @@ failure details persist. Startup returns abandoned `in_progress` claims to
 `pending`; completed and terminal rows remain as history. Before HTTP, the
 worker opens and verifies the exact recorded file size and SHA-256. Missing or
 changed artifacts become permanent failures so different bytes cannot reuse an
-existing identity.
+existing identity. A direct path conflict is accepted as already recorded only
+when its complete stored identity matches.
 
 The dedicated thread streams the verified file with `PUT` to the validated
 endpoint after standard URL normalization, explicit JPEG content type and

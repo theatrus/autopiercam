@@ -19,7 +19,8 @@ retention_days = 14
 [upload]
 # Upload starts only after a JPEG is flushed, synced, and atomically published.
 # Intents and retry deadlines persist in <config-name>.upload.sqlite3 beside
-# this file. The uploader never deletes the local JPEG.
+# this file. Its first transaction inventories existing generated names so
+# they are never adopted as history. The uploader never deletes the local JPEG.
 enabled = false
 # PUT uses this endpoint after standard URL normalization; no filename is
 # appended and redirects are off. An existing ledger is bound to this exact
