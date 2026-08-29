@@ -140,10 +140,4 @@
         </Grid>
     </DataTemplate>
 
-    <GeometryGroup x:Key="AutoPierCam_PierCameraSVG">
-        <RectangleGeometry Rect="2,8,28,20" RadiusX="3" RadiusY="3" />
-        <RectangleGeometry Rect="8,4,9,5" RadiusX="1" RadiusY="1" />
-        <EllipseGeometry Center="16,18" RadiusX="7" RadiusY="7" />
-        <EllipseGeometry Center="16,18" RadiusX="3" RadiusY="3" />
-    </GeometryGroup>
 </ResourceDictionary>

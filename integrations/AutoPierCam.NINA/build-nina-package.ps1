@@ -3,6 +3,8 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string] $Version = '0.1.0.0',
 
+    [string] $ReleaseTag = '',
+
     [string] $InstallerUrl = '',
 
     [string] $FeaturedImageUrl = '',
@@ -89,6 +91,149 @@ function Assert-PackageAllowlist {
     }
 }
 
+function Read-PluginAssemblyIdentity {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $loadContext = $null
+    $assemblyStream = $null
+    try {
+        $assemblyBytes = [IO.File]::ReadAllBytes($Path)
+        $loadContext = [System.Runtime.Loader.AssemblyLoadContext]::new(
+            "AutoPierCam-package-validation-$([Guid]::NewGuid())",
+            $true)
+        $assemblyStream = [IO.MemoryStream]::new($assemblyBytes, $false)
+        $assembly = $loadContext.LoadFromStream($assemblyStream)
+        $attributes = @($assembly.GetCustomAttributesData())
+
+        $readAttribute = {
+            param([Parameter(Mandatory)] [string] $AttributeType)
+
+            $matches = @(
+                $attributes |
+                    Where-Object { $_.AttributeType.FullName -eq $AttributeType }
+            )
+            if ($matches.Count -gt 1) {
+                throw "Assembly has more than one $AttributeType attribute."
+            }
+            if ($matches.Count -eq 0) {
+                return $null
+            }
+            return [string] $matches[0].ConstructorArguments[0].Value
+        }
+
+        $metadata = @{}
+        foreach ($attribute in $attributes) {
+            if ($attribute.AttributeType.FullName -eq
+                'System.Reflection.AssemblyMetadataAttribute') {
+                $key = [string] $attribute.ConstructorArguments[0].Value
+                $value = [string] $attribute.ConstructorArguments[1].Value
+                $metadata[$key] = $value
+            }
+        }
+
+        return [pscustomobject]@{
+            AssemblyName = $assembly.GetName().Name
+            AssemblyVersion = $assembly.GetName().Version.ToString()
+            Guid = & $readAttribute 'System.Runtime.InteropServices.GuidAttribute'
+            Title = & $readAttribute 'System.Reflection.AssemblyTitleAttribute'
+            FileVersion = & $readAttribute 'System.Reflection.AssemblyFileVersionAttribute'
+            Metadata = $metadata
+        }
+    } catch {
+        throw "Could not inspect staged plugin assembly '$Path': $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $assemblyStream) {
+            $assemblyStream.Dispose()
+        }
+        if ($null -ne $loadContext) {
+            $loadContext.Unload()
+        }
+    }
+}
+
+function Assert-PluginAssemblyIdentity {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $ExpectedVersion
+    )
+
+    $identity = Read-PluginAssemblyIdentity -Path $Path
+    $license = if ($identity.Metadata.ContainsKey('License')) {
+        [string] $identity.Metadata['License']
+    } else {
+        $null
+    }
+    $minimumNinaVersion = if ($identity.Metadata.ContainsKey('MinimumApplicationVersion')) {
+        [string] $identity.Metadata['MinimumApplicationVersion']
+    } else {
+        $null
+    }
+
+    $checks = @(
+        [pscustomobject]@{
+            Label = 'assembly name'
+            Actual = $identity.AssemblyName
+            Expected = 'AutoPierCam.NINA'
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'GUID'
+            Actual = $identity.Guid
+            Expected = 'cb626d89-4f49-454f-8d42-01153902d12b'
+            Comparison = [StringComparison]::OrdinalIgnoreCase
+        },
+        [pscustomobject]@{
+            Label = 'AssemblyTitle'
+            Actual = $identity.Title
+            Expected = 'AutoPierCam'
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'AssemblyVersion'
+            Actual = $identity.AssemblyVersion
+            Expected = $ExpectedVersion
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'FileVersion'
+            Actual = $identity.FileVersion
+            Expected = $ExpectedVersion
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'License metadata'
+            Actual = $license
+            Expected = 'Apache-2.0'
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'MinimumApplicationVersion metadata'
+            Actual = $minimumNinaVersion
+            Expected = '3.2.0.9001'
+            Comparison = [StringComparison]::Ordinal
+        }
+    )
+
+    $problems = @()
+    foreach ($check in $checks) {
+        if (-not [string]::Equals(
+            [string] $check.Actual,
+            [string] $check.Expected,
+            $check.Comparison)) {
+            $actual = if ([string]::IsNullOrEmpty([string] $check.Actual)) {
+                '<missing>'
+            } else {
+                "'$($check.Actual)'"
+            }
+            $problems += "$($check.Label) is $actual; expected '$($check.Expected)'"
+        }
+    }
+
+    if ($problems.Count -ne 0) {
+        throw "Staged AutoPierCam N.I.N.A. plugin identity validation failed for '$Path':`n - $($problems -join "`n - ")`nRebuild the stage and use the same -Version for -StageOnly and -PackageOnly."
+    }
+}
+
 $integrationRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $integrationRoot '../..'))
 $project = Join-Path $integrationRoot 'src/AutoPierCam.NINA/AutoPierCam.NINA.csproj'
@@ -100,8 +245,14 @@ if ([string]::IsNullOrWhiteSpace($outputRootParent) -or
 }
 
 $archiveName = "AutoPierCam.NINA.$Version.zip"
+$releaseVersionParts = $Version.Split('.')
+if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
+    $ReleaseTag = "v$($releaseVersionParts[0]).$($releaseVersionParts[1]).$($releaseVersionParts[2])"
+} elseif ($ReleaseTag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+    throw "ReleaseTag must look like v1.2.3 or v1.2.3-preview.1; got '$ReleaseTag'."
+}
 if ([string]::IsNullOrWhiteSpace($InstallerUrl)) {
-    $InstallerUrl = "https://github.com/theatrus/autopiercam/releases/download/v$Version/$archiveName"
+    $InstallerUrl = "https://github.com/theatrus/autopiercam/releases/download/$ReleaseTag/$archiveName"
 }
 
 $installerUri = $null
@@ -170,11 +321,14 @@ if (-not $PackageOnly) {
 }
 
 Assert-PackageAllowlist -PackageDirectory $packageDirectory
+Assert-PluginAssemblyIdentity -Path $pluginDll -ExpectedVersion $Version
 
 if ($StageOnly) {
     [pscustomobject]@{
         Package = $packageDirectory
         Plugin = $pluginDll
+        ReleaseTag = $ReleaseTag
+        InstallerUrl = $InstallerUrl
         Files = @(Get-ChildItem -LiteralPath $packageDirectory -File | Select-Object -ExpandProperty Name)
     }
     return
@@ -228,6 +382,7 @@ $json = $manifest | ConvertTo-Json -Depth 10
     Archive = $archivePath
     Manifest = $manifestPath
     Checksum = $checksum
+    ReleaseTag = $ReleaseTag
     InstallerUrl = $InstallerUrl
     PackageFiles = @(Get-ChildItem -LiteralPath $packageDirectory -File | Select-Object -ExpandProperty Name)
 }

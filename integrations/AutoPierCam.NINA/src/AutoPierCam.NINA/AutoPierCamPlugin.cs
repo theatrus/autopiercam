@@ -15,10 +15,12 @@ public sealed class AutoPierCamPlugin : PluginBase
     private readonly IPierCameraPreviewRuntime previewRuntime;
 
     [ImportingConstructor]
-    public AutoPierCamPlugin(IPierCameraPreviewRuntime previewRuntime)
+    public AutoPierCamPlugin()
     {
-        this.previewRuntime = previewRuntime;
+        previewRuntime = PierCameraPreviewProcess.Runtime;
     }
+
+    internal IPierCameraPreviewRuntime PreviewRuntime => previewRuntime;
 
     public override async Task Initialize()
     {

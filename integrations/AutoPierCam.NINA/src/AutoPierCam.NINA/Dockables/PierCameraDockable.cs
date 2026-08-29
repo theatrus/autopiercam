@@ -1,5 +1,4 @@
 using System.ComponentModel.Composition;
-using System.Windows;
 using System.Windows.Media;
 using AutoPierCam.NINA.Preview;
 using NINA.Equipment.Interfaces.ViewModel;
@@ -14,25 +13,20 @@ public sealed class PierCameraDockable : DockableVM
     internal const string StableContentId = "AutoPierCam.PierCamera";
 
     [ImportingConstructor]
-    public PierCameraDockable(
-        IProfileService profileService,
-        IPierCameraPreviewRuntime preview)
+    public PierCameraDockable(IProfileService profileService)
         : base(profileService)
     {
-        Preview = preview;
+        Preview = PierCameraPreviewProcess.Runtime;
         Title = "Pier Camera";
 
-        var resources = new ResourceDictionary
-        {
-            Source = new Uri(
-                "AutoPierCam.NINA;component/Dockables/PierCameraDockableTemplates.xaml",
-                UriKind.RelativeOrAbsolute),
-        };
-        if (resources["AutoPierCam_PierCameraSVG"] is GeometryGroup geometry)
-        {
-            geometry.Freeze();
-            ImageGeometry = geometry;
-        }
+        // Placeholder camera mark until the application-wide icon set is finalized.
+        var geometry = new GeometryGroup();
+        geometry.Children.Add(new RectangleGeometry(new(2, 8, 28, 20), 3, 3));
+        geometry.Children.Add(new RectangleGeometry(new(8, 4, 9, 5), 1, 1));
+        geometry.Children.Add(new EllipseGeometry(new(16, 18), 7, 7));
+        geometry.Children.Add(new EllipseGeometry(new(16, 18), 3, 3));
+        geometry.Freeze();
+        ImageGeometry = geometry;
     }
 
     public override string ContentId => StableContentId;

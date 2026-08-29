@@ -52,6 +52,11 @@ Build a release archive and SHA-256 N.I.N.A. manifest:
 
     ./build-nina-package.ps1 -Version 0.1.0.0
 
+The default download URL uses the matching three-part product release tag
+(`v0.1.0` in this example) while the plugin archive and manifest retain the
+four-part N.I.N.A. version. Pass `-ReleaseTag v0.1.0-preview.1` when packaging
+from a different valid product release tag.
+
 Use `-StageOnly` to stop after creating the allowlisted package directory (for
 example, before code signing), then `-PackageOnly` to archive that exact staged
 content and generate its checksum manifest.

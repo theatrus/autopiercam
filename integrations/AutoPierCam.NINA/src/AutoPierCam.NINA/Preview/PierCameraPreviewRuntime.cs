@@ -1,5 +1,5 @@
 using System.ComponentModel;
-using System.ComponentModel.Composition;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -46,8 +46,6 @@ public interface IPierCameraPreviewRuntime : INotifyPropertyChanged
     Task StopAsync();
 }
 
-[Export(typeof(IPierCameraPreviewRuntime))]
-[PartCreationPolicy(CreationPolicy.Shared)]
 public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
 {
     internal static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(5);
@@ -59,7 +57,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     private Task? freshnessTask;
     private PreviewStreamPhase? streamPhase;
     private PreviewFrameMetadata? metadata;
-    private DateTimeOffset? lastFrameReceivedAt;
+    private long? lastFrameReceivedTimestamp;
     private string? streamDetail;
     private string? frameError;
     private TimeSpan? retryDelay;
@@ -86,7 +84,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     public bool IsStale => HasImage &&
         (streamPhase != PreviewStreamPhase.Live ||
          frameError is not null ||
-         FrameAge(DateTimeOffset.UtcNow) >= StaleAfter);
+         FrameAge() >= StaleAfter);
 
     public bool IsLive => HasImage && !IsStale;
 
@@ -114,7 +112,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                 PreviewStreamPhase.WaitingForFrame =>
                     "Connected to AutoPierCam; waiting for the first pier camera frame…",
                 PreviewStreamPhase.Live when IsStale =>
-                    $"No new pier camera frame for {FormatAge(FrameAge(DateTimeOffset.UtcNow))}; showing the last snapshot.",
+                    $"No new pier camera frame for {FormatAge(FrameAge())}; showing the last snapshot.",
                 PreviewStreamPhase.Live =>
                     "Live pier camera preview.",
                 PreviewStreamPhase.Reconnecting when HasImage =>
@@ -144,12 +142,12 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     {
         get
         {
-            if (lastFrameReceivedAt is null)
+            if (lastFrameReceivedTimestamp is null)
             {
                 return "No frame received";
             }
 
-            TimeSpan age = FrameAge(DateTimeOffset.UtcNow);
+            TimeSpan age = FrameAge();
             return age < TimeSpan.FromSeconds(1.5)
                 ? "Received just now"
                 : $"Received {FormatAge(age)} ago";
@@ -311,7 +309,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                     {
                         Image = decoded;
                         metadata = frame.Metadata;
-                        lastFrameReceivedAt = DateTimeOffset.UtcNow;
+                        lastFrameReceivedTimestamp = Stopwatch.GetTimestamp();
                         frameError = null;
                     }
                     else
@@ -411,9 +409,9 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
         RaisePropertyChanged(nameof(DroppedFramesText));
     }
 
-    private TimeSpan FrameAge(DateTimeOffset now) => lastFrameReceivedAt is null
+    private TimeSpan FrameAge() => lastFrameReceivedTimestamp is null
         ? TimeSpan.MaxValue
-        : now - lastFrameReceivedAt.Value;
+        : Stopwatch.GetElapsedTime(lastFrameReceivedTimestamp.Value);
 
     private string RetrySuffix() => retryDelay is TimeSpan delay
         ? $" in {delay.TotalSeconds:0.#} seconds"
