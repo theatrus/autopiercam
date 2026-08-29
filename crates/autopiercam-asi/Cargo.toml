@@ -2,10 +2,15 @@
 name = "autopiercam-asi"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
 rust-version.workspace = true
+description = "Dynamically loaded ZWO ASI camera SDK adapter for AutoPierCam"
+publish = false
 
 [dependencies]
 libloading.workspace = true
 thiserror.workspace = true
-

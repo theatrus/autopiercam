@@ -5,6 +5,10 @@ planetary cameras. It is intended to live in the system tray, adapt between
 bright days and dark nights, save debayered stills, maintain short security
 video segments, and optionally upload completed artifacts.
 
+AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
+[Apache License 2.0](LICENSE). Its canonical repository is
+[github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
+
 The repository now contains a hardware-validated background capture slice:
 
 - dynamic loading of the bundled ZWO ASI SDK 1.41;
@@ -71,8 +75,9 @@ bundled location. The x64 runtime DLL is expected at:
 
     vendor/zwo/ASI SDK/lib/x64/ASICamera2.dll
 
-The ZWO library is redistributed under its included MIT-style license. The
-camera driver is installed separately.
+The ZWO library is redistributed under its included MIT-style license; it is
+not relicensed under AutoPierCam's Apache-2.0 license. The camera driver is
+installed separately. See `THIRD_PARTY_NOTICES.md` for details.
 
 ## Workspace
 

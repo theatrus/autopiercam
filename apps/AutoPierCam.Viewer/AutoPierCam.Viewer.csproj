@@ -8,6 +8,19 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
     <WindowsPackageType>None</WindowsPackageType>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <AssemblyTitle>AutoPierCam Viewer</AssemblyTitle>
+    <Product>AutoPierCam</Product>
+    <Description>Windows configuration and live-view application for AutoPierCam</Description>
+    <Authors>Yann Ramin</Authors>
+    <Company>Yann Ramin</Company>
+    <Copyright>Copyright © 2026 Yann Ramin</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/theatrus/autopiercam</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/theatrus/autopiercam</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -16,4 +29,3 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
   </ItemGroup>
 </Project>
-

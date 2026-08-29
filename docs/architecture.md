@@ -1,5 +1,13 @@
 # AutoPierCam architecture
 
+## Product identity
+
+The product name is AutoPierCam and the current release line is 0.1.0. Yann
+Ramin is the author. The canonical source repository and project homepage are
+<https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
+are licensed under Apache-2.0; bundled third-party components retain their own
+licenses as recorded in `../THIRD_PARTY_NOTICES.md`.
+
 ## Product boundary
 
 The first product is a per-user desktop agent, not a Windows Service. A service

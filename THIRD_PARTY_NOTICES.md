@@ -1,5 +1,8 @@
 # Third-party notices
 
+AutoPierCam itself is licensed under the Apache License 2.0. The notices below
+cover bundled third-party material and do not change its original license.
+
 ## ZWO ASICamera2 SDK
 
 The bundled camera SDK is copyright (c) 2015 ZWO Company and is distributed
@@ -9,4 +12,3 @@ under the MIT-style license included at:
 
 The vendor library is supplied without warranty. AutoPierCam does not include
 the ZWO camera driver; that is installed separately.
-
