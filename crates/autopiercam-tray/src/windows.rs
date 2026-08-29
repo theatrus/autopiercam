@@ -21,6 +21,7 @@ use crate::{
 };
 
 const VIEWER_FILE_NAME: &str = "AutoPierCam.Viewer.exe";
+#[cfg(debug_assertions)]
 const VIEWER_DEV_RELATIVE_PATH: &str = concat!(
     "apps/AutoPierCam.Viewer/bin/Debug/",
     "net10.0-windows10.0.26100.0/win-x64/AutoPierCam.Viewer.exe"
@@ -307,14 +308,24 @@ fn launch_viewer() {
 fn viewer_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(2);
     match std::env::current_exe() {
-        Ok(tray_executable) => candidates.push(tray_executable.with_file_name(VIEWER_FILE_NAME)),
+        Ok(tray_executable) => {
+            candidates.push(tray_executable.with_file_name(VIEWER_FILE_NAME));
+            candidates.push(
+                tray_executable
+                    .with_file_name("Viewer")
+                    .join(VIEWER_FILE_NAME),
+            );
+        }
         Err(error) => warn!(%error, "could not locate the tray executable"),
     }
 
-    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
-    candidates.push(repository_root.join(VIEWER_DEV_RELATIVE_PATH));
+    #[cfg(debug_assertions)]
+    {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        candidates.push(repository_root.join(VIEWER_DEV_RELATIVE_PATH));
+    }
     candidates
 }
 
