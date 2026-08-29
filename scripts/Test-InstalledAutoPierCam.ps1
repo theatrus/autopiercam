@@ -133,6 +133,65 @@ function Assert-DirectoryIdentity(
     }
 }
 
+function Get-ConfigProof([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Configuration proof target is missing: $Path"
+    }
+    $attributes = [IO.File]::GetAttributes($Path)
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Configuration proof target must not be a reparse point: $Path"
+    }
+
+    # Hash one coherent byte array so Length and Sha256 always describe the
+    # same observed contents, even if an unexpected writer changes the file.
+    $bytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($Path))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($bytes)
+        $hash = ($hashBytes | ForEach-Object { $_.ToString('x2') }) -join ''
+    } finally {
+        $sha256.Dispose()
+    }
+    return [pscustomobject] @{
+        Length = [long] $bytes.LongLength
+        Sha256 = $hash
+    }
+}
+
+function Assert-ConfigProof(
+    [string] $Path,
+    [object] $ExpectedProof,
+    [string] $Description
+) {
+    if ($null -eq $ExpectedProof) {
+        throw "$Description has no expected configuration proof."
+    }
+    $actualProof = Get-ConfigProof $Path
+    if ([long] $actualProof.Length -ne [long] $ExpectedProof.Length -or
+        -not [string]::Equals(
+            [string] $actualProof.Sha256,
+            [string] $ExpectedProof.Sha256,
+            [StringComparison]::Ordinal
+        )) {
+        throw "$Description configuration contents changed."
+    }
+}
+
+function Get-StableConfigProof([string] $Path) {
+    $first = Get-ConfigProof $Path
+    Start-Sleep -Milliseconds 250
+    $second = Get-ConfigProof $Path
+    if ([long] $first.Length -ne [long] $second.Length -or
+        -not [string]::Equals(
+            [string] $first.Sha256,
+            [string] $second.Sha256,
+            [StringComparison]::Ordinal
+        )) {
+        throw 'The application-created configuration was not stable when claimed.'
+    }
+    return $second
+}
+
 function Get-DataTreeInventory([string] $Root) {
     $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
     if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {
@@ -988,8 +1047,9 @@ function Get-PostCleanupProblems(
     [string] $StartMenuDirectory,
     [string] $RunRegistryPath,
     [string] $InstallerRegistryPath,
-    [string] $SentinelPath,
-    [string] $SentinelContents
+    [string] $ExpectedDataIdentity,
+    [string] $ConfigPath,
+    [object] $ExpectedConfigProof
 ) {
     $problems = [Collections.Generic.List[string]]::new()
     if (-not (Test-WindowsInstallerTransactionQuiescent)) {
@@ -1021,14 +1081,22 @@ function Get-PostCleanupProblems(
     }
     if (-not (Test-Path -LiteralPath $DataDirectory -PathType Container)) {
         $problems.Add('test-owned user-data directory is missing')
-    } elseif (-not (Test-Path -LiteralPath $SentinelPath -PathType Leaf)) {
-        $problems.Add('test-owned sentinel is missing')
-    } elseif (-not [string]::Equals(
-        (Get-Content -LiteralPath $SentinelPath -Raw),
-        $SentinelContents,
-        [StringComparison]::Ordinal
-    )) {
-        $problems.Add('test-owned sentinel changed')
+    } else {
+        if (-not [string]::Equals(
+            (Get-DirectoryIdentity $DataDirectory),
+            $ExpectedDataIdentity,
+            [StringComparison]::Ordinal
+        )) {
+            $problems.Add('test-owned user-data directory identity changed')
+        }
+        try {
+            Assert-ConfigProof `
+                -Path $ConfigPath `
+                -ExpectedProof $ExpectedConfigProof `
+                -Description 'Post-cleanup user data'
+        } catch {
+            $problems.Add('application-created configuration is missing or changed')
+        }
     }
     return $problems
 }
@@ -1042,8 +1110,9 @@ function Wait-ForSafePostCleanupState(
     [string] $StartMenuDirectory,
     [string] $RunRegistryPath,
     [string] $InstallerRegistryPath,
-    [string] $SentinelPath,
-    [string] $SentinelContents
+    [string] $ExpectedDataIdentity,
+    [string] $ConfigPath,
+    [object] $ExpectedConfigProof
 ) {
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $consecutiveSafeSamples = 0
@@ -1058,8 +1127,9 @@ function Wait-ForSafePostCleanupState(
                 -StartMenuDirectory $StartMenuDirectory `
                 -RunRegistryPath $RunRegistryPath `
                 -InstallerRegistryPath $InstallerRegistryPath `
-                -SentinelPath $SentinelPath `
-                -SentinelContents $SentinelContents)
+                -ExpectedDataIdentity $ExpectedDataIdentity `
+                -ConfigPath $ConfigPath `
+                -ExpectedConfigProof $ExpectedConfigProof)
         } catch {
             $lastProblems = @('post-cleanup state could not be inspected safely')
         }
@@ -1089,8 +1159,8 @@ function Get-PostArchiveProblems(
     [string] $RunRegistryPath,
     [string] $InstallerRegistryPath,
     [string] $ExpectedDataIdentity,
-    [string] $ArchivedSentinelPath,
-    [string] $SentinelContents
+    [string] $ArchivedConfigPath,
+    [object] $ExpectedConfigProof
 ) {
     $problems = [Collections.Generic.List[string]]::new()
     if (-not (Test-WindowsInstallerTransactionQuiescent)) {
@@ -1132,14 +1202,13 @@ function Get-PostArchiveProblems(
     )) {
         $problems.Add('archived user-data directory identity changed')
     }
-    if (-not (Test-Path -LiteralPath $ArchivedSentinelPath -PathType Leaf)) {
-        $problems.Add('archived sentinel is missing')
-    } elseif (-not [string]::Equals(
-        (Get-Content -LiteralPath $ArchivedSentinelPath -Raw),
-        $SentinelContents,
-        [StringComparison]::Ordinal
-    )) {
-        $problems.Add('archived sentinel changed')
+    try {
+        Assert-ConfigProof `
+            -Path $ArchivedConfigPath `
+            -ExpectedProof $ExpectedConfigProof `
+            -Description 'Archived user data'
+    } catch {
+        $problems.Add('archived application-created configuration is missing or changed')
     }
     return $problems
 }
@@ -1156,8 +1225,8 @@ function Wait-ForStablePostArchiveState(
     [string] $RunRegistryPath,
     [string] $InstallerRegistryPath,
     [string] $ExpectedDataIdentity,
-    [string] $ArchivedSentinelPath,
-    [string] $SentinelContents
+    [string] $ArchivedConfigPath,
+    [object] $ExpectedConfigProof
 ) {
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $consecutiveSafeSamples = 0
@@ -1174,8 +1243,8 @@ function Wait-ForStablePostArchiveState(
                 -RunRegistryPath $RunRegistryPath `
                 -InstallerRegistryPath $InstallerRegistryPath `
                 -ExpectedDataIdentity $ExpectedDataIdentity `
-                -ArchivedSentinelPath $ArchivedSentinelPath `
-                -SentinelContents $SentinelContents)
+                -ArchivedConfigPath $ArchivedConfigPath `
+                -ExpectedConfigProof $ExpectedConfigProof)
         } catch {
             $lastProblems = @('post-archive state could not be inspected safely')
         }
@@ -1219,8 +1288,9 @@ function Assert-UninstalledState(
     [string] $StartMenuDirectory,
     [string] $RunRegistryPath,
     [string] $InstallerRegistryPath,
-    [string] $SentinelPath,
-    [string] $SentinelContents,
+    [string] $ExpectedDataIdentity,
+    [string] $ConfigPath,
+    [object] $ExpectedConfigProof,
     [string] $ProductCode,
     [string] $UpgradeCode
 ) {
@@ -1240,17 +1310,14 @@ function Assert-UninstalledState(
     if (-not (Test-Path -LiteralPath $DataDirectory -PathType Container)) {
         throw 'Uninstall removed the user-owned AutoPierCam data directory.'
     }
-    if (-not (Test-Path -LiteralPath $SentinelPath -PathType Leaf)) {
-        throw 'Uninstall removed the lifecycle-test sentinel from user data.'
-    }
-    $actualSentinel = Get-Content -LiteralPath $SentinelPath -Raw
-    if (-not [string]::Equals(
-        $actualSentinel,
-        $SentinelContents,
-        [StringComparison]::Ordinal
-    )) {
-        throw 'Uninstall changed the lifecycle-test sentinel in user data.'
-    }
+    Assert-DirectoryIdentity `
+        -Path $DataDirectory `
+        -ExpectedIdentity $ExpectedDataIdentity `
+        -Description 'Data root after uninstall'
+    Assert-ConfigProof `
+        -Path $ConfigPath `
+        -ExpectedProof $ExpectedConfigProof `
+        -Description 'Data after uninstall'
 }
 
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -1356,13 +1423,9 @@ $artifactRoot = Join-Path $artifactParent (
     'lifecycle-test-{0}-{1}' -f $timestamp, [Guid]::NewGuid().ToString('N')
 )
 $archivedDataDirectory = Join-Path $artifactRoot 'user-data'
-$sentinelPath = Join-Path $dataDirectory '.installer-lifecycle-sentinel.txt'
-$sentinelContents = (
-    "AutoPierCam installer lifecycle data`r`nTest ID: {0}`r`n" -f `
-        [Guid]::NewGuid().ToString('D')
-)
 $dataDirectoryOwned = $false
 $claimedDataRootIdentity = $null
+$claimedConfigProof = $null
 $primaryFailure = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 
@@ -1372,17 +1435,6 @@ try {
     }
     New-Item -ItemType Directory -Path $artifactRoot | Out-Null
 
-    # Claim the path only after the fail-closed preflight. The MSI never owns
-    # this directory; creating it here makes archival ownership unambiguous.
-    New-Item -ItemType Directory -Path $dataDirectory | Out-Null
-    $dataDirectoryOwned = $true
-    [IO.File]::WriteAllText(
-        $sentinelPath,
-        $sentinelContents,
-        [Text.UTF8Encoding]::new($false)
-    )
-    $claimedDataRootIdentity = Get-DirectoryIdentity $dataDirectory
-
     Write-Host 'Cycle 1: default per-user install with sign-in startup enabled.'
     Invoke-MsiOperation `
         -Operation Install `
@@ -1391,14 +1443,28 @@ try {
     $firstTray = Wait-ForInstalledTray `
         -ExpectedPath $trayPath `
         -TimeoutSeconds $trayStartupTimeoutSeconds
-    Assert-DirectoryIdentity `
-        -Path $dataDirectory `
-        -ExpectedIdentity $claimedDataRootIdentity `
-        -Description 'Cycle-one data root'
     Assert-InstalledPayload `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
         -StartMenuDirectory $startMenuDirectory
+
+    # Preflight proved this namespace path absent. Claim only the real root and
+    # default config created by the verified cycle-one tray; until all checks
+    # below succeed, cleanup must leave any newly appeared data in place.
+    $candidateDataRootIdentity = Get-DirectoryIdentity $dataDirectory
+    $candidateConfigProof = Get-StableConfigProof $configPath
+    Assert-DirectoryIdentity `
+        -Path $dataDirectory `
+        -ExpectedIdentity $candidateDataRootIdentity `
+        -Description 'Cycle-one data root at ownership claim'
+    Assert-ConfigProof `
+        -Path $configPath `
+        -ExpectedProof $candidateConfigProof `
+        -Description 'Cycle-one default config at ownership claim'
+    $claimedDataRootIdentity = $candidateDataRootIdentity
+    $claimedConfigProof = $candidateConfigProof
+    $dataDirectoryOwned = $true
+
     Assert-RunValue -RegistryPath $runRegistryPath -Expected $expectedRunValue
     Assert-ProductRegistered `
         -ProductCode $msiIdentity.ProductCode `
@@ -1426,8 +1492,9 @@ try {
         -StartMenuDirectory $startMenuDirectory `
         -RunRegistryPath $runRegistryPath `
         -InstallerRegistryPath $installerRegistryPath `
-        -SentinelPath $sentinelPath `
-        -SentinelContents $sentinelContents `
+        -ExpectedDataIdentity $claimedDataRootIdentity `
+        -ConfigPath $configPath `
+        -ExpectedConfigProof $claimedConfigProof `
         -ProductCode $msiIdentity.ProductCode `
         -UpgradeCode $msiIdentity.UpgradeCode
 
@@ -1448,6 +1515,10 @@ try {
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
         -StartMenuDirectory $startMenuDirectory
+    Assert-ConfigProof `
+        -Path $configPath `
+        -ExpectedProof $claimedConfigProof `
+        -Description 'Cycle-two config'
     Assert-RunValue -RegistryPath $runRegistryPath -Expected $null
     Assert-ProductRegistered `
         -ProductCode $msiIdentity.ProductCode `
@@ -1483,8 +1554,9 @@ try {
         -StartMenuDirectory $startMenuDirectory `
         -RunRegistryPath $runRegistryPath `
         -InstallerRegistryPath $installerRegistryPath `
-        -SentinelPath $sentinelPath `
-        -SentinelContents $sentinelContents `
+        -ExpectedDataIdentity $claimedDataRootIdentity `
+        -ConfigPath $configPath `
+        -ExpectedConfigProof $claimedConfigProof `
         -ProductCode $msiIdentity.ProductCode `
         -UpgradeCode $msiIdentity.UpgradeCode
 } catch {
@@ -1580,6 +1652,10 @@ try {
     $safeToArchiveData = $false
     if ($dataDirectoryOwned -and $installerQuiescentForCleanup) {
         try {
+            if ([string]::IsNullOrWhiteSpace($claimedDataRootIdentity) -or
+                $null -eq $claimedConfigProof) {
+                throw 'The application-created data root has no complete ownership proof.'
+            }
             Wait-ForSafePostCleanupState `
                 -TimeoutSeconds $cleanupQuiescenceTimeoutSeconds `
                 -ProductCode $msiIdentity.ProductCode `
@@ -1589,8 +1665,9 @@ try {
                 -StartMenuDirectory $startMenuDirectory `
                 -RunRegistryPath $runRegistryPath `
                 -InstallerRegistryPath $installerRegistryPath `
-                -SentinelPath $sentinelPath `
-                -SentinelContents $sentinelContents
+                -ExpectedDataIdentity $claimedDataRootIdentity `
+                -ConfigPath $configPath `
+                -ExpectedConfigProof $claimedConfigProof
             $safeToArchiveData = $true
         } catch {
             $cleanupErrors.Add(
@@ -1600,6 +1677,10 @@ try {
     } elseif ($dataDirectoryOwned) {
         $cleanupErrors.Add(
             "test-owned data was left in place at $dataDirectory because MSI quiescence is uncertain"
+        )
+    } elseif (Test-Path -LiteralPath $dataDirectory) {
+        $cleanupErrors.Add(
+            "unclaimed user data appeared at $dataDirectory and was left in place; no archival was attempted"
         )
     }
 
@@ -1639,14 +1720,10 @@ try {
             }
 
             $preMoveInventory = @(Get-StableDataTreeInventory $resolvedOwnedData)
-            if (-not (Test-Path -LiteralPath $sentinelPath -PathType Leaf) -or
-                -not [string]::Equals(
-                    (Get-Content -LiteralPath $sentinelPath -Raw),
-                    $sentinelContents,
-                    [StringComparison]::Ordinal
-                )) {
-                throw 'The sentinel changed before atomic archival.'
-            }
+            Assert-ConfigProof `
+                -Path $configPath `
+                -ExpectedProof $claimedConfigProof `
+                -Description 'Pre-archive user data'
 
             # Directory.Move is one same-volume namespace rename. Do not fall
             # back to provider recursion or copy/delete semantics.
@@ -1664,17 +1741,13 @@ try {
                 -Actual $postMoveInventory `
                 -Description 'Atomic archive'
 
-            $archivedSentinelPath = Join-Path `
+            $archivedConfigPath = Join-Path `
                 $archivedDataDirectory `
-                '.installer-lifecycle-sentinel.txt'
-            if (-not (Test-Path -LiteralPath $archivedSentinelPath -PathType Leaf) -or
-                -not [string]::Equals(
-                    (Get-Content -LiteralPath $archivedSentinelPath -Raw),
-                    $sentinelContents,
-                    [StringComparison]::Ordinal
-                )) {
-                throw 'The archived sentinel is missing or changed.'
-            }
+                'autopiercam.toml'
+            Assert-ConfigProof `
+                -Path $archivedConfigPath `
+                -ExpectedProof $claimedConfigProof `
+                -Description 'Archived user data'
 
             Wait-ForStablePostArchiveState `
                 -TimeoutSeconds 10 `
@@ -1688,12 +1761,16 @@ try {
                 -RunRegistryPath $runRegistryPath `
                 -InstallerRegistryPath $installerRegistryPath `
                 -ExpectedDataIdentity $claimedDataRootIdentity `
-                -ArchivedSentinelPath $archivedSentinelPath `
-                -SentinelContents $sentinelContents
+                -ArchivedConfigPath $archivedConfigPath `
+                -ExpectedConfigProof $claimedConfigProof
             $stableInventory = @(Get-DataTreeInventory $archivedDataDirectory)
             Assert-DataTreeInventoryEqual `
                 -Expected $preMoveInventory `
                 -Actual $stableInventory `
+                -Description 'Stable archive'
+            Assert-ConfigProof `
+                -Path $archivedConfigPath `
+                -ExpectedProof $claimedConfigProof `
                 -Description 'Stable archive'
             Write-Host "Preserved lifecycle user data at $archivedDataDirectory"
         } catch {
