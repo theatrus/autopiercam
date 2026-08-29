@@ -33,3 +33,6 @@ windows-sys.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tokio.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true

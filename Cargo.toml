@@ -23,6 +23,7 @@ rust-version = "1.88"
 anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["derive", "env"] }
 ctrlc = "3.5.2"
+embed-resource = "3.0.5"
 fs4 = "1.1.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 getrandom = "0.4.3"

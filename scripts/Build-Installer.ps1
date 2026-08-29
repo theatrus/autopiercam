@@ -13,6 +13,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'PeImports.ps1')
 
 if ($StageOnly -and $PackageOnly) {
     throw 'Specify at most one of -StageOnly and -PackageOnly.'
@@ -42,6 +43,15 @@ $viewerStageRoot = Join-Path $stageRoot 'Viewer'
 $intermediateRoot = Join-Path $artifactRoot 'obj'
 $outputRoot = Join-Path $artifactRoot 'output'
 $msiPath = Join-Path $outputRoot ("AutoPierCam-{0}-x64.msi" -f $Version)
+$stageManifestPath = Join-Path $artifactRoot 'approved-stage-manifest.json'
+$rustTarget = 'x86_64-pc-windows-msvc'
+$rustReleaseRoot = Join-Path $repositoryRoot "target\$rustTarget\release"
+$signableStagePaths = @(
+    'autopiercam.exe',
+    'autopiercam-tray.exe',
+    'Viewer\AutoPierCam.Viewer.dll',
+    'Viewer\AutoPierCam.Viewer.exe'
+)
 $sdkSource = Join-Path $repositoryRoot 'vendor\zwo\ASI SDK\lib\x64\ASICamera2.dll'
 $expectedSdkSha256 = '0c8778c3cce2012961b079e3c7d0d8348a8b3823939335d9e98148cb5d5dc34a'
 
@@ -58,6 +68,256 @@ function Reset-GeneratedDirectory([string] $Path) {
         Remove-Item -LiteralPath $resolvedPath -Recurse -Force
     }
     New-Item -ItemType Directory -Path $resolvedPath | Out-Null
+}
+
+function Remove-GeneratedArtifactFile([string] $Path) {
+    $resolvedArtifactRoot = [IO.Path]::GetFullPath($artifactRoot).TrimEnd('\')
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    if (-not $resolvedPath.StartsWith(
+        $resolvedArtifactRoot + '\',
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to remove a file outside the installer artifact root: $resolvedPath"
+    }
+    if (Test-Path -LiteralPath $resolvedPath) {
+        if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+            throw "Expected a generated artifact file, not a directory: $resolvedPath"
+        }
+        Remove-Item -LiteralPath $resolvedPath -Force
+    }
+}
+
+function Get-ApprovedStageFileMap([string] $StagePath) {
+    $resolvedStagePath = (Resolve-Path -LiteralPath $StagePath).Path.TrimEnd('\')
+    $map = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in Get-ChildItem -LiteralPath $resolvedStagePath -File -Recurse) {
+        $relativePath = [IO.Path]::GetRelativePath(
+            $resolvedStagePath,
+            $file.FullName
+        ).Replace('/', '\')
+        if (
+            [IO.Path]::IsPathRooted($relativePath) -or
+            $relativePath.StartsWith('..\', [StringComparison]::Ordinal) -or
+            $relativePath.Contains('/') -or
+            $relativePath.Split('\') -contains '..' -or
+            $relativePath.Split('\') -contains '.'
+        ) {
+            throw "Staged file has an invalid relative path: $relativePath"
+        }
+        if ($map.ContainsKey($relativePath)) {
+            throw "Staged payload contains a case-insensitive path collision: $relativePath"
+        }
+        $map.Add(
+            $relativePath,
+            (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        )
+    }
+    return $map
+}
+
+function New-ApprovedStageManifest(
+    [string] $StagePath,
+    [string] $ManifestPath,
+    [string] $ProductVersion,
+    [string] $Target,
+    [string[]] $SignablePaths
+) {
+    $files = Get-ApprovedStageFileMap $StagePath
+    $paths = [string[]] @($files.Keys)
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    $sortedSignablePaths = [string[]] @($SignablePaths)
+    [Array]::Sort($sortedSignablePaths, [StringComparer]::Ordinal)
+    $entries = @(
+        foreach ($relativePath in $paths) {
+            [ordered] @{
+                path = $relativePath
+                sha256 = $files[$relativePath]
+            }
+        }
+    )
+    $document = [ordered] @{
+        schema_version = 1
+        product_version = $ProductVersion
+        target = $Target
+        signable_paths = $sortedSignablePaths
+        files = $entries
+    }
+    $resolvedManifestPath = [IO.Path]::GetFullPath($ManifestPath)
+    $resolvedArtifactRoot = [IO.Path]::GetFullPath($artifactRoot).TrimEnd('\')
+    if (-not $resolvedManifestPath.StartsWith(
+        $resolvedArtifactRoot + '\',
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to write a stage manifest outside the installer artifact root: $resolvedManifestPath"
+    }
+    $manifestDirectory = Split-Path -Parent $resolvedManifestPath
+    if (-not (Test-Path -LiteralPath $manifestDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $manifestDirectory | Out-Null
+    }
+    $json = $document | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText(
+        $resolvedManifestPath,
+        $json + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Test-ApprovedStageManifest(
+    [string] $StagePath,
+    [string] $ManifestPath,
+    [string] $ProductVersion,
+    [string] $Target,
+    [string[]] $SignablePaths
+) {
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Approved stage manifest is missing: $ManifestPath"
+    }
+    try {
+        $document = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "Approved stage manifest is not valid JSON: $($_.Exception.Message)"
+    }
+    foreach ($property in @(
+        'schema_version',
+        'product_version',
+        'target',
+        'signable_paths',
+        'files'
+    )) {
+        if ($property -notin $document.PSObject.Properties.Name) {
+            throw "Approved stage manifest is missing property: $property"
+        }
+    }
+    if ([int] $document.schema_version -ne 1) {
+        throw "Unsupported approved stage manifest schema: $($document.schema_version)"
+    }
+    if ([string] $document.product_version -cne $ProductVersion) {
+        throw "Approved stage manifest version does not match $ProductVersion."
+    }
+    if ([string] $document.target -cne $Target) {
+        throw "Approved stage manifest target does not match $Target."
+    }
+
+    $declaredSignable = [string[]] @($document.signable_paths | ForEach-Object { [string] $_ })
+    $expectedSignable = [string[]] @($SignablePaths)
+    [Array]::Sort($declaredSignable, [StringComparer]::Ordinal)
+    [Array]::Sort($expectedSignable, [StringComparer]::Ordinal)
+    $signableDifference = @(
+        Compare-Object `
+            -ReferenceObject $expectedSignable `
+            -DifferenceObject $declaredSignable `
+            -CaseSensitive
+    )
+    if ($signableDifference.Count -ne 0) {
+        throw 'Approved stage manifest does not carry the exact build-script signing allowlist.'
+    }
+
+    $approvedFiles = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($document.files)) {
+        if ('path' -notin $entry.PSObject.Properties.Name -or
+            'sha256' -notin $entry.PSObject.Properties.Name) {
+            throw 'Approved stage manifest contains an incomplete file entry.'
+        }
+        $relativePath = [string] $entry.path
+        $sha256 = [string] $entry.sha256
+        if (
+            [string]::IsNullOrWhiteSpace($relativePath) -or
+            [IO.Path]::IsPathRooted($relativePath) -or
+            $relativePath.Contains('/') -or
+            $relativePath.StartsWith('..\', [StringComparison]::Ordinal) -or
+            $relativePath.Split('\') -contains '..' -or
+            $relativePath.Split('\') -contains '.'
+        ) {
+            throw "Approved stage manifest contains an invalid path: $relativePath"
+        }
+        if ($sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Approved stage manifest contains an invalid SHA-256 for $relativePath."
+        }
+        if ($approvedFiles.ContainsKey($relativePath)) {
+            throw "Approved stage manifest contains a case-insensitive duplicate: $relativePath"
+        }
+        $approvedFiles.Add($relativePath, $sha256)
+    }
+    if ($approvedFiles.Count -eq 0) {
+        throw 'Approved stage manifest contains no payload files.'
+    }
+
+    $actualFiles = Get-ApprovedStageFileMap $StagePath
+    $missingFiles = @($approvedFiles.Keys | Where-Object { -not $actualFiles.ContainsKey($_) })
+    $unexpectedFiles = @($actualFiles.Keys | Where-Object { -not $approvedFiles.ContainsKey($_) })
+    if ($missingFiles.Count -ne 0 -or $unexpectedFiles.Count -ne 0) {
+        throw ("Stage differs from its approved file inventory. Missing: " +
+               "$($missingFiles -join ', '); files absent from approved manifest: " +
+               "$($unexpectedFiles -join ', ').")
+    }
+
+    foreach ($relativePath in $approvedFiles.Keys) {
+        if ($actualFiles[$relativePath] -ceq $approvedFiles[$relativePath]) {
+            continue
+        }
+        if ($relativePath -notin $expectedSignable) {
+            throw "Non-signable staged file changed after approval: $relativePath"
+        }
+        Write-Host "Accepted post-staging signature change: $relativePath"
+    }
+    Write-Host "Approved stage manifest verified: $($approvedFiles.Count) exact paths."
+}
+
+function Test-ApprovedStageManifestRejectsInjection {
+    $testRoot = Join-Path `
+        $artifactRoot `
+        ("stage-manifest-self-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    $testStage = Join-Path $testRoot 'stage'
+    $testManifest = Join-Path $testRoot 'approved.json'
+    $rejected = $false
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $testStage 'Viewer') | Out-Null
+        [IO.File]::WriteAllText(
+            (Join-Path $testStage 'baseline.txt'),
+            'approved',
+            [Text.UTF8Encoding]::new($false)
+        )
+        New-ApprovedStageManifest `
+            -StagePath $testStage `
+            -ManifestPath $testManifest `
+            -ProductVersion $Version `
+            -Target $rustTarget `
+            -SignablePaths @()
+        [IO.File]::WriteAllText(
+            (Join-Path $testStage 'Viewer\injected.dll'),
+            'not approved',
+            [Text.UTF8Encoding]::new($false)
+        )
+        try {
+            Test-ApprovedStageManifest `
+                -StagePath $testStage `
+                -ManifestPath $testManifest `
+                -ProductVersion $Version `
+                -Target $rustTarget `
+                -SignablePaths @()
+        } catch {
+            if ($_.Exception.Message -notlike '*files absent from approved manifest:*Viewer\injected.dll*') {
+                throw
+            }
+            $rejected = $true
+        }
+    } finally {
+        if (Test-Path -LiteralPath $testRoot) {
+            $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
+            $resolvedArtifactRoot = [IO.Path]::GetFullPath($artifactRoot).TrimEnd('\')
+            if (-not $resolvedTestRoot.StartsWith(
+                $resolvedArtifactRoot + '\stage-manifest-self-test-',
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw "Refusing to remove an unexpected stage-manifest test path: $resolvedTestRoot"
+            }
+            Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+        }
+    }
+    if (-not $rejected) {
+        throw 'Approved stage manifest self-test accepted an injected Viewer file.'
+    }
+    Write-Host 'Approved stage manifest self-test rejected an injected Viewer file.'
 }
 
 function Copy-RequiredFile([string] $Source, [string] $Destination) {
@@ -124,6 +384,7 @@ function Assert-StagedPayload {
     $requiredLicenseFiles = @(
         'dotnet-LICENSE.txt',
         'dotnet-ThirdPartyNotices.txt',
+        'Rust-Standard-Library-COPYRIGHT.html',
         'Rust-Third-Party-Licenses.md',
         'windows-app-sdk-LICENSE.txt',
         'windows-app-sdk-NOTICE.txt',
@@ -149,6 +410,22 @@ function Assert-StagedPayload {
                "$($missingLicenseFiles -join ', '); unexpected: " +
                "$($unexpectedLicenseFiles -join ', '); nested directories: " +
                "$($nestedLicenseDirectories.Name -join ', ').")
+    }
+    $rustStandardLibraryNotice = Get-Content `
+        -LiteralPath (Join-Path $licenseRoot 'Rust-Standard-Library-COPYRIGHT.html') `
+        -Raw
+    foreach ($requiredNoticeText in @(
+        '<h1>Copyright notices for The Rust Standard Library</h1>',
+        'The Rust Standard Library is dual-licensed under Apache 2.0 and MIT terms.',
+        'Apache License',
+        'Version 2.0, January 2004',
+        'END OF TERMS AND CONDITIONS',
+        'Permission is hereby granted, free of charge, to any',
+        'THE SOFTWARE IS PROVIDED &#34;AS IS&#34;, WITHOUT WARRANTY OF'
+    )) {
+        if (-not $rustStandardLibraryNotice.Contains($requiredNoticeText)) {
+            throw "Staged Rust standard-library notice is missing: $requiredNoticeText"
+        }
     }
 
     foreach ($requiredViewerFile in @(
@@ -190,6 +467,18 @@ function Assert-StagedPayload {
     Assert-SdkHash (Join-Path $stageRoot 'ASICamera2.dll') 'Staged ASICamera2.dll'
 
     $cliPath = Join-Path $stageRoot 'autopiercam.exe'
+    Assert-AutoPierCamStaticCrt `
+        -Path $cliPath `
+        -Description 'Staged autopiercam.exe'
+    Assert-AutoPierCamVersionResource `
+        -Path $cliPath `
+        -Version $Version `
+        -FileDescription 'AutoPierCam capture engine and diagnostic CLI' `
+        -OriginalFilename 'autopiercam.exe'
+    Assert-AutoPierCamApplicationManifest `
+        -Path $cliPath `
+        -Version $Version `
+        -AssemblyName 'AutoPierCam.Capture'
     $cliVersion = (& $cliPath --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $cliVersion -cne "autopiercam $Version") {
         throw "Staged capture CLI version mismatch: '$cliVersion' (expected 'autopiercam $Version')."
@@ -204,6 +493,19 @@ function Assert-StagedPayload {
     }
 
     $trayPath = Join-Path $stageRoot 'autopiercam-tray.exe'
+    Assert-AutoPierCamStaticCrt `
+        -Path $trayPath `
+        -Description 'Staged autopiercam-tray.exe'
+    Assert-AutoPierCamVersionResource `
+        -Path $trayPath `
+        -Version $Version `
+        -FileDescription 'AutoPierCam Windows notification-area host' `
+        -OriginalFilename 'autopiercam-tray.exe'
+    Assert-AutoPierCamApplicationManifest `
+        -Path $trayPath `
+        -Version $Version `
+        -AssemblyName 'AutoPierCam.Tray' `
+        -GraphicalShell
     $trayVersion = (& $trayPath --version 2>&1 | Out-String).Trim()
     if ($trayVersion -cne "autopiercam-tray $Version") {
         throw "Staged tray version mismatch: '$trayVersion' (expected 'autopiercam-tray $Version')."
@@ -436,7 +738,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'The installer build currently supports only Windows x64.'
 }
 
-$requiredTools = if ($PackageOnly) { @('wix') } else { @('cargo', 'dotnet', 'wix') }
+$requiredTools = if ($PackageOnly) { @('wix') } else { @('cargo', 'dotnet', 'rustc', 'wix') }
 foreach ($tool in $requiredTools) {
     if ($null -eq (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "Required build tool is unavailable: $tool"
@@ -446,8 +748,10 @@ $wixVersion = (& wix --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $wixVersion -notmatch '^6\.') {
     throw "WiX 6 is required; found '$wixVersion'."
 }
+Test-ApprovedStageManifestRejectsInjection
 
 if (-not $PackageOnly) {
+    Remove-GeneratedArtifactFile $stageManifestPath
     Reset-GeneratedDirectory $stageRoot
 }
 Reset-GeneratedDirectory $intermediateRoot
@@ -458,7 +762,11 @@ try {
     if (-not $PackageOnly) {
         Assert-SdkHash $sdkSource 'Vendored ASICamera2.dll'
 
-        & cargo build --release -p autopiercam -p autopiercam-tray
+        & cargo build `
+            --release `
+            --target $rustTarget `
+            -p autopiercam `
+            -p autopiercam-tray
         if ($LASTEXITCODE -ne 0) {
             throw "Rust release build failed with exit code $LASTEXITCODE"
         }
@@ -492,10 +800,10 @@ try {
             Remove-Item -Force
 
         Copy-RequiredFile `
-            (Join-Path $repositoryRoot 'target\release\autopiercam.exe') `
+            (Join-Path $rustReleaseRoot 'autopiercam.exe') `
             (Join-Path $stageRoot 'autopiercam.exe')
         Copy-RequiredFile `
-            (Join-Path $repositoryRoot 'target\release\autopiercam-tray.exe') `
+            (Join-Path $rustReleaseRoot 'autopiercam-tray.exe') `
             (Join-Path $stageRoot 'autopiercam-tray.exe')
         Copy-RequiredFile $sdkSource (Join-Path $stageRoot 'ASICamera2.dll')
         Copy-RequiredFile `
@@ -519,6 +827,14 @@ try {
         Copy-RequiredFile `
             (Join-Path $repositoryRoot 'third-party\rust\Rust-Third-Party-Licenses.md') `
             (Join-Path $licenseRoot 'Rust-Third-Party-Licenses.md')
+
+        $rustSysrootOutput = (& rustc --print sysroot 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rustSysrootOutput)) {
+            throw "Could not locate the active Rust toolchain sysroot: $rustSysrootOutput"
+        }
+        Copy-RequiredFile `
+            (Join-Path $rustSysrootOutput 'share\doc\rust\COPYRIGHT-library.html') `
+            (Join-Path $licenseRoot 'Rust-Standard-Library-COPYRIGHT.html')
 
         $dotnetRoot = Split-Path -Parent (Get-Command dotnet).Source
         Copy-RequiredFile `
@@ -561,13 +877,34 @@ try {
     }
 
     Assert-StagedPayload
+    if (-not $PackageOnly) {
+        New-ApprovedStageManifest `
+            -StagePath $stageRoot `
+            -ManifestPath $stageManifestPath `
+            -ProductVersion $Version `
+            -Target $rustTarget `
+            -SignablePaths $signableStagePaths
+    }
+    Test-ApprovedStageManifest `
+        -StagePath $stageRoot `
+        -ManifestPath $stageManifestPath `
+        -ProductVersion $Version `
+        -Target $rustTarget `
+        -SignablePaths $signableStagePaths
 
     if ($StageOnly) {
         Write-Host "Staged and validated payload at $stageRoot"
+        Write-Host "Approved stage inventory at $stageManifestPath"
         Write-Host 'Sign the first-party executables in this directory, then run this script with -PackageOnly.'
         return
     }
 
+    Test-ApprovedStageManifest `
+        -StagePath $stageRoot `
+        -ManifestPath $stageManifestPath `
+        -ProductVersion $Version `
+        -Target $rustTarget `
+        -SignablePaths $signableStagePaths
     $payloadSource = Join-Path $intermediateRoot 'GeneratedPayload.wxs'
     New-PayloadWixSource $payloadSource
 
@@ -583,6 +920,13 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "WiX build failed with exit code $LASTEXITCODE"
     }
+
+    Test-ApprovedStageManifest `
+        -StagePath $stageRoot `
+        -ManifestPath $stageManifestPath `
+        -ProductVersion $Version `
+        -Target $rustTarget `
+        -SignablePaths $signableStagePaths
 
     Set-MsiFileLanguageNeutral `
         -DatabasePath $msiPath `

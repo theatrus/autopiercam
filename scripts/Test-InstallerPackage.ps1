@@ -5,6 +5,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'PeImports.ps1')
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts'))
@@ -124,8 +125,6 @@ try {
         '--sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;',
         'Shortcut Id="AutoPierCamViewerShortcut"',
         'Shortcut Id="StartAutoPierCamShortcut"',
-        'CloseAutoPierCamTray',
-        'CloseAutoPierCamViewer',
         'Apache License, Version 2.0',
         'Copyright 2026 Yann Ramin',
         '9. Accepting Warranty or Additional Liability',
@@ -135,11 +134,19 @@ try {
         'DllEntry="WixSilentExec"',
         'shutdown-agent --if-running --timeout-seconds 30',
         'CustomAction Id="LaunchTrayAfterInstall"',
+        'Return="asyncNoWait"',
         '--config &quot;[LocalAppDataFolder]AutoPierCam\autopiercam.toml&quot; --sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;'
     )) {
         if (-not $decompiledPackage.Contains($requiredAuthoring)) {
             throw "MSI database is missing required authoring: $requiredAuthoring"
         }
+    }
+    if (
+        $decompiledPackage.Contains('<CustomTable Id="Wix4CloseApplication">') -or
+        $decompiledPackage.Contains('WixCloseApplications') -or
+        $decompiledPackage.Contains('CloseAutoPierCam')
+    ) {
+        throw 'MSI must not contain process-basename CloseApplication handling.'
     }
 
     $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -297,23 +304,18 @@ try {
             "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='SetGracefulStopAutoPierCam'")
         $gracefulSequence = [int](Get-MsiScalar $database `
             "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='GracefulStopAutoPierCam'")
-        $closeSequence = [int](Get-MsiScalar $database `
-            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='Wix4CloseApplications_X64'")
         if (
             $setterSequence -le 1500 -or
-            $setterSequence -ge $gracefulSequence -or
-            $gracefulSequence -ge $closeSequence
+            $gracefulSequence -ne ($setterSequence + 1) -or
+            $gracefulSequence -ge 4000
         ) {
-            throw "Graceful stop must prepare CustomActionData after InstallInitialize, then stop before CloseApplications; got $setterSequence, $gracefulSequence, $closeSequence."
+            throw "Graceful-stop authoring must prepare CustomActionData directly after InstallInitialize and precede InstallFiles; got $setterSequence, $gracefulSequence."
         }
         foreach ($action in @('SetGracefulStopAutoPierCam', 'GracefulStopAutoPierCam')) {
             Assert-MsiScalar $database `
                 "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='$action'" `
                 'Installed OR WIX_UPGRADE_DETECTED' `
                 "$action condition"
-        }
-        if ($closeSequence -ge 3500) {
-            throw "CloseApplications must run before RemoveFiles (3500); got $closeSequence."
         }
         Assert-MsiScalar $database `
             "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='RemoveExistingProducts'" `
@@ -332,6 +334,26 @@ try {
             if ($null -eq $launchArguments -or -not $launchArguments.Contains($requiredArgument)) {
                 throw "Post-install tray launch is missing argument: $requiredArgument"
             }
+        }
+        Assert-MsiScalar $database `
+            "SELECT `Type` FROM `CustomAction` WHERE `Action`='LaunchTrayAfterInstall'" `
+            '210' `
+            'Async current-user tray custom-action type'
+        $launchSequence = [int](Get-MsiScalar $database `
+            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='LaunchTrayAfterInstall'")
+        if ($launchSequence -le 6600) {
+            throw "Post-install tray launch must be authored after InstallFinalize; got sequence $launchSequence."
+        }
+        Assert-MsiScalar $database `
+            "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='LaunchTrayAfterInstall'" `
+            'NOT (REMOVE ~= "ALL")' `
+            'Post-install tray launch condition'
+
+        foreach ($fileId in @('CaptureCliExecutable', 'TrayExecutable')) {
+            Assert-MsiScalar $database `
+                "SELECT `Version` FROM `File` WHERE `File`='$fileId'" `
+                $fileVersion `
+                "$fileId MSI file version"
         }
     } finally {
         if ($null -ne $database) {
@@ -400,6 +422,7 @@ try {
     $requiredLicenseFiles = @(
         'dotnet-LICENSE.txt',
         'dotnet-ThirdPartyNotices.txt',
+        'Rust-Standard-Library-COPYRIGHT.html',
         'Rust-Third-Party-Licenses.md',
         'windows-app-sdk-LICENSE.txt',
         'windows-app-sdk-NOTICE.txt',
@@ -420,6 +443,23 @@ try {
     }
     if (@(Get-ChildItem -LiteralPath $licenseImage -Directory).Count -ne 0) {
         throw 'Administrative-image licenses directory unexpectedly contains nested directories.'
+    }
+
+    $rustStandardLibraryNotice = Get-Content `
+        -LiteralPath (Join-Path $licenseImage 'Rust-Standard-Library-COPYRIGHT.html') `
+        -Raw
+    foreach ($requiredNoticeText in @(
+        '<h1>Copyright notices for The Rust Standard Library</h1>',
+        'The Rust Standard Library is dual-licensed under Apache 2.0 and MIT terms.',
+        'Apache License',
+        'Version 2.0, January 2004',
+        'END OF TERMS AND CONDITIONS',
+        'Permission is hereby granted, free of charge, to any',
+        'THE SOFTWARE IS PROVIDED &#34;AS IS&#34;, WITHOUT WARRANTY OF'
+    )) {
+        if (-not $rustStandardLibraryNotice.Contains($requiredNoticeText)) {
+            throw "Packaged Rust standard-library notice is missing: $requiredNoticeText"
+        }
     }
 
     $rustNoticeSource = Join-Path `
@@ -507,6 +547,18 @@ try {
     }
 
     $cliPath = Join-Path $installImage 'autopiercam.exe'
+    Assert-AutoPierCamStaticCrt `
+        -Path $cliPath `
+        -Description 'Packaged autopiercam.exe'
+    Assert-AutoPierCamVersionResource `
+        -Path $cliPath `
+        -Version $productVersion `
+        -FileDescription 'AutoPierCam capture engine and diagnostic CLI' `
+        -OriginalFilename 'autopiercam.exe'
+    Assert-AutoPierCamApplicationManifest `
+        -Path $cliPath `
+        -Version $productVersion `
+        -AssemblyName 'AutoPierCam.Capture'
     $cliVersion = (& $cliPath --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $cliVersion -cne "autopiercam $productVersion") {
         throw "Packaged capture CLI version mismatch: '$cliVersion'."
@@ -521,6 +573,19 @@ try {
     }
 
     $trayPath = Join-Path $installImage 'autopiercam-tray.exe'
+    Assert-AutoPierCamStaticCrt `
+        -Path $trayPath `
+        -Description 'Packaged autopiercam-tray.exe'
+    Assert-AutoPierCamVersionResource `
+        -Path $trayPath `
+        -Version $productVersion `
+        -FileDescription 'AutoPierCam Windows notification-area host' `
+        -OriginalFilename 'autopiercam-tray.exe'
+    Assert-AutoPierCamApplicationManifest `
+        -Path $trayPath `
+        -Version $productVersion `
+        -AssemblyName 'AutoPierCam.Tray' `
+        -GraphicalShell
     $trayVersion = (& $trayPath --version 2>&1 | Out-String).Trim()
     if ($trayVersion -cne "autopiercam-tray $productVersion") {
         throw "Packaged tray version mismatch: '$trayVersion'."
@@ -545,7 +610,9 @@ try {
         }
     }
 
-    Write-Host 'MSI table checks, validation, administrative extraction, allowlist, hashes, versions, and shutdown contract passed.'
+    Write-Host ('MSI authoring, validation, administrative extraction, allowlists, hashes, ' +
+                'versions, static CRT, and shutdown-command authoring passed. ' +
+                'A normal install/repair/upgrade lifecycle was not executed by this package test.')
 } finally {
     if (Test-Path -LiteralPath $testRoot) {
         $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
