@@ -69,6 +69,7 @@ pub(crate) fn run(options: Options) {
         }
     };
     let agent_monitor = worker.monitor();
+    let menu_config_store = config_store.clone();
     let mut control_server = match ControlServer::start(worker.clone(), agent_monitor, config_store)
     {
         Ok(server) => Some(server),
@@ -100,11 +101,16 @@ pub(crate) fn run(options: Options) {
 
     let menu = Menu::new();
     let open_viewer = MenuItem::new("Open viewer", true, None);
+    let open_captures = MenuItem::new("Open captures", true, None);
+    let open_logs = MenuItem::new("Open logs", true, None);
     let pause_capture = CheckMenuItem::new("Pause capture", true, false, None);
     let capture_now = MenuItem::new("Capture now", true, None);
     let quit = MenuItem::new("Quit", true, None);
     if let Err(error) = menu.append_items(&[
         &open_viewer,
+        &open_captures,
+        &open_logs,
+        &PredefinedMenuItem::separator(),
         &pause_capture,
         &capture_now,
         &PredefinedMenuItem::separator(),
@@ -159,6 +165,14 @@ pub(crate) fn run(options: Options) {
                 launch_viewer();
             }
             Event::UserEvent(UserEvent::Menu(event))
+                if event.id == open_captures.id() && !quitting =>
+            {
+                open_capture_directory(&menu_config_store);
+            }
+            Event::UserEvent(UserEvent::Menu(event)) if event.id == open_logs.id() && !quitting => {
+                open_log_directory(&menu_config_store);
+            }
+            Event::UserEvent(UserEvent::Menu(event))
                 if event.id == pause_capture.id() && !quitting =>
             {
                 // muda updates CheckMenuItem before it emits MenuEvent.
@@ -179,6 +193,8 @@ pub(crate) fn run(options: Options) {
                 if !quitting {
                     quitting = true;
                     open_viewer.set_enabled(false);
+                    open_captures.set_enabled(false);
+                    open_logs.set_enabled(false);
                     pause_capture.set_enabled(false);
                     capture_now.set_enabled(false);
                     quit.set_enabled(false);
@@ -340,6 +356,56 @@ fn launch_viewer() {
     }
 }
 
+fn open_capture_directory(config_store: &ConfigStore) {
+    let snapshot = match config_store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            error!(%error, "could not read the capture directory from configuration");
+            return;
+        }
+    };
+    let directory = resolve_configured_directory(
+        config_store.path(),
+        snapshot.config.capture.directory.as_path(),
+    );
+    launch_directory("capture", &directory);
+}
+
+fn open_log_directory(config_store: &ConfigStore) {
+    let directory = config_store
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs");
+    launch_directory("log", &directory);
+}
+
+fn resolve_configured_directory(config_path: &Path, configured: &Path) -> PathBuf {
+    if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(configured)
+    }
+}
+
+fn launch_directory(label: &'static str, directory: &Path) {
+    if let Err(error) = std::fs::create_dir_all(directory) {
+        error!(kind = label, path = %directory.display(), %error, "could not create directory before opening it");
+        return;
+    }
+    match Command::new("explorer.exe").arg(directory).spawn() {
+        Ok(child) => {
+            info!(kind = label, path = %directory.display(), pid = child.id(), "opened directory")
+        }
+        Err(error) => {
+            error!(kind = label, path = %directory.display(), %error, "could not open directory")
+        }
+    }
+}
+
 fn viewer_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(2);
     match std::env::current_exe() {
@@ -391,4 +457,31 @@ fn generated_icon() -> Icon {
     }
 
     Icon::from_rgba(rgba, SIZE, SIZE).expect("the generated tray icon has valid RGBA dimensions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_capture_directory_is_resolved_beside_configuration() {
+        assert_eq!(
+            resolve_configured_directory(
+                Path::new(r"C:\Users\Alice\AppData\Local\AutoPierCam\autopiercam.toml"),
+                Path::new("captures"),
+            ),
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\AutoPierCam\captures")
+        );
+    }
+
+    #[test]
+    fn absolute_capture_directory_is_preserved() {
+        assert_eq!(
+            resolve_configured_directory(
+                Path::new(r"C:\Users\Alice\AppData\Local\AutoPierCam\autopiercam.toml"),
+                Path::new(r"D:\Pier Captures"),
+            ),
+            PathBuf::from(r"D:\Pier Captures")
+        );
+    }
 }
