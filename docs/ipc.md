@@ -227,13 +227,18 @@ for the active preview session. Ending or restarting a camera session clears
 the published frame and prevents an old session from publishing later.
 
 A newly connected client receives the newest published frame, then only newer
-frames. The server keeps a replacement listener present while one client is
-streaming and allows two seconds for an entire frame write; a slow or broken
-consumer is disconnected without stopping the listener. Clearing a session
-closes an established active stream. The Viewer reconnects with bounded 250 ms, 500 ms,
-1 s, 2 s, then 5 s delays, uses a two-second connection timeout, and requires a
-record to finish within five seconds after its first byte arrives. Waiting for
-the next record's first byte is intentionally unbounded.
+frames. The server fans out independently to as many as four active preview
+clients while keeping one replacement listener present. A fifth client can wait
+on that listener until a stream slot opens; further connection attempts fail
+with the normal Windows pipe-busy result and may retry. Each client gets its own
+two-second whole-frame write timeout, so a slow or broken consumer is
+disconnected without delaying healthy readers or stopping the listener.
+Shutdown cancels and joins all active stream tasks before the pipe thread exits.
+Clearing a session closes every established active stream. The Viewer reconnects
+with bounded 250 ms, 500 ms, 1 s, 2 s, then 5 s delays, uses a two-second
+connection timeout, and requires a record to finish within five seconds after
+its first byte arrives. Waiting for the next record's first byte is intentionally
+unbounded.
 
 The Viewer exposes connecting, waiting, live, and reconnecting stream states,
 clears an image when the connection epoch changes, and verifies metadata,
