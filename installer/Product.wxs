@@ -37,14 +37,15 @@
             Message="AutoPierCam requires Windows 10 version 1809 (build 17763) or later." />
 
     <!-- Ask the running tray to shut down through its authenticated local
-         control pipe and wait for its exact process ID before touching files.
+         control pipe and wait for its exact process ID before Windows
+         Installer and Restart Manager perform files-in-use detection.
          Return=ignore lets Windows Installer and Restart Manager report any
          remaining exact file locks if an older build lacks shutdown-agent. Do
          not use process-basename termination: it can target another session. -->
-    <!-- Deferred actions cannot safely read arbitrary MSI properties. This
-         immediate property action expands INSTALLFOLDER into CustomActionData
-         before WixSilentExec runs in the installing user's context. -->
-    <SetProperty Id="GracefulStopAutoPierCam"
+    <!-- Immediate WixSilentExec reads its formatted command from the
+         WixSilentExecCmdLine property. Both actions run after costing has
+         resolved INSTALLFOLDER and before InstallValidate. -->
+    <SetProperty Id="WixSilentExecCmdLine"
                  Value="&quot;[INSTALLFOLDER]autopiercam.exe&quot; shutdown-agent --if-running --timeout-seconds 30"
                  Before="GracefulStopAutoPierCam"
                  Sequence="execute"
@@ -52,7 +53,7 @@
     <CustomAction Id="GracefulStopAutoPierCam"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixSilentExec"
-                  Execute="deferred"
+                  Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
@@ -234,7 +235,7 @@
                   Return="asyncNoWait" />
     <InstallExecuteSequence>
       <Custom Action="GracefulStopAutoPierCam"
-              After="InstallInitialize"
+              Before="InstallValidate"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <Custom Action="LaunchTrayAfterInstall"
               After="InstallFinalize"

@@ -129,7 +129,7 @@ try {
         'Copyright 2026 Yann Ramin',
         '9. Accepting Warranty or Additional Liability',
         'END OF TERMS AND CONDITIONS',
-        'CustomAction Id="SetGracefulStopAutoPierCam"',
+        'CustomAction Id="SetWixSilentExecCmdLine"',
         'CustomAction Id="GracefulStopAutoPierCam"',
         'DllEntry="WixSilentExec"',
         'shutdown-agent --if-running --timeout-seconds 30',
@@ -271,17 +271,20 @@ try {
         }
 
         Assert-MsiScalar $database `
-            "SELECT `Source` FROM `CustomAction` WHERE `Action`='SetGracefulStopAutoPierCam'" `
-            'GracefulStopAutoPierCam' `
-            'Graceful-stop CustomActionData property'
-        $gracefulCommand = Get-MsiScalar $database `
-            "SELECT `Target` FROM `CustomAction` WHERE `Action`='SetGracefulStopAutoPierCam'"
-        if (
-            $null -eq $gracefulCommand -or
-            -not $gracefulCommand.Contains('"[INSTALLFOLDER]autopiercam.exe"') -or
-            -not $gracefulCommand.Contains('shutdown-agent --if-running --timeout-seconds 30')
-        ) {
-            throw "Graceful-stop property action has an unexpected command: $gracefulCommand"
+            "SELECT `Source` FROM `CustomAction` WHERE `Action`='SetWixSilentExecCmdLine'" `
+            'WixSilentExecCmdLine' `
+            'Immediate graceful-stop command property'
+        Assert-MsiScalar $database `
+            "SELECT `Target` FROM `CustomAction` WHERE `Action`='SetWixSilentExecCmdLine'" `
+            '"[INSTALLFOLDER]autopiercam.exe" shutdown-agent --if-running --timeout-seconds 30' `
+            'Exact installed-path graceful-stop command'
+        Assert-MsiScalar $database `
+            "SELECT `Type` FROM `CustomAction` WHERE `Action`='SetWixSilentExecCmdLine'" `
+            '51' `
+            'Immediate graceful-stop command-property action type'
+        if ($null -ne (Get-MsiScalar $database `
+            "SELECT `Action` FROM `CustomAction` WHERE `Action`='SetGracefulStopAutoPierCam'")) {
+            throw 'MSI still contains the obsolete deferred CustomActionData setter.'
         }
         Assert-MsiScalar $database `
             "SELECT `Source` FROM `CustomAction` WHERE `Action`='GracefulStopAutoPierCam'" `
@@ -291,27 +294,31 @@ try {
             "SELECT `Target` FROM `CustomAction` WHERE `Action`='GracefulStopAutoPierCam'" `
             'WixSilentExec' `
             'Graceful-stop custom-action entry point'
-        $gracefulType = [int](Get-MsiScalar $database `
-            "SELECT `Type` FROM `CustomAction` WHERE `Action`='GracefulStopAutoPierCam'")
-        if (
-            ($gracefulType -band 1024) -eq 0 -or
-            ($gracefulType -band 2048) -ne 0 -or
-            ($gracefulType -band 64) -eq 0
-        ) {
-            throw "Graceful stop must be deferred, impersonated, and non-fatal; CustomAction.Type is $gracefulType."
-        }
+        Assert-MsiScalar $database `
+            "SELECT `Type` FROM `CustomAction` WHERE `Action`='GracefulStopAutoPierCam'" `
+            '65' `
+            'Immediate impersonated non-fatal graceful-stop custom-action type'
         $setterSequence = [int](Get-MsiScalar $database `
-            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='SetGracefulStopAutoPierCam'")
+            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='SetWixSilentExecCmdLine'")
         $gracefulSequence = [int](Get-MsiScalar $database `
             "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='GracefulStopAutoPierCam'")
+        $costFinalizeSequence = [int](Get-MsiScalar $database `
+            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='CostFinalize'")
+        $installValidateSequence = [int](Get-MsiScalar $database `
+            "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action`='InstallValidate'")
         if (
-            $setterSequence -le 1500 -or
+            $costFinalizeSequence -ne 1000 -or
+            $installValidateSequence -ne 1400 -or
+            $setterSequence -le $costFinalizeSequence -or
             $gracefulSequence -ne ($setterSequence + 1) -or
-            $gracefulSequence -ge 4000
+            $gracefulSequence -ge $installValidateSequence
         ) {
-            throw "Graceful-stop authoring must prepare CustomActionData directly after InstallInitialize and precede InstallFiles; got $setterSequence, $gracefulSequence."
+            throw ("Graceful stop must run as an immediate current-user action after " +
+                   "CostFinalize and before InstallValidate; got CostFinalize=" +
+                   "$costFinalizeSequence, setter=$setterSequence, stop=$gracefulSequence, " +
+                   "InstallValidate=$installValidateSequence.")
         }
-        foreach ($action in @('SetGracefulStopAutoPierCam', 'GracefulStopAutoPierCam')) {
+        foreach ($action in @('SetWixSilentExecCmdLine', 'GracefulStopAutoPierCam')) {
             Assert-MsiScalar $database `
                 "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='$action'" `
                 'Installed OR WIX_UPGRADE_DETECTED' `
