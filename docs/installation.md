@@ -138,6 +138,23 @@ administratively extracts, and inspects the MSI:
 .\scripts\Build-Installer.ps1
 ```
 
+On a clean disposable Windows account or release-test host, exercise the real
+per-user lifecycle as well:
+
+```powershell
+.\scripts\Test-InstalledAutoPierCam.ps1
+```
+
+This fail-closed test refuses to touch pre-existing AutoPierCam state. It runs
+default and startup-opt-out installs, verifies the tray and installed feature
+states, tests both explicit and MSI-driven graceful shutdown, uninstalls, and
+proves the application-created configuration survives unchanged. Test-created
+user data and verbose MSI logs are atomically preserved under
+`artifacts\installer\lifecycle-test-*`. Run this host-level check from an
+ordinary user PowerShell rather than a layered or virtualized development
+shell, so Windows Installer and the harness observe the same Local AppData
+namespace.
+
 Before a release, verify that the committed Windows-target Rust license report
 matches the locked dependency graph. This check requires `cargo-about 0.9.1`:
 
