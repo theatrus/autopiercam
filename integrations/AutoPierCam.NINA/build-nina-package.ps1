@@ -246,10 +246,14 @@ if ([string]::IsNullOrWhiteSpace($outputRootParent) -or
 
 $archiveName = "AutoPierCam.NINA.$Version.zip"
 $releaseVersionParts = $Version.Split('.')
-if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
-    $ReleaseTag = "v$($releaseVersionParts[0]).$($releaseVersionParts[1]).$($releaseVersionParts[2])"
-} elseif ($ReleaseTag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
-    throw "ReleaseTag must look like v1.2.3 or v1.2.3-preview.1; got '$ReleaseTag'."
+$releaseTagBase = "v$($releaseVersionParts[0]).$($releaseVersionParts[1]).$($releaseVersionParts[2])"
+$releaseTagPattern = '\A' +
+    [Regex]::Escape($releaseTagBase) +
+    '(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z'
+if ($ReleaseTag.Length -eq 0) {
+    $ReleaseTag = $releaseTagBase
+} elseif ($ReleaseTag -cnotmatch $releaseTagPattern) {
+    throw "ReleaseTag must match Version ${Version}: use $releaseTagBase or $releaseTagBase-preview.1, with nonempty dot-separated prerelease identifiers."
 }
 if ([string]::IsNullOrWhiteSpace($InstallerUrl)) {
     $InstallerUrl = "https://github.com/theatrus/autopiercam/releases/download/$ReleaseTag/$archiveName"
