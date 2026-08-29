@@ -6,8 +6,11 @@
     <RootNamespace>AutoPierCam.Viewer</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platforms>x64</Platforms>
     <UseWinUI>true</UseWinUI>
     <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <Version>0.1.0</Version>
     <AssemblyVersion>0.1.0.0</AssemblyVersion>
     <FileVersion>0.1.0.0</FileVersion>
@@ -21,6 +24,7 @@
     <PackageProjectUrl>https://github.com/theatrus/autopiercam</PackageProjectUrl>
     <RepositoryUrl>https://github.com/theatrus/autopiercam</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -28,4 +32,22 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
   </ItemGroup>
+
+  <!-- The Windows App SDK publish pipeline omits compiled XAML and the PRI
+       from an unpackaged WinUI application's publish directory. Copy the
+       already-built runtime resources explicitly and fail the package build
+       if the markup compiler did not create them. -->
+  <Target Name="CopyWinUiMarkupToPublishDirectory" AfterTargets="Publish">
+    <ItemGroup>
+      <_WinUiMarkup Include="$(TargetDir)*.xbf" />
+    </ItemGroup>
+    <Error Condition="'@(_WinUiMarkup)' == '' or !Exists('$(TargetDir)$(ProjectPriFileName)')"
+           Text="The WinUI markup compiler did not produce runtime resources." />
+    <Copy SourceFiles="@(_WinUiMarkup)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetDir)$(ProjectPriFileName)"
+          DestinationFiles="$(PublishDir)resources.pri"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>
