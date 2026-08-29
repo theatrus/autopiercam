@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 /captures/
 /autopiercam.toml
 /ASI_Camera_SDK/

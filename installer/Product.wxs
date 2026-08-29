@@ -1,0 +1,264 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="AutoPierCam"
+           Manufacturer="Yann Ramin"
+           Version="$(ProductVersion)"
+           UpgradeCode="CFB03866-5B27-42FD-8CC3-84E6F58DB343"
+           Language="1033"
+           Scope="perUser"
+           InstallerVersion="500"
+           Compressed="yes">
+    <SummaryInformation Description="Automatic pier-camera capture, configuration, and live viewing" />
+
+    <!-- Install the candidate before removing the previous product. Stable
+         component GUIDs and installed paths let a major upgrade retain shared
+         self-contained runtime files when MSI decides not to recopy them. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AutoPierCam is already installed."
+                  Schedule="afterInstallExecute" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/theatrus/autopiercam" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/theatrus/autopiercam/issues" />
+    <Property Id="ARPCONTACT" Value="Yann Ramin" />
+    <Property Id="ARPCOMMENTS"
+              Value="Automatic capture and monitoring for ZWO ASI planetary cameras. Configuration, captures, upload state, and 14 daily logs are kept in the current user's Local AppData." />
+    <Property Id="MSIDISABLERMRESTART" Value="1" />
+
+    <Property Id="WINDOWSBUILDNUMBER" Secure="yes">
+      <RegistrySearch Id="WindowsBuildNumberSearch"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber"
+                      Type="raw" />
+    </Property>
+    <Launch Condition="Installed OR VersionNT64"
+            Message="AutoPierCam requires a 64-bit edition of Windows." />
+    <Launch Condition="Installed OR (WINDOWSBUILDNUMBER &gt;= 17763)"
+            Message="AutoPierCam requires Windows 10 version 1809 (build 17763) or later." />
+
+    <!-- Ask both interactive processes to leave before InstallFiles. The
+         package relaunches the tray after InstallFinalize, while the viewer is
+         intentionally left closed so an upgrade does not surprise the user. -->
+    <util:CloseApplication Id="CloseAutoPierCamTray"
+                           Target="autopiercam-tray.exe"
+                           CloseMessage="yes"
+                           Timeout="5"
+                           TerminateProcess="0"
+                           RebootPrompt="no" />
+    <util:CloseApplication Id="CloseAutoPierCamViewer"
+                           Target="AutoPierCam.Viewer.exe"
+                           CloseMessage="yes"
+                           Timeout="5"
+                           TerminateProcess="0"
+                           RebootPrompt="no" />
+
+    <!-- Ask the running tray to shut down through its authenticated local
+         control pipe and wait for its exact process ID before touching files.
+         CloseApplication remains a compatibility fallback for an older or
+         unhealthy process. Return=ignore intentionally lets that fallback run
+         if a pre-release build does not understand shutdown-agent. -->
+    <!-- Deferred actions cannot safely read arbitrary MSI properties. This
+         immediate property action expands INSTALLFOLDER into CustomActionData
+         before WixSilentExec runs in the installing user's context. -->
+    <SetProperty Id="GracefulStopAutoPierCam"
+                 Value="&quot;[INSTALLFOLDER]autopiercam.exe&quot; shutdown-agent --if-running --timeout-seconds 30"
+                 Before="GracefulStopAutoPierCam"
+                 Sequence="execute"
+                 Condition="Installed OR WIX_UPGRADE_DETECTED" />
+    <CustomAction Id="GracefulStopAutoPierCam"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixSilentExec"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LOCALPROGRAMSDIRECTORY" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="AutoPierCam">
+          <Directory Id="VIEWERFOLDER" Name="Viewer" />
+          <Directory Id="LICENSESFOLDER" Name="licenses" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AUTOPIERCAMPROGRAMMENU" Name="AutoPierCam" />
+    </StandardDirectory>
+
+    <Feature Id="MainApplication"
+             Title="AutoPierCam application"
+             Description="Capture agent, notification-area host, viewer, ZWO SDK runtime, and documentation. User settings and captures remain in Local AppData when the app is removed."
+             Level="1"
+             Display="expand"
+             AllowAbsent="no"
+             AllowAdvertise="no">
+      <!-- The build script generates one stable component per remaining file.
+           Each generated component has an HKCU registry key path, as required
+           for repair-safe files under a user-profile directory. -->
+      <ComponentGroupRef Id="GeneratedPayloadFiles" />
+
+      <Component Id="CaptureCliComponent"
+                 Guid="47D94910-248E-4BCB-ADE2-04D3E4442BA7"
+                 Directory="INSTALLFOLDER">
+        <File Id="CaptureCliExecutable"
+              Source="$(StageDir)\autopiercam.exe" />
+        <RegistryValue Id="CaptureCliKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="CaptureCli"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="TrayExecutableComponent"
+                 Guid="874B79A1-A7BB-4A4F-AEA0-8A7736B5A438"
+                 Directory="INSTALLFOLDER">
+        <File Id="TrayExecutable"
+              Source="$(StageDir)\autopiercam-tray.exe" />
+        <RegistryValue Id="TrayExecutableKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="TrayExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="SdkRuntimeComponent"
+                 Guid="D984D07D-A511-47B7-9BB0-99DD818D3B6C"
+                 Directory="INSTALLFOLDER">
+        <File Id="SdkRuntime"
+              Source="$(StageDir)\ASICamera2.dll" />
+        <RegistryValue Id="SdkRuntimeKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="SdkRuntime"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="ViewerExecutableComponent"
+                 Guid="57989CDB-CDCB-4350-AA9C-D68722C80405"
+                 Directory="VIEWERFOLDER">
+        <File Id="ViewerExecutable"
+              Source="$(StageDir)\Viewer\AutoPierCam.Viewer.exe" />
+        <RegistryValue Id="ViewerExecutableKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="ViewerExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="WinUiXamlRuntimeComponent"
+                 Guid="33152D60-7900-45B6-8B47-1B0C5F4FFED0"
+                 Directory="VIEWERFOLDER">
+        <File Id="WinUiXamlRuntime"
+              Source="$(StageDir)\Viewer\Microsoft.ui.xaml.dll"
+              DefaultLanguage="0" />
+        <RegistryValue Id="WinUiXamlRuntimeKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="WinUiXamlRuntime"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="WinUiXamlPhoneRuntimeComponent"
+                 Guid="4A8F4F31-C085-4501-97A6-5DC41167BF18"
+                 Directory="VIEWERFOLDER">
+        <File Id="WinUiXamlPhoneRuntime"
+              Source="$(StageDir)\Viewer\Microsoft.UI.Xaml.Phone.dll"
+              DefaultLanguage="0" />
+        <RegistryValue Id="WinUiXamlPhoneRuntimeKeyPath"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer\Payload"
+                       Name="WinUiXamlPhoneRuntime"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuShortcutsComponent"
+                 Guid="6922E5E3-8A0F-4CF4-94A5-B00BA854BB44"
+                 Directory="AUTOPIERCAMPROGRAMMENU">
+        <Shortcut Id="AutoPierCamViewerShortcut"
+                  Name="AutoPierCam Viewer"
+                  Description="Configure AutoPierCam and view the live pier camera"
+                  Target="[VIEWERFOLDER]AutoPierCam.Viewer.exe"
+                  WorkingDirectory="VIEWERFOLDER" />
+        <Shortcut Id="StartAutoPierCamShortcut"
+                  Name="Start AutoPierCam"
+                  Description="Start automatic pier-camera capture in the notification area"
+                  Target="[INSTALLFOLDER]autopiercam-tray.exe"
+                  Arguments="--config &quot;[LocalAppDataFolder]AutoPierCam\autopiercam.toml&quot; --sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveAutoPierCamProgramMenu" On="uninstall" />
+        <!-- ICE64 requires every authored directory below a user-profile
+             root to have a RemoveFile row. This attempt affects Programs only
+             when it is empty; it never removes another application's files. -->
+        <RemoveFolder Id="RemoveEmptyLocalProgramsDirectory"
+                      Directory="LOCALPROGRAMSDIRECTORY"
+                      On="uninstall" />
+        <RegistryValue Id="StartMenuShortcutMarker"
+                       Root="HKCU"
+                       Key="Software\AutoPierCam\Installer"
+                       Name="StartMenuShortcuts"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <!-- This optional child is selected by default in WixUI_FeatureTree.
+           It owns only the current user's Run entry, so Modify can toggle
+           startup without touching the application or user data. -->
+      <Feature Id="StartAtSignIn"
+               Title="Start AutoPierCam when I sign in (recommended)"
+               Description="Starts background capture for this Windows account. You can change this later by modifying the installation."
+               Level="1"
+               Display="expand"
+               AllowAdvertise="no">
+        <Component Id="TrayAutostartComponent"
+                   Guid="4109A4BD-5D04-47A3-8826-51B439E05345"
+                   Directory="INSTALLFOLDER">
+          <RegistryValue Id="AutoPierCamRunEntry"
+                         Root="HKCU"
+                         Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                         Name="AutoPierCam"
+                         Type="string"
+                         Value="&quot;[INSTALLFOLDER]autopiercam-tray.exe&quot; --config &quot;[LocalAppDataFolder]AutoPierCam\autopiercam.toml&quot; --sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;"
+                         KeyPath="yes" />
+        </Component>
+      </Feature>
+    </Feature>
+
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+
+    <!-- A per-user package can launch its installed tray directly in the
+         installing user's context. Keep the paths explicit here as they are
+         in the sign-in entry and Start Menu shortcut. -->
+    <CustomAction Id="LaunchTrayAfterInstall"
+                  FileRef="TrayExecutable"
+                  ExeCommand="--config &quot;[LocalAppDataFolder]AutoPierCam\autopiercam.toml&quot; --sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="GracefulStopAutoPierCam"
+              After="InstallInitialize"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)"
+              After="GracefulStopAutoPierCam"
+              Condition="VersionNT &gt; 400" />
+      <Custom Action="LaunchTrayAfterInstall"
+              After="InstallFinalize"
+              Condition="NOT (REMOVE ~= &quot;ALL&quot;)" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
