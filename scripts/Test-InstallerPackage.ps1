@@ -400,6 +400,7 @@ try {
     $requiredLicenseFiles = @(
         'dotnet-LICENSE.txt',
         'dotnet-ThirdPartyNotices.txt',
+        'Rust-Third-Party-Licenses.md',
         'windows-app-sdk-LICENSE.txt',
         'windows-app-sdk-NOTICE.txt',
         'ZWO-ASI-SDK-license.txt'
@@ -419,6 +420,27 @@ try {
     }
     if (@(Get-ChildItem -LiteralPath $licenseImage -Directory).Count -ne 0) {
         throw 'Administrative-image licenses directory unexpectedly contains nested directories.'
+    }
+
+    $rustNoticeSource = Join-Path `
+        $repositoryRoot `
+        'third-party\rust\Rust-Third-Party-Licenses.md'
+    $rustNoticeImage = Join-Path $licenseImage 'Rust-Third-Party-Licenses.md'
+    $rustNoticeSourceHash = (Get-FileHash -LiteralPath $rustNoticeSource -Algorithm SHA256).Hash
+    $rustNoticeImageHash = (Get-FileHash -LiteralPath $rustNoticeImage -Algorithm SHA256).Hash
+    if ($rustNoticeImageHash -cne $rustNoticeSourceHash) {
+        throw 'Administrative extraction changed the generated Rust dependency notices.'
+    }
+    $rustNoticeText = Get-Content -LiteralPath $rustNoticeImage -Raw
+    foreach ($requiredNoticeText in @(
+        '# Rust dependency licenses',
+        'x86_64-pc-windows-msvc',
+        '## Components',
+        '## License and copyright texts'
+    )) {
+        if (-not $rustNoticeText.Contains($requiredNoticeText)) {
+            throw "Generated Rust dependency notices are missing: $requiredNoticeText"
+        }
     }
 
     $installedLicense = Get-Content -LiteralPath (Join-Path $installImage 'LICENSE-AutoPierCam.txt') -Raw

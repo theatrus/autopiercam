@@ -1,9 +1,10 @@
 # AutoPierCam
 
-AutoPierCam is a Windows-first, portable Rust capture agent for ZWO ASI
-planetary cameras. It is intended to live in the system tray, adapt between
-bright days and dark nights, save debayered stills, maintain short security
-video segments, and optionally upload completed artifacts.
+AutoPierCam is a Windows-first capture suite for ZWO ASI planetary cameras,
+built around a portable Rust core and capture agent. On Windows it lives in the
+system tray, adapts between bright days and dark nights, saves debayered stills,
+and can upload completed artifacts. Short security-video segments remain a
+planned storage sink rather than an implemented feature.
 
 AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
@@ -23,9 +24,12 @@ The repository now contains a hardware-validated background capture slice:
 - a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
   backoff;
 - a Windows notification-area host that owns and supervises the camera worker;
+- per-user Windows installer packaging with optional start-at-sign-in,
+  self-contained Viewer deployment, orderly upgrade shutdown, and retained
+  user data;
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
-- a separate secured, outbound-only preview pipe backed by a bounded latest-frame
-  producer;
+- a separate same-user, outbound-only preview pipe backed by a bounded
+  latest-frame producer and isolated fan-out to four concurrent viewers;
 - a durable SQLite HTTP outbox that records atomically published JPEGs, resumes
   retries after restart, and supports bounded operator inspection and safe,
   revision-fenced requeue without delaying capture for network work;
@@ -36,7 +40,25 @@ The repository now contains a hardware-validated background capture slice:
 - a buildable unpackaged WinUI 3 viewer that shows live status, requests an
   immediate capture, renders the latest JPEG preview, manages the durable
   outbox, reports storage pressure, and edits the supported live configuration
-  fields.
+  fields;
+- a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
+  Camera** panel to the Imaging tab.
+
+## Install on Windows
+
+The x64 MSI installs AutoPierCam for the current Windows user under
+`%LOCALAPPDATA%\Programs\AutoPierCam`. It includes the ZWO SDK runtime and a
+self-contained Viewer; install the ZWO Windows camera driver separately first.
+Windows 10 version 1809 or newer is required.
+
+Configuration and user data live outside the application directory under
+`%LOCALAPPDATA%\AutoPierCam`: captures default to `captures\`, persistent logs
+to `logs\`, and the upload ledger sits beside the configuration. The optional
+start-at-sign-in feature is selected by default. Upgrade and uninstall preserve
+all user data deliberately.
+
+See [Installing AutoPierCam on Windows](docs/installation.md) for interactive
+and silent installation, exact paths, diagnostics, upgrades, and removal.
 
 ## Quick start
 
@@ -66,9 +88,16 @@ The command prints the verified archive/retired paths and archive SHA-256. See
 `docs/upload.md` for refusal conditions and partial-operation recovery.
 
 The tray also accepts `AUTOPIERCAM_CONFIG` and `AUTOPIERCAM_ASI_SDK_PATH`.
-Its menu can open the built Viewer, pause/resume scheduled stills, capture one
-frame immediately, and perform an ordered shutdown. `autopiercam run` remains
-available for a console-only installation or capture test.
+Its menu can open the Viewer, capture and log folders, pause/resume scheduled
+stills, capture one frame immediately, and perform an ordered shutdown. Logs use
+UTC daily filenames and the newest 14 files are retained. Installers request an
+orderly shutdown and wait up to 30 seconds before upgrade or uninstall; an
+operator can issue the same request without loading the camera SDK:
+
+    autopiercam shutdown-agent --if-running --timeout-seconds 30
+
+`autopiercam run` remains available for a console-only installation or capture
+test.
 
 Set AUTOPIERCAM_ASI_SDK_PATH or pass --sdk when the SDK DLL is not in the
 bundled location. The x64 runtime DLL is expected at:
@@ -79,6 +108,19 @@ The ZWO library is redistributed under its included MIT-style license; it is
 not relicensed under AutoPierCam's Apache-2.0 license. The camera driver is
 installed separately. See `THIRD_PARTY_NOTICES.md` for details.
 
+## N.I.N.A. integration
+
+The separately distributed AutoPierCam plugin requires N.I.N.A. 3.2 or newer.
+It adds a **Pier Camera** dockable panel to Imaging, connects as the same Windows
+user to the local preview stream, and retains a visibly stale last snapshot
+during interruptions. It is strictly read-only and never opens or owns the ZWO
+camera, so the N.I.N.A. panel and AutoPierCam Viewer can run together.
+
+The plugin is not installed by the AutoPierCam MSI. Extract its archive to
+`%LOCALAPPDATA%\NINA\Plugins\3.0.0\AutoPierCam` while N.I.N.A. is closed. See
+[AutoPierCam for N.I.N.A.](integrations/AutoPierCam.NINA/README.md) for use,
+troubleshooting, development, and package details.
+
 ## Workspace
 
 - crates/autopiercam-asi: dynamically loaded ASICamera2 wrapper.
@@ -87,6 +129,12 @@ installed separately. See `THIRD_PARTY_NOTICES.md` for details.
 - crates/autopiercam: reusable capture engine plus diagnostic CLI.
 - crates/autopiercam-tray: Windows notification-area host and named-pipe server.
 - apps/AutoPierCam.Viewer: unpackaged WinUI 3 status/settings application.
+- installer and scripts/Build-Installer.ps1: per-user WiX 6 MSI and its guarded
+  staging, packaging, and verification pipeline.
+- integrations/AutoPierCam.NINA: N.I.N.A. Imaging-tab plugin, tests, and release
+  archive/manifest builder.
+- docs/installation.md: installed paths, start-at-sign-in, logs, diagnostics,
+  silent setup, removal, and installer build/signing seam.
 - docs/architecture.md: target agent, UI, storage, video, and upload design.
 - docs/upload.md: implemented HTTP request, retry, and durability contract.
 - docs/retention.md: implemented retention policy, upload-ledger safety, and
@@ -149,7 +197,9 @@ healthy.
   available.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
-  off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder.
+  off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder. Up to four
+  independent active preview clients can coexist; a fifth retries when a slot
+  becomes available. A slow client cannot stall capture or the other clients.
 - Auto-exposure limits use microseconds in AutoPierCam configuration. SDK 1.41
   documentation calls control 11 microseconds, while the ASI676MC exposes
   AutoExpMaxExpMS. The implementation detects the runtime control name and

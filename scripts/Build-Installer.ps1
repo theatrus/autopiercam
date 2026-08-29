@@ -124,6 +124,7 @@ function Assert-StagedPayload {
     $requiredLicenseFiles = @(
         'dotnet-LICENSE.txt',
         'dotnet-ThirdPartyNotices.txt',
+        'Rust-Third-Party-Licenses.md',
         'windows-app-sdk-LICENSE.txt',
         'windows-app-sdk-NOTICE.txt',
         'ZWO-ASI-SDK-license.txt'
@@ -515,6 +516,9 @@ try {
         Copy-RequiredFile `
             (Join-Path $repositoryRoot 'vendor\zwo\ASI SDK\license.txt') `
             (Join-Path $licenseRoot 'ZWO-ASI-SDK-license.txt')
+        Copy-RequiredFile `
+            (Join-Path $repositoryRoot 'third-party\rust\Rust-Third-Party-Licenses.md') `
+            (Join-Path $licenseRoot 'Rust-Third-Party-Licenses.md')
 
         $dotnetRoot = Split-Path -Parent (Get-Command dotnet).Source
         Copy-RequiredFile `

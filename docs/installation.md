@@ -18,9 +18,10 @@ feature page includes **Start AutoPierCam when I sign in (recommended)**,
 selected by default. Clear it if capture should only run when manually started.
 The choice can be changed later with **Modify** from Windows Installed apps.
 
-The installer starts AutoPierCam when setup finishes. The tray menu can open
-the Viewer, pause capture, capture immediately, or stop the application. The
-Start menu also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
+The installer starts AutoPierCam when setup finishes, independently of the
+start-at-sign-in choice. The tray menu can open the Viewer, captures, and logs;
+pause capture; capture immediately; or stop the application. The Start menu
+also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
 ## What is installed
 
@@ -34,6 +35,9 @@ Application files are installed for the current user at:
 `ASICamera2.dll` are adjacent in that directory. The complete self-contained
 WinUI application is under `Viewer\`; no separate .NET runtime installation is
 required. Apache and third-party license material is included with the payload.
+The full generated Rust dependency report is installed as
+`licenses\Rust-Third-Party-Licenses.md` alongside the ZWO, .NET, and Windows App
+SDK license files.
 
 The optional sign-in feature writes this current-user startup command:
 
@@ -71,7 +75,37 @@ captures, upload state, and logs therefore survive repair, upgrade, and
 uninstall. After uninstalling, delete that exact directory manually in Explorer
 only if its retained contents are no longer wanted.
 
+## Viewer and N.I.N.A.
+
+AutoPierCam accepts up to four independent local preview clients. The Viewer
+and the separately distributed N.I.N.A. plugin can therefore remain open at the
+same time, and a slow client cannot stall camera capture or the other viewers.
+A fifth client waits and retries when a slot becomes available.
+
+The N.I.N.A. plugin is not part of the MSI. With N.I.N.A. closed, extract its
+archive to `%LOCALAPPDATA%\NINA\Plugins\3.0.0\AutoPierCam`; see
+`integrations\AutoPierCam.NINA\README.md` in the source tree for details. It
+adds a read-only **Pier Camera** panel to Imaging and never opens the camera.
+
+## Upgrade and shutdown
+
+Repair, upgrade, and uninstall ask the running tray to shut down through its
+same-user control pipe and wait up to 30 seconds for that exact process. The MSI
+then asks compatible tray and Viewer processes to close before replacing or
+removing files. It does not forcibly terminate an unhealthy process; if setup
+reports files in use, stop AutoPierCam from its tray menu or run:
+
+```powershell
+autopiercam shutdown-agent --if-running --timeout-seconds 30
+```
+
 ## Silent installation and diagnostics
+
+Before installing a downloaded release, compare its published SHA-256 with:
+
+```powershell
+Get-FileHash .\AutoPierCam-0.1.0-x64.msi -Algorithm SHA256
+```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
@@ -101,6 +135,13 @@ administratively extracts, and inspects the MSI:
 
 ```powershell
 .\scripts\Build-Installer.ps1
+```
+
+Before a release, verify that the committed Windows-target Rust license report
+matches the locked dependency graph. This check requires `cargo-about 0.9.1`:
+
+```powershell
+.\third-party\rust\Generate-Notices.ps1 -Check
 ```
 
 Release builds preserve an explicit signing gap:
