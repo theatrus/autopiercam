@@ -16,6 +16,218 @@ $cleanupQuiescenceTimeoutSeconds = 60
 $script:msiTransactionTimedOut = $false
 $script:msiTimeoutDescriptions = [Collections.Generic.List[string]]::new()
 
+if ($null -eq ('AutoPierCam.InstallerTest.NativeDirectoryIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace AutoPierCam.InstallerTest
+{
+    public static class NativeDirectoryIdentity
+    {
+        private const uint OpenExisting = 3;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint FileShareDelete = 0x00000004;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information);
+
+        public static string Get(string path)
+        {
+            using (SafeFileHandle handle = CreateFileW(
+                path,
+                0,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero))
+            {
+                if (handle.IsInvalid)
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Could not open the directory for identity inspection.");
+                }
+
+                ByHandleFileInformation information;
+                if (!GetFileInformationByHandle(handle, out information))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Could not read the directory identity.");
+                }
+
+                if ((information.FileAttributes & FileAttributeReparsePoint) != 0)
+                {
+                    throw new InvalidOperationException(
+                        "Directory identity targets must not be reparse points.");
+                }
+
+                ulong fileIndex = ((ulong)information.FileIndexHigh << 32) |
+                                  information.FileIndexLow;
+                return information.VolumeSerialNumber.ToString("X8") + ":" +
+                       fileIndex.ToString("X16");
+            }
+        }
+    }
+}
+'@
+}
+
+function Get-DirectoryIdentity([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "Directory identity target is missing: $Path"
+    }
+    return [AutoPierCam.InstallerTest.NativeDirectoryIdentity]::Get(
+        [IO.Path]::GetFullPath($Path)
+    )
+}
+
+function Assert-DirectoryIdentity(
+    [string] $Path,
+    [string] $ExpectedIdentity,
+    [string] $Description
+) {
+    $actualIdentity = Get-DirectoryIdentity $Path
+    if (-not [string]::Equals(
+        $actualIdentity,
+        $ExpectedIdentity,
+        [StringComparison]::Ordinal
+    )) {
+        throw "$Description changed filesystem identity."
+    }
+}
+
+function Get-DataTreeInventory([string] $Root) {
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {
+        throw "Cannot inventory a missing data root: $resolvedRoot"
+    }
+    # Open the root namespace entry without following a junction or symlink.
+    # Get-DirectoryIdentity rejects a reparse-point root before enumeration.
+    [void] (Get-DirectoryIdentity $resolvedRoot)
+    $entries = [Collections.Generic.List[object]]::new()
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($resolvedRoot)
+    while ($pending.Count -ne 0) {
+        $directory = $pending.Pop()
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
+            $attributes = [IO.File]::GetAttributes($entryPath)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "The test-owned data tree contains a reparse point: $entryPath"
+            }
+            $relativePath = [IO.Path]::GetRelativePath(
+                $resolvedRoot,
+                $entryPath
+            ).Replace('/', '\')
+            if ([IO.Path]::IsPathRooted($relativePath) -or
+                $relativePath.StartsWith('..\', [StringComparison]::Ordinal) -or
+                $relativePath.Split('\') -contains '..' -or
+                $relativePath.Split('\') -contains '.') {
+                throw "The data inventory produced an unsafe relative path: $relativePath"
+            }
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                $entries.Add([pscustomobject] @{
+                    RelativePath = $relativePath
+                    Type = 'directory'
+                    Length = [long] -1
+                    Sha256 = ''
+                })
+                $pending.Push($entryPath)
+            } else {
+                $file = [IO.FileInfo]::new($entryPath)
+                $entries.Add([pscustomobject] @{
+                    RelativePath = $relativePath
+                    Type = 'file'
+                    Length = [long] $file.Length
+                    Sha256 = (Get-FileHash `
+                        -LiteralPath $entryPath `
+                        -Algorithm SHA256).Hash.ToLowerInvariant()
+                })
+            }
+        }
+    }
+    return @($entries | Sort-Object RelativePath)
+}
+
+function Assert-DataTreeInventoryEqual(
+    [object[]] $Expected,
+    [object[]] $Actual,
+    [string] $Description
+) {
+    if ($Expected.Count -ne $Actual.Count) {
+        throw "$Description inventory count changed from $($Expected.Count) to $($Actual.Count)."
+    }
+    for ($index = 0; $index -lt $Expected.Count; $index++) {
+        $expectedEntry = $Expected[$index]
+        $actualEntry = $Actual[$index]
+        if (-not [string]::Equals(
+                [string] $expectedEntry.RelativePath,
+                [string] $actualEntry.RelativePath,
+                [StringComparison]::Ordinal
+            ) -or
+            -not [string]::Equals(
+                [string] $expectedEntry.Type,
+                [string] $actualEntry.Type,
+                [StringComparison]::Ordinal
+            ) -or
+            [long] $expectedEntry.Length -ne [long] $actualEntry.Length -or
+            -not [string]::Equals(
+                [string] $expectedEntry.Sha256,
+                [string] $actualEntry.Sha256,
+                [StringComparison]::Ordinal
+            )) {
+            throw "$Description inventory changed at sorted entry $index."
+        }
+    }
+}
+
+function Get-StableDataTreeInventory([string] $Root) {
+    $first = @(Get-DataTreeInventory $Root)
+    Start-Sleep -Milliseconds 250
+    $second = @(Get-DataTreeInventory $Root)
+    Assert-DataTreeInventoryEqual `
+        -Expected $first `
+        -Actual $second `
+        -Description 'Pre-archive data tree'
+    return $second
+}
+
 function Get-MsiScalar(
     [object] $Database,
     [string] $Sql
@@ -867,6 +1079,122 @@ function Wait-ForSafePostCleanupState(
     )
 }
 
+function Get-PostArchiveProblems(
+    [string] $ProductCode,
+    [string] $UpgradeCode,
+    [string] $InstallDirectory,
+    [string] $SourceDataDirectory,
+    [string] $ArchivedDataDirectory,
+    [string] $StartMenuDirectory,
+    [string] $RunRegistryPath,
+    [string] $InstallerRegistryPath,
+    [string] $ExpectedDataIdentity,
+    [string] $ArchivedSentinelPath,
+    [string] $SentinelContents
+) {
+    $problems = [Collections.Generic.List[string]]::new()
+    if (-not (Test-WindowsInstallerTransactionQuiescent)) {
+        $problems.Add('Windows Installer transaction is not quiescent')
+    }
+    if ((Get-InstallerProductState $ProductCode) -ne -1) {
+        $problems.Add('candidate ProductCode is not unknown')
+    }
+    if (@(Get-RelatedProductCodes $UpgradeCode).Count -ne 0) {
+        $problems.Add('a related product remains registered')
+    }
+    if (@(Get-AutoPierCamArpEntries).Count -ne 0) {
+        $problems.Add('an AutoPierCam ARP entry remains')
+    }
+    if (Test-Path -LiteralPath $InstallDirectory) {
+        $problems.Add('program directory remains')
+    }
+    if (Test-Path -LiteralPath $StartMenuDirectory) {
+        $problems.Add('Start Menu directory remains')
+    }
+    if ($null -ne (Get-RunValue $RunRegistryPath)) {
+        $problems.Add('AutoPierCam Run value remains')
+    }
+    if (Test-Path -LiteralPath $InstallerRegistryPath) {
+        $problems.Add('AutoPierCam installer registry key remains')
+    }
+    if (@(Get-AutoPierCamProcesses).Count -ne 0) {
+        $problems.Add('an AutoPierCam process remains')
+    }
+    if (Test-Path -LiteralPath $SourceDataDirectory) {
+        $problems.Add('source user-data path reappeared')
+    }
+    if (-not (Test-Path -LiteralPath $ArchivedDataDirectory -PathType Container)) {
+        $problems.Add('archived user-data directory is missing')
+    } elseif (-not [string]::Equals(
+        (Get-DirectoryIdentity $ArchivedDataDirectory),
+        $ExpectedDataIdentity,
+        [StringComparison]::Ordinal
+    )) {
+        $problems.Add('archived user-data directory identity changed')
+    }
+    if (-not (Test-Path -LiteralPath $ArchivedSentinelPath -PathType Leaf)) {
+        $problems.Add('archived sentinel is missing')
+    } elseif (-not [string]::Equals(
+        (Get-Content -LiteralPath $ArchivedSentinelPath -Raw),
+        $SentinelContents,
+        [StringComparison]::Ordinal
+    )) {
+        $problems.Add('archived sentinel changed')
+    }
+    return $problems
+}
+
+function Wait-ForStablePostArchiveState(
+    [int] $TimeoutSeconds,
+    [int] $RequiredConsecutiveSamples,
+    [string] $ProductCode,
+    [string] $UpgradeCode,
+    [string] $InstallDirectory,
+    [string] $SourceDataDirectory,
+    [string] $ArchivedDataDirectory,
+    [string] $StartMenuDirectory,
+    [string] $RunRegistryPath,
+    [string] $InstallerRegistryPath,
+    [string] $ExpectedDataIdentity,
+    [string] $ArchivedSentinelPath,
+    [string] $SentinelContents
+) {
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $consecutiveSafeSamples = 0
+    $lastProblems = @('post-archive state was not inspected')
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $lastProblems = @(Get-PostArchiveProblems `
+                -ProductCode $ProductCode `
+                -UpgradeCode $UpgradeCode `
+                -InstallDirectory $InstallDirectory `
+                -SourceDataDirectory $SourceDataDirectory `
+                -ArchivedDataDirectory $ArchivedDataDirectory `
+                -StartMenuDirectory $StartMenuDirectory `
+                -RunRegistryPath $RunRegistryPath `
+                -InstallerRegistryPath $InstallerRegistryPath `
+                -ExpectedDataIdentity $ExpectedDataIdentity `
+                -ArchivedSentinelPath $ArchivedSentinelPath `
+                -SentinelContents $SentinelContents)
+        } catch {
+            $lastProblems = @('post-archive state could not be inspected safely')
+        }
+        if ($lastProblems.Count -eq 0) {
+            $consecutiveSafeSamples++
+            if ($consecutiveSafeSamples -ge $RequiredConsecutiveSamples) {
+                return
+            }
+        } else {
+            $consecutiveSafeSamples = 0
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw (
+        "Stable post-archive state was not reached within $TimeoutSeconds seconds: " +
+        ($lastProblems -join ', ')
+    )
+}
+
 function Assert-ProductUnregistered(
     [string] $ProductCode,
     [string] $UpgradeCode
@@ -1034,6 +1362,7 @@ $sentinelContents = (
         [Guid]::NewGuid().ToString('D')
 )
 $dataDirectoryOwned = $false
+$claimedDataRootIdentity = $null
 $primaryFailure = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 
@@ -1052,6 +1381,7 @@ try {
         $sentinelContents,
         [Text.UTF8Encoding]::new($false)
     )
+    $claimedDataRootIdentity = Get-DirectoryIdentity $dataDirectory
 
     Write-Host 'Cycle 1: default per-user install with sign-in startup enabled.'
     Invoke-MsiOperation `
@@ -1061,6 +1391,10 @@ try {
     $firstTray = Wait-ForInstalledTray `
         -ExpectedPath $trayPath `
         -TimeoutSeconds $trayStartupTimeoutSeconds
+    Assert-DirectoryIdentity `
+        -Path $dataDirectory `
+        -ExpectedIdentity $claimedDataRootIdentity `
+        -Description 'Cycle-one data root'
     Assert-InstalledPayload `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
@@ -1082,6 +1416,10 @@ try {
         -Operation Uninstall `
         -Target $msiIdentity.ProductCode `
         -LogPath (Join-Path $artifactRoot '02-default-uninstall.log')
+    Assert-DirectoryIdentity `
+        -Path $dataDirectory `
+        -ExpectedIdentity $claimedDataRootIdentity `
+        -Description 'Data root after cycle-one uninstall'
     Assert-UninstalledState `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
@@ -1102,6 +1440,10 @@ try {
     $secondTray = Wait-ForInstalledTray `
         -ExpectedPath $trayPath `
         -TimeoutSeconds $trayStartupTimeoutSeconds
+    Assert-DirectoryIdentity `
+        -Path $dataDirectory `
+        -ExpectedIdentity $claimedDataRootIdentity `
+        -Description 'Cycle-two data root'
     Assert-InstalledPayload `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
@@ -1131,6 +1473,10 @@ try {
         -LogPath $runningTrayUninstallLog `
         -Properties @('MSIRESTARTMANAGERCONTROL=Disable')
     Assert-GracefulStopLog -Path $runningTrayUninstallLog
+    Assert-DirectoryIdentity `
+        -Path $dataDirectory `
+        -ExpectedIdentity $claimedDataRootIdentity `
+        -Description 'Data root after cycle-two uninstall'
     Assert-UninstalledState `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
@@ -1273,12 +1619,87 @@ try {
             if (Test-Path -LiteralPath $archivedDataDirectory) {
                 throw "Refusing to overwrite archived lifecycle data: $archivedDataDirectory"
             }
-            Move-Item `
-                -LiteralPath $resolvedOwnedData `
-                -Destination $archivedDataDirectory
+            if ([string]::IsNullOrWhiteSpace($claimedDataRootIdentity)) {
+                throw 'The test-owned data root has no claimed filesystem identity.'
+            }
+            Assert-DirectoryIdentity `
+                -Path $resolvedOwnedData `
+                -ExpectedIdentity $claimedDataRootIdentity `
+                -Description 'Pre-archive data root'
+
+            $artifactRootIdentity = Get-DirectoryIdentity $artifactRoot
+            $sourceVolume = $claimedDataRootIdentity.Split(':')[0]
+            $destinationVolume = $artifactRootIdentity.Split(':')[0]
+            if (-not [string]::Equals(
+                $sourceVolume,
+                $destinationVolume,
+                [StringComparison]::Ordinal
+            )) {
+                throw 'Atomic lifecycle-data archival requires one filesystem volume.'
+            }
+
+            $preMoveInventory = @(Get-StableDataTreeInventory $resolvedOwnedData)
+            if (-not (Test-Path -LiteralPath $sentinelPath -PathType Leaf) -or
+                -not [string]::Equals(
+                    (Get-Content -LiteralPath $sentinelPath -Raw),
+                    $sentinelContents,
+                    [StringComparison]::Ordinal
+                )) {
+                throw 'The sentinel changed before atomic archival.'
+            }
+
+            # Directory.Move is one same-volume namespace rename. Do not fall
+            # back to provider recursion or copy/delete semantics.
+            [IO.Directory]::Move($resolvedOwnedData, $archivedDataDirectory)
+            if (Test-Path -LiteralPath $resolvedOwnedData) {
+                throw 'The source data path still exists immediately after atomic archival.'
+            }
+            Assert-DirectoryIdentity `
+                -Path $archivedDataDirectory `
+                -ExpectedIdentity $claimedDataRootIdentity `
+                -Description 'Archived data root'
+            $postMoveInventory = @(Get-DataTreeInventory $archivedDataDirectory)
+            Assert-DataTreeInventoryEqual `
+                -Expected $preMoveInventory `
+                -Actual $postMoveInventory `
+                -Description 'Atomic archive'
+
+            $archivedSentinelPath = Join-Path `
+                $archivedDataDirectory `
+                '.installer-lifecycle-sentinel.txt'
+            if (-not (Test-Path -LiteralPath $archivedSentinelPath -PathType Leaf) -or
+                -not [string]::Equals(
+                    (Get-Content -LiteralPath $archivedSentinelPath -Raw),
+                    $sentinelContents,
+                    [StringComparison]::Ordinal
+                )) {
+                throw 'The archived sentinel is missing or changed.'
+            }
+
+            Wait-ForStablePostArchiveState `
+                -TimeoutSeconds 10 `
+                -RequiredConsecutiveSamples 4 `
+                -ProductCode $msiIdentity.ProductCode `
+                -UpgradeCode $msiIdentity.UpgradeCode `
+                -InstallDirectory $installDirectory `
+                -SourceDataDirectory $resolvedOwnedData `
+                -ArchivedDataDirectory $archivedDataDirectory `
+                -StartMenuDirectory $startMenuDirectory `
+                -RunRegistryPath $runRegistryPath `
+                -InstallerRegistryPath $installerRegistryPath `
+                -ExpectedDataIdentity $claimedDataRootIdentity `
+                -ArchivedSentinelPath $archivedSentinelPath `
+                -SentinelContents $sentinelContents
+            $stableInventory = @(Get-DataTreeInventory $archivedDataDirectory)
+            Assert-DataTreeInventoryEqual `
+                -Expected $preMoveInventory `
+                -Actual $stableInventory `
+                -Description 'Stable archive'
             Write-Host "Preserved lifecycle user data at $archivedDataDirectory"
         } catch {
-            $cleanupErrors.Add("could not archive test-owned user data: $($_.Exception.Message)")
+            $cleanupErrors.Add(
+                "could not prove exact atomic archival of test-owned user data: $($_.Exception.Message)"
+            )
         }
     }
 
