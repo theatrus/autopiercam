@@ -8,6 +8,9 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "windows")]
+mod control_client;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Unattended capture for ZWO ASI planetary cameras")]
 struct Cli {
@@ -60,6 +63,15 @@ enum Command {
     UploadLedger {
         #[command(subcommand)]
         command: UploadLedgerCommand,
+    },
+    /// Ask the current user's tray agent to shut down cleanly and wait for it.
+    ShutdownAgent {
+        /// Treat an agent that is not running as a successful no-op.
+        #[arg(long)]
+        if_running: bool,
+        /// Maximum time for the request and orderly process shutdown.
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: u64,
     },
 }
 
@@ -123,6 +135,29 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Command::ShutdownAgent {
+            if_running,
+            timeout_seconds,
+        } => {
+            #[cfg(target_os = "windows")]
+            {
+                let stopped = control_client::shutdown_agent(
+                    std::time::Duration::from_secs(timeout_seconds),
+                    if_running,
+                )?;
+                if stopped {
+                    println!("AutoPierCam stopped cleanly.");
+                } else {
+                    println!("AutoPierCam was not running.");
+                }
+                return Ok(());
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (if_running, timeout_seconds);
+                anyhow::bail!("shutdown-agent is currently supported only on Windows");
+            }
+        }
         command => command,
     };
     let sdk = Arc::new(match cli.sdk {
@@ -153,6 +188,8 @@ fn main() -> Result<()> {
             jpeg_quality,
         ),
         Command::Run { config, max_frames } => run_agent(&sdk, &config, max_frames),
-        Command::UploadLedger { .. } => unreachable!("ledger maintenance returned before SDK load"),
+        Command::UploadLedger { .. } | Command::ShutdownAgent { .. } => {
+            unreachable!("non-camera command returned before SDK load")
+        }
     }
 }
