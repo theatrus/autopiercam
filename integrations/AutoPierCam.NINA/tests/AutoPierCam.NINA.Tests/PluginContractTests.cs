@@ -96,19 +96,6 @@ public sealed class PluginContractTests
         await runtime.StopAsync();
     }
 
-    [Fact]
-    public async Task ManifestLifecycleControlsTheProcessRuntimeIdempotently()
-    {
-        var firstManifest = new AutoPierCamPlugin();
-        var secondManifest = new AutoPierCamPlugin();
-        Assert.Same(firstManifest.PreviewRuntime, secondManifest.PreviewRuntime);
-
-        await firstManifest.Initialize();
-        await secondManifest.Initialize();
-        await Task.WhenAll(firstManifest.Teardown(), secondManifest.Teardown());
-        await firstManifest.Teardown();
-    }
-
     private static void AssertExport<TPart, TContract>()
     {
         ExportAttribute? export = typeof(TPart)

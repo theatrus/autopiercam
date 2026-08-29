@@ -7,6 +7,8 @@ namespace AutoPierCam.NINA.Preview;
 /// </summary>
 internal static class PierCameraPreviewProcess
 {
-    internal static IPierCameraPreviewRuntime Runtime { get; } =
-        new PierCameraPreviewRuntime();
+    internal static PierCameraPreviewLifetime Lifetime { get; } =
+        new(new PierCameraPreviewRuntime());
+
+    internal static IPierCameraPreviewRuntime Runtime => Lifetime.Runtime;
 }
