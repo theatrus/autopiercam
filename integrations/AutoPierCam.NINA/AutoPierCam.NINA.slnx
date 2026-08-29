@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AutoPierCam.NINA/AutoPierCam.NINA.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AutoPierCam.NINA.Tests/AutoPierCam.NINA.Tests.csproj" />
+  </Folder>
+</Solution>

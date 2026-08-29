@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows7.0</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AutoPierCam.NINA</RootNamespace>
+    <AssemblyName>AutoPierCam.NINA</AssemblyName>
+    <OutputType>Library</OutputType>
+    <UseWPF>true</UseWPF>
+    <ImportWindowsDesktopTargets>true</ImportWindowsDesktopTargets>
+    <PlatformTarget>x64</PlatformTarget>
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
+    <Version>0.1.0.0</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
+    <FileVersion>$(Version)</FileVersion>
+    <Title>AutoPierCam</Title>
+    <Description>Shows the latest AutoPierCam pier camera snapshot in N.I.N.A.'s Imaging tab.</Description>
+    <Authors>Yann Ramin</Authors>
+    <Company>Yann Ramin</Company>
+    <Product>AutoPierCam for N.I.N.A.</Product>
+    <Copyright>Copyright © 2026 Yann Ramin</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/theatrus/autopiercam</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/theatrus/autopiercam</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NINA.Plugin" Version="3.2.0.9001">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AutoPierCam.NINA.Tests" />
+  </ItemGroup>
+
+  <Target Name="CopyPluginForLocalDevelopment"
+          AfterTargets="Build"
+          Condition="'$(CopyToNina)' == 'true'">
+    <PropertyGroup>
+      <NinaPluginDir>$(LOCALAPPDATA)\NINA\Plugins\3.0.0\AutoPierCam</NinaPluginDir>
+    </PropertyGroup>
+    <Error Condition="'$(LOCALAPPDATA)' == ''"
+           Text="LOCALAPPDATA is required when CopyToNina=true." />
+    <MakeDir Directories="$(NinaPluginDir)" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(NinaPluginDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>
