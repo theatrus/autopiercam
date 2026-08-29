@@ -12,6 +12,9 @@ $expectedUpgradeCode = '{CFB03866-5B27-42FD-8CC3-84E6F58DB343}'
 $msiTimeoutSeconds = 180
 $trayStartupTimeoutSeconds = 30
 $trayShutdownTimeoutSeconds = 45
+$cleanupQuiescenceTimeoutSeconds = 60
+$script:msiTransactionTimedOut = $false
+$script:msiTimeoutDescriptions = [Collections.Generic.List[string]]::new()
 
 function Get-MsiScalar(
     [object] $Database,
@@ -155,8 +158,32 @@ function Get-InstallerProductState([string] $ProductCode) {
     }
 }
 
+function Get-InstallerFeatureState(
+    [string] $ProductCode,
+    [string] $Feature
+) {
+    $installer = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        return [int] $installer.GetType().InvokeMember(
+            'FeatureState',
+            [Reflection.BindingFlags]::GetProperty,
+            $null,
+            $installer,
+            @($ProductCode, $Feature)
+        )
+    } finally {
+        if ($null -ne $installer) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+        }
+    }
+}
+
 function Get-AutoPierCamArpEntries {
     $entries = @()
+    $seenEntries = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
     foreach ($hive in @(
         [Microsoft.Win32.RegistryHive]::CurrentUser,
         [Microsoft.Win32.RegistryHive]::LocalMachine
@@ -189,6 +216,14 @@ function Get-AutoPierCamArpEntries {
                             'AutoPierCam',
                             [StringComparison]::Ordinal
                         )) {
+                            continue
+                        }
+                        # HKCU's Uninstall key is shared between the 32-bit
+                        # and 64-bit registry views on supported Windows
+                        # versions. Count one underlying ARP subkey once while
+                        # still examining both views for fail-closed preflight.
+                        $entryIdentity = '{0}|{1}' -f $hive, $subKeyName
+                        if (-not $seenEntries.Add($entryIdentity)) {
                             continue
                         }
                         $entries += [pscustomobject] @{
@@ -232,6 +267,32 @@ function Get-ProcessPath([Diagnostics.Process] $Process) {
         return [IO.Path]::GetFullPath($Process.Path)
     } catch {
         return $null
+    }
+}
+
+function Assert-ExactTrayProcessAlive(
+    [int] $ProcessId,
+    [string] $ExpectedPath
+) {
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        throw "The expected tray PID $ProcessId exited before the MSI transaction began."
+    }
+    if ($process.ProcessName -cne 'autopiercam-tray') {
+        throw "PID $ProcessId was reused by an unexpected process before MSI startup."
+    }
+    $actualPath = Get-ProcessPath $process
+    $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath)
+    if ($null -eq $actualPath -or -not [string]::Equals(
+        $actualPath,
+        $expectedFullPath,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Tray PID $ProcessId no longer runs the exact installed executable."
+    }
+    $allProcesses = @(Get-AutoPierCamProcesses)
+    if ($allProcesses.Count -ne 1 -or $allProcesses[0].Id -ne $ProcessId) {
+        throw 'The AutoPierCam process set changed before the MSI transaction began.'
     }
 }
 
@@ -319,7 +380,8 @@ function Invoke-BoundedProcess(
     [string] $Arguments,
     [int] $TimeoutSeconds,
     [int[]] $SuccessExitCodes,
-    [string] $Description
+    [string] $Description,
+    [switch] $WindowsInstallerTransaction
 ) {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $FilePath
@@ -333,8 +395,14 @@ function Invoke-BoundedProcess(
             throw "Could not start $Description."
         }
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            if ($WindowsInstallerTransaction) {
+                $script:msiTransactionTimedOut = $true
+                $script:msiTimeoutDescriptions.Add($Description)
+            }
             # This is the exact child process created by this test. Stopping it
-            # bounds the harness; final cleanup still checks MSI registration.
+            # bounds the client wait. The Windows Installer service may still
+            # own the transaction, so final cleanup must prove quiescence before
+            # it changes or archives any test-owned state.
             try {
                 $process.Kill()
                 [void] $process.WaitForExit(5000)
@@ -376,7 +444,8 @@ function Invoke-MsiOperation(
         -Arguments $arguments `
         -TimeoutSeconds $msiTimeoutSeconds `
         -SuccessExitCodes @(0, 3010) `
-        -Description "$Operation transaction")
+        -Description "$Operation transaction" `
+        -WindowsInstallerTransaction)
 }
 
 function Invoke-GracefulTrayStop(
@@ -410,7 +479,7 @@ function Get-RunValue([string] $RegistryPath) {
 function Assert-RunValue(
     [string] $RegistryPath,
     [AllowNull()]
-    [string] $Expected
+    [object] $Expected
 ) {
     $actual = Get-RunValue $RegistryPath
     if ($null -eq $Expected) {
@@ -419,13 +488,14 @@ function Assert-RunValue(
         }
         return
     }
+    $expectedText = [string] $Expected
     if ($null -eq $actual -or -not [string]::Equals(
         [string] $actual,
-        $Expected,
+        $expectedText,
         [StringComparison]::Ordinal
     )) {
         $shown = if ($null -eq $actual) { '<missing>' } else { "'$actual'" }
-        throw "AutoPierCam Run value mismatch: got $shown; expected '$Expected'."
+        throw "AutoPierCam Run value mismatch: got $shown; expected '$expectedText'."
     }
 }
 
@@ -433,7 +503,7 @@ function Assert-Shortcut(
     [string] $Path,
     [string] $ExpectedTarget,
     [AllowEmptyString()]
-    [string] $RequiredArguments
+    [string] $ExpectedArguments
 ) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Installed Start Menu shortcut is missing: $Path"
@@ -452,9 +522,13 @@ function Assert-Shortcut(
         )) {
             throw "Shortcut target mismatch for $Path`: got '$target'."
         }
-        if (-not [string]::IsNullOrEmpty($RequiredArguments) -and
-            -not ([string] $shortcut.Arguments).Contains($RequiredArguments)) {
-            throw "Shortcut arguments for $Path are missing '$RequiredArguments'."
+        $actualArguments = [string] $shortcut.Arguments
+        if (-not [string]::Equals(
+            $actualArguments,
+            $ExpectedArguments,
+            [StringComparison]::Ordinal
+        )) {
+            throw "Shortcut arguments do not exactly match the MSI contract for $Path."
         }
     } finally {
         if ($null -ne $shortcut) {
@@ -513,11 +587,14 @@ function Assert-InstalledPayload(
     Assert-Shortcut `
         -Path $viewerShortcut `
         -ExpectedTarget (Join-Path $InstallDirectory 'Viewer\AutoPierCam.Viewer.exe') `
-        -RequiredArguments ''
+        -ExpectedArguments ''
+    $expectedStartArguments = '--config "{0}" --sdk "{1}"' -f `
+        (Join-Path $DataDirectory 'autopiercam.toml'), `
+        (Join-Path $InstallDirectory 'ASICamera2.dll')
     Assert-Shortcut `
         -Path $startShortcut `
         -ExpectedTarget (Join-Path $InstallDirectory 'autopiercam-tray.exe') `
-        -RequiredArguments '--config'
+        -ExpectedArguments $expectedStartArguments
 }
 
 function Assert-ProductRegistered(
@@ -547,6 +624,249 @@ function Assert-ProductRegistered(
     }
 }
 
+function Assert-InstalledFeatureStates(
+    [string] $ProductCode,
+    [bool] $StartAtSignInInstalled
+) {
+    # Windows Installer INSTALLSTATE_LOCAL is 3 and INSTALLSTATE_ABSENT is 2.
+    $mainState = Get-InstallerFeatureState $ProductCode 'MainApplication'
+    if ($mainState -ne 3) {
+        throw "MainApplication feature state is $mainState; expected LOCAL (3)."
+    }
+    $expectedStartupState = if ($StartAtSignInInstalled) { 3 } else { 2 }
+    $startupState = Get-InstallerFeatureState $ProductCode 'StartAtSignIn'
+    if ($startupState -ne $expectedStartupState) {
+        $expectedName = if ($StartAtSignInInstalled) { 'LOCAL (3)' } else { 'ABSENT (2)' }
+        throw "StartAtSignIn feature state is $startupState; expected $expectedName."
+    }
+}
+
+function Assert-GracefulStopLog([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "The running-tray uninstall log is missing: $Path"
+    }
+    $logText = Get-Content -LiteralPath $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($logText)) {
+        throw "The running-tray uninstall log is empty: $Path"
+    }
+    $options = (
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+        [Text.RegularExpressions.RegexOptions]::Multiline -bor
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    $gracefulStarts = [Regex]::Matches(
+        $logText,
+        '^[^\r\n]*Action\s+start\s+[^\r\n]*:\s*GracefulStopAutoPierCam\.\s*$',
+        $options
+    )
+    $gracefulSuccesses = [Regex]::Matches(
+        $logText,
+        ('^[^\r\n]*Action\s+ended\s+[^\r\n]*:\s*' +
+         'GracefulStopAutoPierCam\.\s*Return value 1\.\s*$'),
+        $options
+    )
+    $installValidateStarts = [Regex]::Matches(
+        $logText,
+        '^[^\r\n]*Action\s+start\s+[^\r\n]*:\s*InstallValidate\.\s*$',
+        $options
+    )
+    if ($gracefulStarts.Count -ne 1 -or
+        $gracefulSuccesses.Count -ne 1 -or
+        $installValidateStarts.Count -ne 1) {
+        # Do not echo arbitrary verbose-log lines: MSI properties may contain
+        # environment-specific values even though AutoPierCam stores no token.
+        throw (
+            'The uninstall log does not contain one unambiguous start, success, ' +
+            'and InstallValidate record for the graceful-stop action.'
+        )
+    }
+    if ($gracefulStarts[0].Index -ge $gracefulSuccesses[0].Index -or
+        $gracefulSuccesses[0].Index -ge $installValidateStarts[0].Index) {
+        throw 'The graceful-stop action did not complete successfully before InstallValidate.'
+    }
+}
+
+function Test-WindowsInstallerInProgressMarker {
+    $baseKey = $null
+    $inProgressKey = $null
+    try {
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64
+        )
+        $inProgressKey = $baseKey.OpenSubKey(
+            'Software\Microsoft\Windows\CurrentVersion\Installer\InProgress',
+            $false
+        )
+        return $null -ne $inProgressKey
+    } finally {
+        if ($null -ne $inProgressKey) {
+            $inProgressKey.Dispose()
+        }
+        if ($null -ne $baseKey) {
+            $baseKey.Dispose()
+        }
+    }
+}
+
+function Test-WindowsInstallerTransactionQuiescent {
+    $mutex = $null
+    $acquired = $false
+    try {
+        try {
+            $mutex = [Threading.Mutex]::OpenExisting('Global\_MSIExecute')
+        } catch [Threading.WaitHandleCannotBeOpenedException] {
+            # No execution mutex exists. Still reject an Installer InProgress
+            # marker so a damaged or transitioning service is never called safe.
+            return -not (Test-WindowsInstallerInProgressMarker)
+        }
+        try {
+            $acquired = $mutex.WaitOne(0)
+        } catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            return $false
+        }
+        return -not (Test-WindowsInstallerInProgressMarker)
+    } finally {
+        if ($acquired -and $null -ne $mutex) {
+            $mutex.ReleaseMutex()
+        }
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Wait-ForWindowsInstallerQuiescence([int] $TimeoutSeconds) {
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $consecutiveSafeSamples = 0
+    $lastInspectionError = $null
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            if (Test-WindowsInstallerTransactionQuiescent) {
+                $consecutiveSafeSamples++
+                if ($consecutiveSafeSamples -ge 2) {
+                    return
+                }
+            } else {
+                $consecutiveSafeSamples = 0
+            }
+            $lastInspectionError = $null
+        } catch {
+            $consecutiveSafeSamples = 0
+            $lastInspectionError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    $suffix = if ([string]::IsNullOrWhiteSpace($lastInspectionError)) {
+        ''
+    } else {
+        " Last inspection error: $lastInspectionError"
+    }
+    throw "Windows Installer did not become verifiably quiescent within $TimeoutSeconds seconds.$suffix"
+}
+
+function Get-PostCleanupProblems(
+    [string] $ProductCode,
+    [string] $UpgradeCode,
+    [string] $InstallDirectory,
+    [string] $DataDirectory,
+    [string] $StartMenuDirectory,
+    [string] $RunRegistryPath,
+    [string] $InstallerRegistryPath,
+    [string] $SentinelPath,
+    [string] $SentinelContents
+) {
+    $problems = [Collections.Generic.List[string]]::new()
+    if (-not (Test-WindowsInstallerTransactionQuiescent)) {
+        $problems.Add('Windows Installer transaction is not quiescent')
+    }
+    if ((Get-InstallerProductState $ProductCode) -ne -1) {
+        $problems.Add('candidate ProductCode is not unknown')
+    }
+    if (@(Get-RelatedProductCodes $UpgradeCode).Count -ne 0) {
+        $problems.Add('a related product remains registered')
+    }
+    if (@(Get-AutoPierCamArpEntries).Count -ne 0) {
+        $problems.Add('an AutoPierCam ARP entry remains')
+    }
+    if (Test-Path -LiteralPath $InstallDirectory) {
+        $problems.Add('program directory remains')
+    }
+    if (Test-Path -LiteralPath $StartMenuDirectory) {
+        $problems.Add('Start Menu directory remains')
+    }
+    if ($null -ne (Get-RunValue $RunRegistryPath)) {
+        $problems.Add('AutoPierCam Run value remains')
+    }
+    if (Test-Path -LiteralPath $InstallerRegistryPath) {
+        $problems.Add('AutoPierCam installer registry key remains')
+    }
+    if (@(Get-AutoPierCamProcesses).Count -ne 0) {
+        $problems.Add('an AutoPierCam process remains')
+    }
+    if (-not (Test-Path -LiteralPath $DataDirectory -PathType Container)) {
+        $problems.Add('test-owned user-data directory is missing')
+    } elseif (-not (Test-Path -LiteralPath $SentinelPath -PathType Leaf)) {
+        $problems.Add('test-owned sentinel is missing')
+    } elseif (-not [string]::Equals(
+        (Get-Content -LiteralPath $SentinelPath -Raw),
+        $SentinelContents,
+        [StringComparison]::Ordinal
+    )) {
+        $problems.Add('test-owned sentinel changed')
+    }
+    return $problems
+}
+
+function Wait-ForSafePostCleanupState(
+    [int] $TimeoutSeconds,
+    [string] $ProductCode,
+    [string] $UpgradeCode,
+    [string] $InstallDirectory,
+    [string] $DataDirectory,
+    [string] $StartMenuDirectory,
+    [string] $RunRegistryPath,
+    [string] $InstallerRegistryPath,
+    [string] $SentinelPath,
+    [string] $SentinelContents
+) {
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $consecutiveSafeSamples = 0
+    $lastProblems = @('post-cleanup state was not inspected')
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $lastProblems = @(Get-PostCleanupProblems `
+                -ProductCode $ProductCode `
+                -UpgradeCode $UpgradeCode `
+                -InstallDirectory $InstallDirectory `
+                -DataDirectory $DataDirectory `
+                -StartMenuDirectory $StartMenuDirectory `
+                -RunRegistryPath $RunRegistryPath `
+                -InstallerRegistryPath $InstallerRegistryPath `
+                -SentinelPath $SentinelPath `
+                -SentinelContents $SentinelContents)
+        } catch {
+            $lastProblems = @('post-cleanup state could not be inspected safely')
+        }
+        if ($lastProblems.Count -eq 0) {
+            $consecutiveSafeSamples++
+            if ($consecutiveSafeSamples -ge 2) {
+                return
+            }
+        } else {
+            $consecutiveSafeSamples = 0
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw (
+        "Safe post-uninstall state was not reached within $TimeoutSeconds seconds: " +
+        ($lastProblems -join ', ')
+    )
+}
+
 function Assert-ProductUnregistered(
     [string] $ProductCode,
     [string] $UpgradeCode
@@ -570,6 +890,7 @@ function Assert-UninstalledState(
     [string] $DataDirectory,
     [string] $StartMenuDirectory,
     [string] $RunRegistryPath,
+    [string] $InstallerRegistryPath,
     [string] $SentinelPath,
     [string] $SentinelContents,
     [string] $ProductCode,
@@ -582,6 +903,9 @@ function Assert-UninstalledState(
         throw "The Start Menu directory remains after uninstall: $StartMenuDirectory"
     }
     Assert-RunValue -RegistryPath $RunRegistryPath -Expected $null
+    if (Test-Path -LiteralPath $InstallerRegistryPath) {
+        throw "The AutoPierCam installer registry key remains: $InstallerRegistryPath"
+    }
     Assert-ProductUnregistered -ProductCode $ProductCode -UpgradeCode $UpgradeCode
     Wait-ForNoAutoPierCamProcesses -TimeoutSeconds 15
 
@@ -746,6 +1070,9 @@ try {
         -ProductCode $msiIdentity.ProductCode `
         -UpgradeCode $msiIdentity.UpgradeCode `
         -ExpectedVersion $msiIdentity.ProductVersion
+    Assert-InstalledFeatureStates `
+        -ProductCode $msiIdentity.ProductCode `
+        -StartAtSignInInstalled $true
 
     Write-Host "Gracefully stopping default-install tray PID $($firstTray.Id)."
     Invoke-GracefulTrayStop `
@@ -760,6 +1087,7 @@ try {
         -DataDirectory $dataDirectory `
         -StartMenuDirectory $startMenuDirectory `
         -RunRegistryPath $runRegistryPath `
+        -InstallerRegistryPath $installerRegistryPath `
         -SentinelPath $sentinelPath `
         -SentinelContents $sentinelContents `
         -ProductCode $msiIdentity.ProductCode `
@@ -783,20 +1111,32 @@ try {
         -ProductCode $msiIdentity.ProductCode `
         -UpgradeCode $msiIdentity.UpgradeCode `
         -ExpectedVersion $msiIdentity.ProductVersion
+    Assert-InstalledFeatureStates `
+        -ProductCode $msiIdentity.ProductCode `
+        -StartAtSignInInstalled $false
 
+    $runningTrayUninstallLog = Join-Path `
+        $artifactRoot `
+        '04-running-tray-uninstall.log'
     Write-Host (
         "Uninstalling while tray PID $($secondTray.Id) is running; " +
         'the MSI must use its graceful-shutdown custom action.'
     )
+    Assert-ExactTrayProcessAlive `
+        -ProcessId $secondTray.Id `
+        -ExpectedPath $trayPath
     Invoke-MsiOperation `
         -Operation Uninstall `
         -Target $msiIdentity.ProductCode `
-        -LogPath (Join-Path $artifactRoot '04-running-tray-uninstall.log')
+        -LogPath $runningTrayUninstallLog `
+        -Properties @('MSIRESTARTMANAGERCONTROL=Disable')
+    Assert-GracefulStopLog -Path $runningTrayUninstallLog
     Assert-UninstalledState `
         -InstallDirectory $installDirectory `
         -DataDirectory $dataDirectory `
         -StartMenuDirectory $startMenuDirectory `
         -RunRegistryPath $runRegistryPath `
+        -InstallerRegistryPath $installerRegistryPath `
         -SentinelPath $sentinelPath `
         -SentinelContents $sentinelContents `
         -ProductCode $msiIdentity.ProductCode `
@@ -805,61 +1145,119 @@ try {
     $primaryFailure = $_
 } finally {
     # Cleanup is limited to the ProductCode and paths proven absent during
-    # preflight. It never recursively deletes user or program directories.
+    # preflight. Never race a Windows Installer service transaction after its
+    # client timed out, and never recursively delete program or data paths.
+    $installerQuiescentForCleanup = $false
     try {
-        $currentState = Get-InstallerProductState $msiIdentity.ProductCode
-        $relatedNow = @(Get-RelatedProductCodes $msiIdentity.UpgradeCode)
-        if ($currentState -ne -1 -or $msiIdentity.ProductCode -iin $relatedNow) {
-            if (Test-Path -LiteralPath $cliPath -PathType Leaf) {
-                try {
-                    Invoke-GracefulTrayStop `
-                        -CliPath $cliPath `
-                        -TimeoutSeconds $trayShutdownTimeoutSeconds
-                } catch {
-                    $cleanupErrors.Add("graceful cleanup stop failed: $($_.Exception.Message)")
-                }
-            }
-            try {
-                Invoke-MsiOperation `
-                    -Operation Uninstall `
-                    -Target $msiIdentity.ProductCode `
-                    -LogPath (Join-Path $artifactRoot 'cleanup-uninstall.log')
-            } catch {
-                $cleanupErrors.Add("cleanup uninstall failed: $($_.Exception.Message)")
-            }
-        }
+        Wait-ForWindowsInstallerQuiescence `
+            -TimeoutSeconds $cleanupQuiescenceTimeoutSeconds
+        $installerQuiescentForCleanup = $true
     } catch {
-        $cleanupErrors.Add("could not inspect cleanup registration: $($_.Exception.Message)")
+        $cleanupErrors.Add(
+            "cleanup cannot safely proceed while MSI state is uncertain: $($_.Exception.Message)"
+        )
     }
 
-    # A forced stop is only a last-resort cleanup for an executable underneath
-    # this test's exact, previously absent install directory.
-    foreach ($process in @(Get-AutoPierCamProcesses)) {
-        $processPath = Get-ProcessPath $process
-        if ($null -ne $processPath -and [string]::Equals(
-            $processPath,
-            $trayPath,
-            [StringComparison]::OrdinalIgnoreCase
-        )) {
-            try {
-                Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                [void] $process.WaitForExit(5000)
-                $cleanupErrors.Add(
-                    "tray PID $($process.Id) required a forced stop after graceful cleanup"
-                )
-            } catch {
-                $cleanupErrors.Add(
-                    "could not stop test-owned tray PID $($process.Id): $($_.Exception.Message)"
-                )
+    if ($installerQuiescentForCleanup) {
+        try {
+            $currentState = Get-InstallerProductState $msiIdentity.ProductCode
+            $relatedNow = @(Get-RelatedProductCodes $msiIdentity.UpgradeCode)
+            if ($currentState -ne -1 -or $msiIdentity.ProductCode -iin $relatedNow) {
+                if (Test-Path -LiteralPath $cliPath -PathType Leaf) {
+                    try {
+                        Invoke-GracefulTrayStop `
+                            -CliPath $cliPath `
+                            -TimeoutSeconds $trayShutdownTimeoutSeconds
+                    } catch {
+                        $cleanupErrors.Add(
+                            "graceful cleanup stop failed: $($_.Exception.Message)"
+                        )
+                    }
+                }
+                try {
+                    Invoke-MsiOperation `
+                        -Operation Uninstall `
+                        -Target $msiIdentity.ProductCode `
+                        -LogPath (Join-Path $artifactRoot 'cleanup-uninstall.log') `
+                        -Properties @('MSIRESTARTMANAGERCONTROL=Disable')
+                } catch {
+                    $cleanupErrors.Add("cleanup uninstall failed: $($_.Exception.Message)")
+                }
             }
-        } else {
+        } catch {
+            $cleanupErrors.Add("could not inspect cleanup registration: $($_.Exception.Message)")
+        }
+
+        # A cleanup uninstall can itself time out. Re-establish service
+        # quiescence before inspecting or stopping any process it may own.
+        $installerQuiescentForCleanup = $false
+        try {
+            Wait-ForWindowsInstallerQuiescence `
+                -TimeoutSeconds $cleanupQuiescenceTimeoutSeconds
+            $installerQuiescentForCleanup = $true
+        } catch {
             $cleanupErrors.Add(
-                "refused to stop unexpected AutoPierCam PID $($process.Id) at '$processPath'"
+                "MSI state remained uncertain after cleanup: $($_.Exception.Message)"
             )
         }
     }
 
-    if ($dataDirectoryOwned -and (Test-Path -LiteralPath $dataDirectory)) {
+    if ($installerQuiescentForCleanup) {
+        # A forced stop is only a last resort for the exact executable under
+        # this test's previously absent install directory.
+        foreach ($process in @(Get-AutoPierCamProcesses)) {
+            $processPath = Get-ProcessPath $process
+            if ($null -ne $processPath -and [string]::Equals(
+                $processPath,
+                $trayPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                try {
+                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                    [void] $process.WaitForExit(5000)
+                    $cleanupErrors.Add(
+                        "tray PID $($process.Id) required a forced stop after graceful cleanup"
+                    )
+                } catch {
+                    $cleanupErrors.Add(
+                        "could not stop test-owned tray PID $($process.Id): $($_.Exception.Message)"
+                    )
+                }
+            } else {
+                $cleanupErrors.Add(
+                    "refused to stop unexpected AutoPierCam PID $($process.Id) at '$processPath'"
+                )
+            }
+        }
+    }
+
+    $safeToArchiveData = $false
+    if ($dataDirectoryOwned -and $installerQuiescentForCleanup) {
+        try {
+            Wait-ForSafePostCleanupState `
+                -TimeoutSeconds $cleanupQuiescenceTimeoutSeconds `
+                -ProductCode $msiIdentity.ProductCode `
+                -UpgradeCode $msiIdentity.UpgradeCode `
+                -InstallDirectory $installDirectory `
+                -DataDirectory $dataDirectory `
+                -StartMenuDirectory $startMenuDirectory `
+                -RunRegistryPath $runRegistryPath `
+                -InstallerRegistryPath $installerRegistryPath `
+                -SentinelPath $sentinelPath `
+                -SentinelContents $sentinelContents
+            $safeToArchiveData = $true
+        } catch {
+            $cleanupErrors.Add(
+                "test-owned data was left in place because cleanup is not proven safe: $($_.Exception.Message)"
+            )
+        }
+    } elseif ($dataDirectoryOwned) {
+        $cleanupErrors.Add(
+            "test-owned data was left in place at $dataDirectory because MSI quiescence is uncertain"
+        )
+    }
+
+    if ($safeToArchiveData) {
         try {
             $resolvedOwnedData = [IO.Path]::GetFullPath($dataDirectory).TrimEnd('\')
             $expectedOwnedData = [IO.Path]::GetFullPath(
@@ -882,6 +1280,13 @@ try {
         } catch {
             $cleanupErrors.Add("could not archive test-owned user data: $($_.Exception.Message)")
         }
+    }
+
+    if ($script:msiTransactionTimedOut) {
+        Write-Host (
+            'At least one bounded msiexec client wait timed out; archival was permitted ' +
+            'only after the independent MSI quiescence and post-uninstall gates.'
+        )
     }
 }
 
