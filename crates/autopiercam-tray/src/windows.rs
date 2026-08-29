@@ -1,4 +1,7 @@
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use autopiercam_core::ConfigStore;
 use autopiercam_protocol::{AgentState, AgentStatus};
@@ -7,7 +10,8 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder},
 };
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 use tray_icon::{
     Icon, TrayIconBuilder,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -34,7 +38,7 @@ enum UserEvent {
 }
 
 pub(crate) fn run(options: Options) {
-    init_tracing();
+    init_tracing(&options.config);
 
     let config_store = match ConfigStore::open(&options.config) {
         Ok(store) => store,
@@ -219,12 +223,43 @@ pub(crate) fn run(options: Options) {
     });
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+fn init_tracing(config_path: &Path) {
+    let log_directory = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs");
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("autopiercam")
+        .filename_suffix("log")
+        .max_log_files(14)
+        .build(&log_directory);
+
+    match file_appender {
+        Ok(file_appender) => {
+            let writer = std::io::stderr.and(file_appender);
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(default_log_filter())
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(writer)
+                .try_init();
+            info!(directory = %log_directory.display(), "file logging initialized");
+        }
+        Err(error) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(default_log_filter())
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .try_init();
+            error!(directory = %log_directory.display(), %error, "file logging is unavailable");
+        }
+    }
+}
+
+fn default_log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
 }
 
 fn apply_worker_status(

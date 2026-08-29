@@ -22,6 +22,7 @@ serde_json.workspace = true
 tao = { version = "=0.34.4", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 tray-icon = { version = "=0.24.2", default-features = false }
 windows-sys.workspace = true
