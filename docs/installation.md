@@ -35,9 +35,10 @@ Application files are installed for the current user at:
 `ASICamera2.dll` are adjacent in that directory. The complete self-contained
 WinUI application is under `Viewer\`; no separate .NET runtime installation is
 required. Apache and third-party license material is included with the payload.
-The full generated Rust dependency report is installed as
-`licenses\Rust-Third-Party-Licenses.md` alongside the ZWO, .NET, and Windows App
-SDK license files.
+The generated Rust dependency report and the Rust standard-library copyright
+collection are installed as `licenses\Rust-Third-Party-Licenses.md` and
+`licenses\Rust-Standard-Library-COPYRIGHT.html` alongside the ZWO, .NET, and
+Windows App SDK license files.
 
 The optional sign-in feature writes this current-user startup command:
 
@@ -90,10 +91,10 @@ adds a read-only **Pier Camera** panel to Imaging and never opens the camera.
 ## Upgrade and shutdown
 
 Repair, upgrade, and uninstall ask the running tray to shut down through its
-same-user control pipe and wait up to 30 seconds for that exact process. The MSI
-then asks compatible tray and Viewer processes to close before replacing or
-removing files. It does not forcibly terminate an unhealthy process; if setup
-reports files in use, stop AutoPierCam from its tray menu or run:
+same-user control pipe and wait up to 30 seconds for that exact process. Windows
+Installer and Restart Manager then handle any remaining locks on installed
+files; setup never finds or terminates processes merely by executable name. If
+setup reports files in use, stop AutoPierCam from its tray menu or run:
 
 ```powershell
 autopiercam shutdown-agent --if-running --timeout-seconds 30

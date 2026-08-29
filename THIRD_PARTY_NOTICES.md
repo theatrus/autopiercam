@@ -30,6 +30,13 @@ selected license and copyright texts are generated deterministically at:
 The generator configuration, checksum-backed clarifications, and independent
 Cargo graph validation are documented in `third-party/rust/README.md`.
 
+The Rust executables also statically link portions of the Rust standard
+library. Its toolchain-supplied copyright and license collection is copied
+without modification from `$(rustc --print sysroot)\share\doc\rust\COPYRIGHT-library.html`
+and installed as:
+
+- `licenses\Rust-Standard-Library-COPYRIGHT.html`
+
 ## Microsoft .NET and Windows App SDK
 
 The self-contained viewer includes redistributable Microsoft .NET and Windows
