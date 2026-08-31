@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Yann Ramin. SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">AutoPierCam</title>
+  <desc id="description">A camera on an observatory pier framed by a cyan night arc and an amber daylight arc.</desc>
+  <path fill="#071A2B" d="M56 16h144a40 40 0 0 1 40 40v144a40 40 0 0 1-40 40H56a40 40 0 0 1-40-40V56a40 40 0 0 1 40-40Z"/>
+  <path fill="#0D2A43" d="M128 35a81 81 0 1 1 0 162 81 81 0 0 1 0-162Z"/>
+  <path fill="none" stroke="#FFB547" stroke-width="15" stroke-linecap="butt" d="M128 43a73 73 0 0 1 0 146"/>
+  <path fill="none" stroke="#4CC9F0" stroke-width="15" stroke-linecap="butt" d="M128 43a73 73 0 0 0 0 146"/>
+  <path fill="#F6FAFD" d="m49 47 3.4 8.6L61 59l-8.6 3.4L49 71l-3.4-8.6L37 59l8.6-3.4L49 47Z"/>
+  <path fill="#F6FAFD" d="M111 132h34v48h22l12 20H77l12-20h22v-48Z"/>
+  <path fill="#F6FAFD" d="M85 78V68a6 6 0 0 1 6-6h28a6 6 0 0 1 6 6v10h59a8 8 0 0 1 8 8v43a8 8 0 0 1-8 8H72a8 8 0 0 1-8-8V86a8 8 0 0 1 8-8h13Z"/>
+  <path fill="#071A2B" d="M151 83a25 25 0 1 1 0 50 25 25 0 0 1 0-50Z"/>
+  <path fill="#4CC9F0" d="M151 94a14 14 0 1 1 0 28 14 14 0 0 1 0-28Z"/>
+  <path fill="#F6FAFD" d="M145 98a5 5 0 1 1 0 10 5 5 0 0 1 0-10Z"/>
+  <path fill="#FFB547" d="M85 101a7 7 0 1 1 0 14 7 7 0 0 1 0-14Z"/>
+</svg>

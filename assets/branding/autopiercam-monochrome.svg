@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Yann Ramin. SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="title description">
+  <title id="title">AutoPierCam monochrome mark</title>
+  <desc id="description">A camera on an observatory pier within an orbital ring.</desc>
+  <path fill="currentColor" fill-rule="evenodd" d="M16 2a11 11 0 1 1 0 22 11 11 0 0 1 0-22Zm0 2.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17Z"/>
+  <path fill="currentColor" fill-rule="evenodd" d="M7 9h3V7.5A1.5 1.5 0 0 1 11.5 6h4A1.5 1.5 0 0 1 17 7.5V9h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-7v5h3l2 4H9l2-4h3v-5H7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Zm15 2a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm0 1.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"/>
+  <path fill="currentColor" d="m5 3 .6 1.4L7 5l-1.4.6L5 7l-.6-1.4L3 5l1.4-.6L5 3Z"/>
+</svg>
