@@ -14,6 +14,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'PeImports.ps1')
+. (Join-Path $PSScriptRoot 'IconValidation.ps1')
 
 if ($StageOnly -and $PackageOnly) {
     throw 'Specify at most one of -StageOnly and -PackageOnly.'
@@ -53,6 +54,7 @@ $signableStagePaths = @(
     'Viewer\AutoPierCam.Viewer.exe'
 )
 $sdkSource = Join-Path $repositoryRoot 'vendor\zwo\ASI SDK\lib\x64\ASICamera2.dll'
+$brandIconSource = Join-Path $repositoryRoot 'assets\branding\autopiercam.ico'
 $expectedSdkSha256 = '0c8778c3cce2012961b079e3c7d0d8348a8b3823939335d9e98148cb5d5dc34a'
 
 function Reset-GeneratedDirectory([string] $Path) {
@@ -438,6 +440,7 @@ function Assert-StagedPayload {
         'Microsoft.WindowsAppRuntime.Bootstrap.dll',
         'Microsoft.ui.xaml.dll',
         'Microsoft.UI.Xaml.Phone.dll',
+        'autopiercam.ico',
         'coreclr.dll',
         'hostfxr.dll',
         'hostpolicy.dll',
@@ -447,6 +450,10 @@ function Assert-StagedPayload {
             throw "Self-contained WinUI payload is missing Viewer\$requiredViewerFile"
         }
     }
+    Assert-AutoPierCamIconMatch `
+        -Path (Join-Path $viewerStageRoot 'autopiercam.ico') `
+        -ExpectedPath $brandIconSource `
+        -Description 'Staged Viewer icon'
 
     $debugFiles = @(Get-ChildItem -LiteralPath $stageRoot -Filter '*.pdb' -File -Recurse)
     if ($debugFiles.Count -ne 0) {
@@ -479,6 +486,10 @@ function Assert-StagedPayload {
         -Path $cliPath `
         -Version $Version `
         -AssemblyName 'AutoPierCam.Capture'
+    Assert-AutoPierCamIconResource `
+        -Path $cliPath `
+        -ResourceId 1 `
+        -Description 'Staged autopiercam.exe'
     $cliVersion = (& $cliPath --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $cliVersion -cne "autopiercam $Version") {
         throw "Staged capture CLI version mismatch: '$cliVersion' (expected 'autopiercam $Version')."
@@ -506,6 +517,10 @@ function Assert-StagedPayload {
         -Version $Version `
         -AssemblyName 'AutoPierCam.Tray' `
         -GraphicalShell
+    Assert-AutoPierCamIconResource `
+        -Path $trayPath `
+        -ResourceId 1 `
+        -Description 'Staged autopiercam-tray.exe'
     $trayVersion = (& $trayPath --version 2>&1 | Out-String).Trim()
     if ($trayVersion -cne "autopiercam-tray $Version") {
         throw "Staged tray version mismatch: '$trayVersion' (expected 'autopiercam-tray $Version')."
@@ -520,6 +535,9 @@ function Assert-StagedPayload {
         throw ("Staged Viewer version mismatch: file=$($viewerVersion.FileVersion), " +
                "product=$($viewerVersion.ProductVersion), expected=$Version")
     }
+    Assert-AutoPierCamAssociatedIcon `
+        -Path (Join-Path $viewerStageRoot 'AutoPierCam.Viewer.exe') `
+        -Description 'Staged AutoPierCam Viewer'
 }
 
 function Get-StablePayloadIdentity([string] $RelativePath) {
@@ -748,6 +766,7 @@ $wixVersion = (& wix --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $wixVersion -notmatch '^6\.') {
     throw "WiX 6 is required; found '$wixVersion'."
 }
+Assert-AutoPierCamIconFile -Path $brandIconSource -Description 'Canonical AutoPierCam icon'
 Test-ApprovedStageManifestRejectsInjection
 
 if (-not $PackageOnly) {
@@ -847,7 +866,7 @@ try {
         [xml] $viewerProject = Get-Content -LiteralPath `
             (Join-Path $repositoryRoot 'apps\AutoPierCam.Viewer\AutoPierCam.Viewer.csproj') -Raw
         $windowsAppSdkReference = @(
-            $viewerProject.Project.ItemGroup.PackageReference |
+            $viewerProject.SelectNodes('/Project/ItemGroup/PackageReference') |
                 Where-Object Include -eq 'Microsoft.WindowsAppSDK'
         )
         if ($windowsAppSdkReference.Count -ne 1) {
@@ -913,6 +932,7 @@ try {
         -ext WixToolset.UI.wixext `
         -ext WixToolset.Util.wixext `
         -d "StageDir=$stageRoot" `
+        -d "BrandIcon=$brandIconSource" `
         -d "LicenseRtf=$(Join-Path $repositoryRoot 'installer\License.rtf')" `
         -d "ProductVersion=$Version" `
         -intermediatefolder $intermediateRoot `

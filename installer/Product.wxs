@@ -17,6 +17,9 @@
                   Schedule="afterInstallExecute" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <Icon Id="AutoPierCamIcon" SourceFile="$(BrandIcon)" />
+    <Property Id="ARPPRODUCTICON" Value="AutoPierCamIcon" />
+
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/theatrus/autopiercam" />
     <Property Id="ARPHELPLINK" Value="https://github.com/theatrus/autopiercam/issues" />
     <Property Id="ARPCONTACT" Value="Yann Ramin" />
@@ -175,13 +178,17 @@
                   Name="AutoPierCam Viewer"
                   Description="Configure AutoPierCam and view the live pier camera"
                   Target="[VIEWERFOLDER]AutoPierCam.Viewer.exe"
-                  WorkingDirectory="VIEWERFOLDER" />
+                  WorkingDirectory="VIEWERFOLDER"
+                  Icon="AutoPierCamIcon"
+                  IconIndex="0" />
         <Shortcut Id="StartAutoPierCamShortcut"
                   Name="Start AutoPierCam"
                   Description="Start automatic pier-camera capture in the notification area"
                   Target="[INSTALLFOLDER]autopiercam-tray.exe"
                   Arguments="--config &quot;[LocalAppDataFolder]AutoPierCam\autopiercam.toml&quot; --sdk &quot;[INSTALLFOLDER]ASICamera2.dll&quot;"
-                  WorkingDirectory="INSTALLFOLDER" />
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AutoPierCamIcon"
+                  IconIndex="0" />
         <RemoveFolder Id="RemoveAutoPierCamProgramMenu" On="uninstall" />
         <!-- ICE64 requires every authored directory below a user-profile
              root to have a RemoveFile row. This attempt affects Programs only

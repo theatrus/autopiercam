@@ -1,5 +1,7 @@
 # AutoPierCam
 
+<img src="assets/branding/autopiercam-logo.png" alt="AutoPierCam camera-on-pier icon" width="144">
+
 AutoPierCam is a Windows-first capture suite for ZWO ASI planetary cameras,
 built around a portable Rust core and capture agent. On Windows it lives in the
 system tray, adapts between bright days and dark nights, saves debayered stills,
@@ -9,6 +11,11 @@ planned storage sink rather than an implemented feature.
 AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
+
+The camera-on-pier mark uses cyan for night operation and amber for daylight
+operation. Its canonical vector source and reproducible Windows icon outputs
+live in [`assets/branding`](assets/branding); see
+[`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
 The repository now contains a hardware-validated background capture slice:
 

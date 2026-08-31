@@ -184,5 +184,7 @@ test require its reviewed SHA-256:
 assemblies are retained. The MSI is emitted at
 `artifacts\installer\output\AutoPierCam-<version>-x64.msi`.
 
-Brand artwork is intentionally not part of this first installer slice. MSI and
-shortcut icon fields use executable defaults until the project icon is chosen.
+The Apps & Features entry, both Start Menu shortcuts, the notification-area
+host, and the Viewer use the same AutoPierCam camera-on-pier icon. The Viewer
+keeps a local icon copy so its title bar and taskbar identity remain correct in
+the unpackaged, self-contained deployment.

@@ -6,11 +6,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'PeImports.ps1')
+. (Join-Path $PSScriptRoot 'IconValidation.ps1')
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts'))
 $expectedSdkSha256 = '0c8778c3cce2012961b079e3c7d0d8348a8b3823939335d9e98148cb5d5dc34a'
 $expectedUpgradeCode = '{CFB03866-5B27-42FD-8CC3-84E6F58DB343}'
+$brandIconSource = Join-Path $repositoryRoot 'assets\branding\autopiercam.ico'
 
 if ([string]::IsNullOrWhiteSpace($MsiPath)) {
     $candidates = @(
@@ -27,6 +29,7 @@ if ([string]::IsNullOrWhiteSpace($MsiPath)) {
 }
 
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
+Assert-AutoPierCamIconFile -Path $brandIconSource -Description 'Canonical AutoPierCam icon'
 $versionMatch = [Regex]::Match(
     [IO.Path]::GetFileName($resolvedMsiPath),
     '^AutoPierCam-(?<version>\d+\.\d+\.\d+)-x64\.msi$')
@@ -163,6 +166,7 @@ try {
             @('ARPURLINFOABOUT', 'https://github.com/theatrus/autopiercam'),
             @('ARPHELPLINK', 'https://github.com/theatrus/autopiercam/issues'),
             @('ARPCONTACT', 'Yann Ramin'),
+            @('ARPPRODUCTICON', 'AutoPierCamIcon'),
             @(
                 'ARPCOMMENTS',
                 "Automatic capture and monitoring for ZWO ASI planetary cameras. Configuration, captures, upload state, and 14 daily logs are kept in the current user's Local AppData."
@@ -255,6 +259,10 @@ try {
             throw 'Per-user MSI unexpectedly contains an HKLM registry row.'
         }
         Assert-MsiScalar $database `
+            "SELECT `Name` FROM `Icon` WHERE `Name`='AutoPierCamIcon'" `
+            'AutoPierCamIcon' `
+            'MSI product icon stream'
+        Assert-MsiScalar $database `
             "SELECT `Directory_` FROM `Shortcut` WHERE `Shortcut`='AutoPierCamViewerShortcut'" `
             'AUTOPIERCAMPROGRAMMENU' `
             'Viewer Start Menu shortcut directory'
@@ -262,6 +270,16 @@ try {
             "SELECT `Target` FROM `Shortcut` WHERE `Shortcut`='AutoPierCamViewerShortcut'" `
             '[VIEWERFOLDER]AutoPierCam.Viewer.exe' `
             'Viewer Start Menu shortcut target'
+        foreach ($shortcutId in @('AutoPierCamViewerShortcut', 'StartAutoPierCamShortcut')) {
+            Assert-MsiScalar $database `
+                "SELECT `Icon_` FROM `Shortcut` WHERE `Shortcut`='$shortcutId'" `
+                'AutoPierCamIcon' `
+                "$shortcutId icon"
+            Assert-MsiScalar $database `
+                "SELECT `IconIndex` FROM `Shortcut` WHERE `Shortcut`='$shortcutId'" `
+                '0' `
+                "$shortcutId icon index"
+        }
         $startShortcutArguments = Get-MsiScalar $database `
             "SELECT `Arguments` FROM `Shortcut` WHERE `Shortcut`='StartAutoPierCamShortcut'"
         foreach ($requiredArgument in @('--config', 'autopiercam.toml', '--sdk', '[INSTALLFOLDER]ASICamera2.dll')) {
@@ -524,6 +542,7 @@ try {
         'Microsoft.WindowsAppRuntime.Bootstrap.dll',
         'Microsoft.ui.xaml.dll',
         'Microsoft.UI.Xaml.Phone.dll',
+        'autopiercam.ico',
         'coreclr.dll',
         'hostfxr.dll',
         'hostpolicy.dll',
@@ -533,6 +552,10 @@ try {
             throw "Administrative image is missing Viewer\$requiredViewerFile"
         }
     }
+    Assert-AutoPierCamIconMatch `
+        -Path (Join-Path $viewerImage 'autopiercam.ico') `
+        -ExpectedPath $brandIconSource `
+        -Description 'Packaged Viewer icon'
     if (@(Get-ChildItem -LiteralPath $installImage -Filter '*.pdb' -File -Recurse).Count -ne 0) {
         throw 'Administrative image unexpectedly contains PDB files.'
     }
@@ -552,6 +575,9 @@ try {
         throw ("Packaged Viewer version mismatch: file=$($viewerVersion.FileVersion), " +
                "product=$($viewerVersion.ProductVersion), expected=$productVersion")
     }
+    Assert-AutoPierCamAssociatedIcon `
+        -Path (Join-Path $viewerImage 'AutoPierCam.Viewer.exe') `
+        -Description 'Packaged AutoPierCam Viewer'
 
     $cliPath = Join-Path $installImage 'autopiercam.exe'
     Assert-AutoPierCamStaticCrt `
@@ -566,6 +592,10 @@ try {
         -Path $cliPath `
         -Version $productVersion `
         -AssemblyName 'AutoPierCam.Capture'
+    Assert-AutoPierCamIconResource `
+        -Path $cliPath `
+        -ResourceId 1 `
+        -Description 'Packaged autopiercam.exe'
     $cliVersion = (& $cliPath --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $cliVersion -cne "autopiercam $productVersion") {
         throw "Packaged capture CLI version mismatch: '$cliVersion'."
@@ -593,6 +623,10 @@ try {
         -Version $productVersion `
         -AssemblyName 'AutoPierCam.Tray' `
         -GraphicalShell
+    Assert-AutoPierCamIconResource `
+        -Path $trayPath `
+        -ResourceId 1 `
+        -Description 'Packaged autopiercam-tray.exe'
     $trayVersion = (& $trayPath --version 2>&1 | Out-String).Trim()
     if ($trayVersion -cne "autopiercam-tray $productVersion") {
         throw "Packaged tray version mismatch: '$trayVersion'."
