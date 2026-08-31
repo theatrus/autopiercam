@@ -1,0 +1,195 @@
+# Build, sign and publish the Windows installer.
+#
+# THE ORDER HERE IS THE WHOLE POINT. Build-Installer.ps1 splits deliberately
+# into -StageOnly and -PackageOnly so signing can happen in the gap:
+#
+#   1. -StageOnly   build + stage + write approved-stage-manifest.json
+#   2. sign         the four executables/DLLs the user actually runs
+#   3. -PackageOnly wrap the now-signed payload into the MSI
+#   4. sign         the MSI itself
+#
+# Signing only the MSI would ship a signed container full of unsigned programs.
+# Signing before staging would not survive either -- packaging rewrites what it
+# packages. The script's own comment says it: "Release signing belongs in this
+# gap so users run signed programs, not only a signed container."
+#
+# The stage manifest enforces this rather than trusting it: -PackageOnly accepts
+# a changed hash ONLY for a path in `signable_paths`, and throws for any other
+# added, removed or altered file. So signing anything outside those four paths
+# turns into a build failure, not a surprise in the shipped MSI.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create a GitHub release (off = build and sign only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, sign, publish
+    runs-on: windows-latest
+    # Load-bearing: must match the Entra federated credential subject
+    # `repo:theatrus/autopiercam:environment:release`. Without it the OIDC
+    # token carries a different subject and azure/login fails.
+    environment: release
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out the version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo.toml is the source of truth; a tag that disagrees is a
+          # mistake worth failing on, and Build-Installer.ps1 asserts it too.
+          cargo_ver=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+                      | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_ver="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag_ver" != "$cargo_ver" ]]; then
+              echo "tag v$tag_ver does not match workspace version $cargo_ver" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$cargo_ver" >> "$GITHUB_OUTPUT"
+          echo "building $cargo_ver"
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install WiX 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool install --global wix --version 6.0.2
+          wix --version
+
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add x86_64-pc-windows-msvc
+          rustc -V
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+
+      # ---- 1. build and stage --------------------------------------------
+      - name: Stage the payload
+        shell: pwsh
+        run: ./scripts/Build-Installer.ps1 -Version ${{ steps.ver.outputs.version }} -StageOnly
+
+      # ---- 2. sign the programs -------------------------------------------
+      # Failure at this step means the OIDC subject did not match the federated
+      # credential; that is the most likely thing to be wrong. The signing
+      # smoke test exercises exactly this in two minutes.
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Exactly the four paths in the script's $signableStagePaths, no more.
+      # `files` takes a newline-separated list of absolute paths. Do not switch
+      # this to files-folder: it would also sign ASICamera2.dll and the .NET
+      # runtime, and -PackageOnly rejects a changed hash on any non-signable
+      # path.
+      - name: Sign the staged programs
+        uses: azure/trusted-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\artifacts\installer\stage\autopiercam.exe
+            ${{ github.workspace }}\artifacts\installer\stage\autopiercam-tray.exe
+            ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.exe
+            ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # ---- 3. package the signed payload ----------------------------------
+      - name: Package the MSI
+        shell: pwsh
+        run: ./scripts/Build-Installer.ps1 -Version ${{ steps.ver.outputs.version }} -PackageOnly
+
+      # ---- 4. sign the container ------------------------------------------
+      - name: Sign the MSI
+        uses: azure/trusted-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\artifacts\installer\output\AutoPierCam-${{ steps.ver.outputs.version }}-x64.msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Assert what we shipped rather than assuming the steps above worked. A
+      # signature that does not chain, or chains to the wrong publisher, should
+      # fail the release and not reach anyone.
+      - name: Verify every signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          signtool=$(find "/c/Program Files (x86)/Windows Kits/10/bin" \
+                       -name signtool.exe -path "*x64*" | sort | tail -1)
+          echo "using: $signtool"
+          stage="artifacts/installer/stage"
+          fail=0
+          for f in "$stage/autopiercam.exe" \
+                   "$stage/autopiercam-tray.exe" \
+                   "$stage/Viewer/AutoPierCam.Viewer.exe" \
+                   "$stage/Viewer/AutoPierCam.Viewer.dll" \
+                   "artifacts/installer/output/AutoPierCam-${{ steps.ver.outputs.version }}-x64.msi"; do
+            echo "--- $f"
+            if "$signtool" verify //pa //v "$f" > "$RUNNER_TEMP/v.txt" 2>&1; then
+              if grep -q "StackFoundry LLC" "$RUNNER_TEMP/v.txt"; then
+                echo "    OK  signed as StackFoundry LLC"
+              else
+                echo "    FAIL unexpected publisher"; cat "$RUNNER_TEMP/v.txt"; fail=1
+              fi
+            else
+              echo "    FAIL not signed or does not chain"; cat "$RUNNER_TEMP/v.txt"; fail=1
+            fi
+          done
+          test "$fail" = "0" || { echo "signature verification failed"; exit 1; }
+          echo "all five artifacts signed and verified"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoPierCam-${{ steps.ver.outputs.version }}-x64-msi
+          path: artifacts/installer/output/*.msi
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          msi="artifacts/installer/output/AutoPierCam-$v-x64.msi"
+          if gh release view "v$v" >/dev/null 2>&1; then
+            gh release upload "v$v" "$msi" --clobber
+          else
+            gh release create "v$v" "$msi" --title "AutoPierCam $v" --generate-notes
+          fi
