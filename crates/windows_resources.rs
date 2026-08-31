@@ -14,6 +14,8 @@ pub fn compile(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("../windows_resources.rs").display()
     );
+    let icon = manifest_dir.join("../../assets/branding/autopiercam.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -52,6 +54,7 @@ pub fn compile(
         &resource,
         version_resource(
             &manifest,
+            &icon,
             description,
             original_filename,
             &version,
@@ -151,6 +154,7 @@ fn application_manifest(
 #[allow(clippy::too_many_arguments)]
 fn version_resource(
     manifest: &Path,
+    icon: &Path,
     description: &str,
     original_filename: &str,
     version: &str,
@@ -159,8 +163,10 @@ fn version_resource(
     patch: u16,
 ) -> String {
     let manifest = rc_path(manifest);
+    let icon = rc_path(icon);
     format!(
         r#"1 24 "{manifest}"
+1 ICON "{icon}"
 1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
 PRODUCTVERSION {major},{minor},{patch},0

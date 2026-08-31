@@ -3,6 +3,8 @@ using System.ComponentModel.Composition.Hosting;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Media;
 using AutoPierCam.NINA.Dockables;
 using AutoPierCam.NINA.Preview;
 using NINA.Equipment.Interfaces.ViewModel;
@@ -31,6 +33,10 @@ public sealed class PluginContractTests
         Assert.Contains(
             assembly.GetCustomAttributes<AssemblyMetadataAttribute>(),
             item => item.Key == "License" && item.Value == "Apache-2.0");
+        Assert.Contains(
+            assembly.GetCustomAttributes<AssemblyMetadataAttribute>(),
+            item => item.Key == "FeaturedImageURL" &&
+                item.Value == "https://raw.githubusercontent.com/theatrus/autopiercam/main/assets/branding/autopiercam-featured.png");
     }
 
     [Fact]
@@ -83,6 +89,24 @@ public sealed class PluginContractTests
         Assert.DoesNotContain(
             dependencies,
             type => type.FullName?.Contains("CameraMediator", StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    [Fact]
+    public void DockableUsesFrozenMonochromeBrandGeometryWithinItsViewBox()
+    {
+        Geometry geometry = PierCameraDockable.DockIconGeometry;
+
+        Assert.True(geometry.IsFrozen);
+        Assert.False(geometry.IsEmpty());
+        Assert.True(geometry.Bounds.Width > 0);
+        Assert.True(geometry.Bounds.Height > 0);
+        Assert.True(new Rect(0, 0, 32, 32).Contains(geometry.Bounds));
+
+        RunInSta(() =>
+        {
+            var dockable = new PierCameraDockable(CreateProfileService());
+            Assert.Same(geometry, dockable.ImageGeometry);
+        });
     }
 
     [Fact]

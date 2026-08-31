@@ -56,7 +56,9 @@ The default download URL uses the matching three-part product release tag
 (`v0.1.0` in this example) while the plugin archive and manifest retain the
 four-part N.I.N.A. version. Pass `-ReleaseTag v0.1.0-preview.1` when packaging
 a prerelease of that product version. Its three numeric components must continue
-to match `-Version`.
+to match `-Version`. The manifest also defaults to the repository's published
+AutoPierCam featured image; pass `-FeaturedImageUrl` only when a release needs
+to reference a different absolute HTTP(S) image.
 
 Use `-StageOnly` to stop after creating the allowlisted package directory (for
 example, before code signing), then `-PackageOnly` to archive that exact staged

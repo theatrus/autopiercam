@@ -37,6 +37,7 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
         Title = "AutoPierCam";
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "autopiercam.ico"));
         AppWindow.Resize(new SizeInt32(1180, 760));
         _previewFreshnessTimer = DispatcherQueue.CreateTimer();
         _previewFreshnessTimer.Interval = TimeSpan.FromSeconds(1);

@@ -11,6 +11,7 @@ using System.Runtime.Versioning;
 [assembly: AssemblyMetadata("Repository", "https://github.com/theatrus/autopiercam")]
 [assembly: AssemblyMetadata("Homepage", "https://github.com/theatrus/autopiercam")]
 [assembly: AssemblyMetadata("ChangelogURL", "https://github.com/theatrus/autopiercam/releases")]
+[assembly: AssemblyMetadata("FeaturedImageURL", "https://raw.githubusercontent.com/theatrus/autopiercam/main/assets/branding/autopiercam-featured.png")]
 [assembly: AssemblyMetadata("MinimumApplicationVersion", "3.2.0.9001")]
 [assembly: AssemblyMetadata("Tags", "pier camera,observatory,monitoring,preview")]
 [assembly: AssemblyMetadata("ShortDescription", "Show the latest AutoPierCam pier camera snapshot in the Imaging tab")]

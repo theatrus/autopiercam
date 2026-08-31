@@ -148,7 +148,7 @@ pub(crate) fn run(options: Options) {
                 match TrayIconBuilder::new()
                     .with_menu(Box::new(menu.clone()))
                     .with_tooltip(tooltip)
-                    .with_icon(generated_icon())
+                    .with_icon(application_icon())
                     .build()
                 {
                     Ok(icon) => tray = Some(icon),
@@ -430,38 +430,19 @@ fn viewer_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-fn generated_icon() -> Icon {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let pixel = ((y * SIZE + x) * 4) as usize;
-            let camera_body = (4..=27).contains(&x) && (8..=24).contains(&y);
-            let camera_top = (9..=16).contains(&x) && (5..=8).contains(&y);
-            let lens_x = x as i32 - 16;
-            let lens_y = y as i32 - 16;
-            let lens_radius_squared = lens_x * lens_x + lens_y * lens_y;
-
-            let color = if lens_radius_squared <= 36 {
-                [226, 241, 255, 255]
-            } else if lens_radius_squared <= 64 {
-                [16, 55, 102, 255]
-            } else if camera_body || camera_top {
-                [32, 104, 184, 255]
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba[pixel..pixel + 4].copy_from_slice(&color);
-        }
-    }
-
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("the generated tray icon has valid RGBA dimensions")
+fn application_icon() -> Icon {
+    Icon::from_resource(1, Some((32, 32)))
+        .expect("the AutoPierCam tray icon resource should be embedded in this executable")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_application_icon_is_loadable() {
+        drop(application_icon());
+    }
 
     #[test]
     fn relative_capture_directory_is_resolved_beside_configuration() {

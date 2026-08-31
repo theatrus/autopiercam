@@ -7,7 +7,7 @@ param(
 
     [string] $InstallerUrl = '',
 
-    [string] $FeaturedImageUrl = '',
+    [string] $FeaturedImageUrl = 'https://raw.githubusercontent.com/theatrus/autopiercam/main/assets/branding/autopiercam-featured.png',
 
     [ValidateNotNullOrEmpty()]
     [string] $OutputDirectory = 'artifacts/nina-plugin',
@@ -168,6 +168,11 @@ function Assert-PluginAssemblyIdentity {
     } else {
         $null
     }
+    $featuredImageUrl = if ($identity.Metadata.ContainsKey('FeaturedImageURL')) {
+        [string] $identity.Metadata['FeaturedImageURL']
+    } else {
+        $null
+    }
 
     $checks = @(
         [pscustomobject]@{
@@ -210,6 +215,12 @@ function Assert-PluginAssemblyIdentity {
             Label = 'MinimumApplicationVersion metadata'
             Actual = $minimumNinaVersion
             Expected = '3.2.0.9001'
+            Comparison = [StringComparison]::Ordinal
+        },
+        [pscustomobject]@{
+            Label = 'FeaturedImageURL metadata'
+            Actual = $featuredImageUrl
+            Expected = 'https://raw.githubusercontent.com/theatrus/autopiercam/main/assets/branding/autopiercam-featured.png'
             Comparison = [StringComparison]::Ordinal
         }
     )
