@@ -42,7 +42,7 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value_t = 6)]
         settle_frames: u32,
-        #[arg(long, default_value_t = 5_000_000)]
+        #[arg(long, default_value_t = 60_000_000)]
         max_exposure_us: i64,
         #[arg(long, default_value_t = 300)]
         max_gain: i64,

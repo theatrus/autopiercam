@@ -28,6 +28,11 @@ impl Config {
                 "camera.bin must be 1 until color binning is characterized",
             ));
         }
+        if self.camera.min_exposure_us < 0 || self.camera.max_exposure_us <= 0 {
+            return Err(ConfigError::Validation(
+                "camera exposure limits must be non-negative with a positive maximum",
+            ));
+        }
         if self.camera.max_exposure_us < self.camera.min_exposure_us {
             return Err(ConfigError::Validation(
                 "camera.max_exposure_us must be >= camera.min_exposure_us",
@@ -152,7 +157,7 @@ impl Default for CameraConfig {
             height: None,
             bin: 1,
             min_exposure_us: 100,
-            max_exposure_us: 5_000_000,
+            max_exposure_us: 60_000_000,
             max_gain: 300,
             target_brightness: 100,
             settle_frames: 6,
@@ -268,6 +273,24 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.capture.retention_max_bytes, None);
         assert_eq!(config.capture.retention_min_free_bytes, None);
+    }
+
+    #[test]
+    fn exposure_defaults_allow_long_nights_without_rewriting_explicit_limits() {
+        let fresh: Config = toml::from_str("").unwrap();
+        assert_eq!(fresh.camera.max_exposure_us, 60_000_000);
+        for maximum in [5_000_000, 30_000_000, 60_000_000] {
+            let config: Config =
+                toml::from_str(&format!("[camera]\nmax_exposure_us = {maximum}\n")).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.camera.max_exposure_us, maximum);
+        }
+        for (minimum, maximum) in [(-1, 60_000_000), (0, 0), (-2, -1), (100, 32)] {
+            let mut config = Config::default();
+            config.camera.min_exposure_us = minimum;
+            config.camera.max_exposure_us = maximum;
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

@@ -3,7 +3,8 @@
 # name_contains = "ASI676MC"
 bin = 1
 min_exposure_us = 100
-max_exposure_us = 5000000
+# Auto exposure adapts up to 60 seconds; the effective cap depends on the camera.
+max_exposure_us = 60000000
 max_gain = 300
 target_brightness = 100
 settle_frames = 6

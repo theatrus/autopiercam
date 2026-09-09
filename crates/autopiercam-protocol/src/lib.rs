@@ -26,6 +26,7 @@ pub const METHOD_UPLOADS_REQUEUE: &str = "uploads.requeue";
 pub const CAPABILITY_UPLOADS_LIST: &str = METHOD_UPLOADS_LIST;
 pub const CAPABILITY_UPLOADS_REQUEUE: &str = METHOD_UPLOADS_REQUEUE;
 pub const CAPABILITY_STORAGE_RETENTION: &str = "storage.retention";
+pub const CAPABILITY_EXPOSURE_PROGRESS: &str = "exposure.progress";
 
 pub const UPLOAD_LIST_DEFAULT_PAGE_SIZE: u16 = 50;
 pub const UPLOAD_LIST_MAX_PAGE_SIZE: u16 = 100;
@@ -262,6 +263,27 @@ pub struct StatusStorage {
     pub last_error: Option<String>,
 }
 
+/// SDK auto-exposure telemetry for the current camera attempt. Durations use
+/// the producer's monotonic clock; they are estimates, not sensor timestamps.
+/// Preview v1 remains unchanged: clients can match this progress to its session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusExposure {
+    /// Matches preview metadata; zero when this headless run has no preview.
+    pub session_generation: u64,
+    pub settling: bool,
+    pub exposure_us: i64,
+    pub gain: i64,
+    /// Effective SDK auto ceiling after capability clamping and readback.
+    pub max_exposure_us: i64,
+    pub settling_frames: u32,
+    pub settling_min_frames: u32,
+    /// Elapsed wait for the next frame, including all short SDK polls.
+    pub wait_elapsed_ms: u64,
+    /// Total allowed frame wait, not the per-call SDK polling timeout.
+    pub frame_timeout_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatus {
     pub state: AgentState,
@@ -277,6 +299,8 @@ pub struct AgentStatus {
     pub upload: Option<StatusUpload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StatusStorage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<StatusExposure>,
     /// Optional operations supported by this agent build. Older v1 agents omit
     /// this field, and older clients can safely ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -294,6 +318,7 @@ impl AgentStatus {
             last_error: None,
             upload: None,
             storage: None,
+            exposure: None,
             capabilities: Vec::new(),
         }
     }
@@ -1779,7 +1804,51 @@ mod tests {
         .unwrap();
         assert!(legacy.upload.is_none());
         assert!(legacy.storage.is_none());
+        assert!(legacy.exposure.is_none());
         assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn exposure_progress_is_additive_and_requires_complete_timing() {
+        let exposure = StatusExposure {
+            session_generation: 7,
+            settling: true,
+            exposure_us: 60_000_000,
+            gain: 300,
+            max_exposure_us: 60_000_000,
+            settling_frames: 2,
+            settling_min_frames: 6,
+            wait_elapsed_ms: 32_000,
+            frame_timeout_ms: 125_000,
+        };
+        let mut status = AgentStatus::new(AgentState::Starting);
+        status.exposure = Some(exposure.clone());
+        status
+            .capabilities
+            .push(CAPABILITY_EXPOSURE_PROGRESS.to_owned());
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["exposure"]["exposure_us"], 60_000_000);
+        assert_eq!(wire["exposure"]["frame_timeout_ms"], 125_000);
+        let round_trip: AgentStatus = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(round_trip, status);
+
+        // Older status consumers can ignore new top-level fields. Preview v1
+        // stays strict and does not need a wire-format or pipe-name change.
+        #[derive(Deserialize)]
+        struct OldStatus {
+            state: AgentState,
+            frames_captured: u64,
+            frames_saved: u64,
+        }
+        let old: OldStatus = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.state, AgentState::Starting);
+        assert_eq!((old.frames_captured, old.frames_saved), (0, 0));
+        let encoded = serde_json::to_value(exposure).unwrap();
+        for field in encoded.as_object().unwrap().keys() {
+            let mut incomplete = encoded.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<StatusExposure>(incomplete).is_err());
+        }
     }
 
     #[test]
