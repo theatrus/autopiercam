@@ -35,6 +35,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\..\shared\AutoPierCam.Preview\ExposureProgress.cs"
+             Link="Preview\ExposureProgress.cs" />
+    <Compile Include="..\..\shared\AutoPierCam.Preview\ExposureProgressClient.cs"
+             Link="Preview\ExposureProgressClient.cs" />
     <Content Include="..\..\assets\branding\autopiercam.ico"
              Link="autopiercam.ico"
              CopyToOutputDirectory="PreserveNewest"

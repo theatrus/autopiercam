@@ -94,7 +94,7 @@
                             <TextBlock
                                 FontSize="12"
                                 Foreground="#FF718096"
-                                Text="Latest-only JPEG stream · no camera access in the UI" />
+                                Text="Frames appear as each exposure completes" />
                         </StackPanel>
                         <Border
                             Margin="12"
@@ -120,7 +120,9 @@
                                 x:Name="PreviewDetailText"
                                 FontSize="12"
                                 Foreground="White"
-                                Text="Waiting for preview stream" />
+                                MaxWidth="490"
+                                Text="Waiting for preview stream"
+                                TextWrapping="Wrap" />
                         </Border>
                     </Grid>
                 </Border>
@@ -134,7 +136,7 @@
                     </Grid.ColumnDefinitions>
                     <Border Padding="14" Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="3">
-                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Exposure" />
+                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Current exposure" />
                             <TextBlock x:Name="ExposureValueText" FontSize="17" Text="—" />
                         </StackPanel>
                     </Border>
@@ -178,6 +180,12 @@
                             <TextBlock
                                 x:Name="FrameCountsText"
                                 Text="No status available" />
+                            <TextBlock
+                                x:Name="ExposureProgressText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Waiting for camera exposure status"
+                                TextWrapping="Wrap" />
                             <TextBlock
                                 x:Name="LastArtifactText"
                                 FontSize="12"
@@ -298,7 +306,7 @@
                                 Maximum="60000"
                                 Minimum="0.001"
                                 SpinButtonPlacementMode="Compact"
-                                Value="5000" />
+                                Value="60000" />
                         </StackPanel>
                         <StackPanel Grid.Column="1" Spacing="6">
                             <TextBlock Text="Max gain" />
@@ -311,6 +319,11 @@
                                 Value="300" />
                         </StackPanel>
                     </Grid>
+                    <TextBlock
+                        FontSize="12"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                        Text="30,000 ms = 30 seconds · 60,000 ms = 1 minute. Automatic exposure adapts within the camera's supported limit."
+                        TextWrapping="Wrap" />
                     <StackPanel Spacing="6">
                         <TextBlock Text="Still interval" />
                         <NumberBox

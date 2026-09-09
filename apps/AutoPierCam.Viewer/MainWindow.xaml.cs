@@ -1,5 +1,5 @@
-using System.Diagnostics;
 using System.Text.Json;
+using AutoPierCam.Preview;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -10,7 +10,6 @@ namespace AutoPierCam.Viewer;
 
 public sealed partial class MainWindow : Window
 {
-    private static readonly TimeSpan PreviewStaleAfter = TimeSpan.FromSeconds(5);
     private static readonly string[] ManagedOutboxStates =
         ["permanently_failed", "retrying", "pending"];
     private const double BytesPerMebibyte = 1024d * 1024d;
@@ -18,14 +17,20 @@ public sealed partial class MainWindow : Window
 
     private readonly AgentPipeClient _agentClient = new();
     private readonly PreviewPipeClient _previewClient = new();
+    private readonly ExposureProgressClient _progressClient = new();
+    private readonly PreviewFrameClock _previewFrameClock = new();
     private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherQueueTimer _previewFreshnessTimer;
     private AgentConfigurationSnapshot? _configurationSnapshot;
     private AgentStatus? _latestAgentStatus;
     private Task? _previewTask;
+    private Task? _progressTask;
+    private ExposureProgressObservation? _progressObservation;
+    private PreviewStreamPhase _previewPhase = PreviewStreamPhase.Connecting;
     private string _lastPreviewDetail = "Waiting for preview stream";
     private ulong _activePreviewConnectionEpoch;
-    private long _lastPreviewArrivalTimestamp;
+    private long? _lastPreviewExposureUs;
+    private ulong _lastPreviewSessionGeneration;
     private bool _hasPreviewFrame;
     private bool _previewFrameError;
     private bool _configurationNeedsRefresh = true;
@@ -56,9 +61,53 @@ public sealed partial class MainWindow : Window
         _initialRefreshStarted = true;
         _previewFreshnessTimer.Start();
         _previewTask = RunPreviewLoopAsync(_lifetime.Token);
+        _progressTask = RunExposureProgressLoopAsync(_lifetime.Token);
         await RunUiOperationAsync(
             "Connecting to the local capture agent…",
             RefreshStatusAndConfigurationAsync);
+    }
+
+    private async Task RunExposureProgressLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            // This read-only client has its own short request deadline. It never
+            // refreshes configuration or touches a user's unsaved setting edits.
+            await _progressClient.RunAsync(
+                    (observation, token) => RunOnDispatcherAsync(
+                        () =>
+                        {
+                            _progressObservation = observation;
+                            UpdatePreviewPresentation();
+                            return Task.CompletedTask;
+                        },
+                        token),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing the window cancels both the request and the polling delay.
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunOnDispatcherAsync(
+                        () =>
+                        {
+                            _progressObservation = null;
+                            UpdatePreviewPresentation();
+                            return Task.CompletedTask;
+                        },
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // The dispatcher may already be shutting down with the window.
+            }
+        }
     }
 
     private async Task RunPreviewLoopAsync(CancellationToken cancellationToken)
@@ -130,6 +179,8 @@ public sealed partial class MainWindow : Window
             }
 
             _activePreviewConnectionEpoch = state.ConnectionEpoch;
+            _previewPhase = state.Phase;
+            _progressObservation = null;
             ClearPreviewImage();
             PreviewStatusText.Text = "CONNECTING";
             PreviewDetailText.Text =
@@ -142,15 +193,18 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        _previewPhase = state.Phase;
         switch (state.Phase)
         {
             case PreviewStreamPhase.WaitingForFrame:
                 ClearPreviewImage();
                 PreviewStatusText.Text = "WAITING";
                 PreviewDetailText.Text = "Connected; waiting for the newest camera frame";
+                UpdatePreviewPresentation();
                 break;
             case PreviewStreamPhase.Reconnecting:
                 ClearPreviewImage();
+                _progressObservation = null;
                 PreviewStatusText.Text = "RECONNECTING";
                 string retry = state.RetryDelay is TimeSpan retryDelay
                     ? $" Retrying in {retryDelay.TotalSeconds:0.##} seconds."
@@ -205,9 +259,15 @@ public sealed partial class MainWindow : Window
 
             _lastPreviewDetail = FormatPreviewDetail(frame.Metadata);
             PreviewDetailText.Text = _lastPreviewDetail;
-            _lastPreviewArrivalTimestamp = Stopwatch.GetTimestamp();
+            _previewFrameClock.RecordFrame(
+                frame.Metadata.CapturedAtUnixMs,
+                frame.Metadata.SessionGeneration,
+                frame.Metadata.Sequence);
+            _lastPreviewExposureUs = frame.Metadata.ExposureUs;
+            _lastPreviewSessionGeneration = frame.Metadata.SessionGeneration;
             _hasPreviewFrame = true;
             _previewFrameError = false;
+            UpdatePreviewPresentation();
         }
         catch (Exception exception)
         {
@@ -220,21 +280,92 @@ public sealed partial class MainWindow : Window
 
     private void PreviewFreshnessTimer_Tick(DispatcherQueueTimer sender, object args)
     {
-        if (_closed || !_hasPreviewFrame || _previewFrameError)
+        UpdatePreviewPresentation();
+    }
+
+    private void UpdatePreviewPresentation()
+    {
+        if (_closed)
         {
             return;
         }
 
-        TimeSpan age = Stopwatch.GetElapsedTime(_lastPreviewArrivalTimestamp);
-        if (age < PreviewStaleAfter)
+        TimeSpan observationAge = _progressObservation?.Age ?? TimeSpan.MaxValue;
+        string? progressDetail = ExposurePresentation.Describe(
+            _progressObservation, observationAge);
+        ExposureProgressText.Text = progressDetail ??
+            (_progressObservation is { Status.Exposure: null } &&
+             ExposurePresentation.IsCurrent(_progressObservation, observationAge)
+                ? "Exposure progress is not available with this capture agent."
+                : "Waiting for camera exposure status");
+        if (ExposurePresentation.IsCurrent(_progressObservation, observationAge) &&
+            _progressObservation?.Status.Exposure is { } currentExposure)
+        {
+            ExposureProgressText.Text +=
+                $" Automatic exposure limit: {FormatExposure(currentExposure.MaxExposureUs)} · gain {currentExposure.Gain:N0}.";
+        }
+
+        // A status response cannot repair a broken preview transport or JPEG.
+        if (_previewFrameError ||
+            _previewPhase is PreviewStreamPhase.Connecting or PreviewStreamPhase.Reconnecting)
         {
             return;
         }
 
-        PreviewStatusText.Text = "STALE";
-        PreviewImage.Opacity = 0.45;
-        PreviewDetailText.Text =
-            $"No new preview for {age.TotalSeconds:0} seconds · {_lastPreviewDetail}";
+        bool currentStatus = ExposurePresentation.IsCurrent(_progressObservation, observationAge);
+        ExposureProgressStatus? status = currentStatus ? _progressObservation?.Status : null;
+        bool captureStopped = status is { IsActive: false };
+        ExposureProgress? exposure = status?.Exposure;
+        bool sameSession = !_hasPreviewFrame ||
+            exposure?.SessionGeneration == _lastPreviewSessionGeneration;
+        if (exposure is not null && sameSession)
+        {
+            ExposureValueText.Text = FormatExposure(exposure.ExposureUs);
+            GainValueText.Text = exposure.Gain.ToString("N0");
+        }
+
+        if (!_hasPreviewFrame)
+        {
+            bool frameOverdue = exposure is not null &&
+                exposure.WaitElapsedMs / 1_000d + observationAge.TotalSeconds >=
+                exposure.FrameTimeoutMs / 1_000d;
+            PreviewStatusText.Text = captureStopped
+                ? "CAPTURE STOPPED"
+                : frameOverdue ? "WAITING"
+                : exposure?.Settling == true ? "SETTLING"
+                : exposure is not null ? "EXPOSING" : "WAITING";
+            PreviewDetailText.Text = progressDetail ??
+                "Connected; waiting for the newest camera frame";
+            return;
+        }
+
+        TimeSpan age = _previewFrameClock.Age;
+        bool stale = ExposurePresentation.IsStale(
+            age,
+            _lastPreviewExposureUs,
+            _lastPreviewSessionGeneration,
+            _progressObservation,
+            observationAge);
+        PreviewImage.Opacity = stale ? 0.45 : 1;
+        PreviewStatusText.Text = captureStopped ? "CAPTURE STOPPED"
+            : stale ? "STALE"
+            : exposure?.Settling == true ? "SETTLING" : "LIVE";
+        string? sameSessionDetail = ExposurePresentation.Describe(
+            _progressObservation, observationAge, _lastPreviewSessionGeneration);
+        if (stale)
+        {
+            string stoppedDetail = captureStopped && sameSessionDetail is not null
+                ? $" {sameSessionDetail}"
+                : string.Empty;
+            PreviewDetailText.Text =
+                $"Snapshot is {age.TotalSeconds:0} seconds old; waiting for a new preview.{stoppedDetail} · {_lastPreviewDetail}";
+        }
+        else
+        {
+            PreviewDetailText.Text = sameSessionDetail is not null
+                ? $"{sameSessionDetail} · {_lastPreviewDetail}"
+                : _lastPreviewDetail;
+        }
     }
 
     private void ShowPreviewFrameError(string detail)
@@ -259,7 +390,10 @@ public sealed partial class MainWindow : Window
         ExposureValueText.Text = "—";
         GainValueText.Text = "—";
         ModeValueText.Text = "—";
-        _lastPreviewArrivalTimestamp = 0;
+        // Keep the frame clock across reconnects: a cached frame is still old
+        // when the preview pipe sends it again on a new connection.
+        _lastPreviewExposureUs = null;
+        _lastPreviewSessionGeneration = 0;
         _hasPreviewFrame = false;
         _previewFrameError = false;
         _lastPreviewDetail = "Waiting for preview stream";
@@ -316,7 +450,9 @@ public sealed partial class MainWindow : Window
                 new InvalidOperationException("The Viewer dispatcher is no longer available."));
         }
 
-        return completion.Task;
+        // If the window closes after a callback was queued, the dispatcher may
+        // never run it. Cancellation still releases both background clients.
+        return completion.Task.WaitAsync(cancellationToken).WaitAsync(_lifetime.Token);
     }
 
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -1596,12 +1732,11 @@ public sealed partial class MainWindow : Window
         _lifetime.Cancel();
         try
         {
-            if (_previewTask is not null)
-            {
-                await _previewTask.ConfigureAwait(false);
-            }
-
-            await _agentClient.DisposeAsync().ConfigureAwait(false);
+            // Join every loop even if one encounters an error during shutdown.
+            await Task.WhenAll(
+                    _previewTask ?? Task.CompletedTask,
+                    _progressTask ?? Task.CompletedTask)
+                .ConfigureAwait(false);
         }
         catch
         {
@@ -1609,7 +1744,18 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _lifetime.Dispose();
+            try
+            {
+                await _agentClient.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Release the lifetime even if control-client cleanup fails.
+            }
+            finally
+            {
+                _lifetime.Dispose();
+            }
         }
     }
 }

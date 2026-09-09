@@ -36,6 +36,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="AutoPierCam.NINA.Tests" />
+    <Compile Include="../../../../shared/AutoPierCam.Preview/*.cs" Link="Preview/Shared/%(Filename)%(Extension)" />
   </ItemGroup>
 
   <Target Name="CopyPluginForLocalDevelopment"

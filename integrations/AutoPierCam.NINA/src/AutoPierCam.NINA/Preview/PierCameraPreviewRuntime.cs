@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -7,6 +6,7 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using AutoPierCam.Preview;
 using NINA.Core.Utility;
 
 namespace AutoPierCam.NINA.Preview;
@@ -48,16 +48,16 @@ public interface IPierCameraPreviewRuntime : INotifyPropertyChanged
 
 public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
 {
-    internal static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(5);
-
     private readonly object lifecycleLock = new();
     private readonly SemaphoreSlim stopGate = new(1, 1);
     private CancellationTokenSource? lifetime;
     private Task? clientTask;
     private Task? freshnessTask;
+    private Task? exposureTask;
+    private ExposureProgressObservation? exposureObservation;
     private PreviewStreamPhase? streamPhase;
     private PreviewFrameMetadata? metadata;
-    private long? lastFrameReceivedTimestamp;
+    private readonly PreviewFrameClock frameClock = new();
     private string? streamDetail;
     private string? frameError;
     private TimeSpan? retryDelay;
@@ -84,7 +84,9 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     public bool IsStale => HasImage &&
         (streamPhase != PreviewStreamPhase.Live ||
          frameError is not null ||
-         FrameAge() >= StaleAfter);
+         ExposurePresentation.IsStale(
+             FrameAge(), metadata?.ExposureUs, metadata?.SessionGeneration ?? 0,
+             exposureObservation, ExposureObservationAge()));
 
     public bool IsLive => HasImage && !IsStale;
 
@@ -99,6 +101,17 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                 return HasImage
                     ? $"Could not display the newest frame; showing the last good snapshot. {frameError}"
                     : $"Could not display the newest pier camera frame. {frameError}";
+            }
+
+            if (streamPhase is PreviewStreamPhase.WaitingForFrame or PreviewStreamPhase.Live)
+            {
+                string? progress = ExposurePresentation.Describe(
+                    exposureObservation, ExposureObservationAge(), HasImage ? metadata?.SessionGeneration : null);
+                if (progress is not null &&
+                    (!HasImage || !IsStale || exposureObservation?.Status.IsActive == false))
+                {
+                    return HasImage && IsStale ? $"{progress} Showing the last snapshot." : progress;
+                }
             }
 
             return streamPhase switch
@@ -127,8 +140,8 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     public string ConnectionText => streamPhase switch
     {
         PreviewStreamPhase.Live when IsStale => "Stale",
-        PreviewStreamPhase.Live => "Live",
-        PreviewStreamPhase.WaitingForFrame => "Waiting for frame",
+        PreviewStreamPhase.Live => ProgressStage() ?? "Live",
+        PreviewStreamPhase.WaitingForFrame => ProgressStage() ?? "Waiting for frame",
         PreviewStreamPhase.Connecting => "Connecting",
         PreviewStreamPhase.Reconnecting => "Reconnecting",
         _ => "Waiting",
@@ -142,15 +155,15 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
     {
         get
         {
-            if (lastFrameReceivedTimestamp is null)
+            if (!frameClock.HasFrame)
             {
                 return "No frame received";
             }
 
             TimeSpan age = FrameAge();
             return age < TimeSpan.FromSeconds(1.5)
-                ? "Received just now"
-                : $"Received {FormatAge(age)} ago";
+                ? "Captured just now"
+                : $"Snapshot is {FormatAge(age)} old";
         }
     }
 
@@ -188,9 +201,11 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
             }
 
             lifetime = new CancellationTokenSource();
+            exposureObservation = null;
             CancellationToken token = lifetime.Token;
             clientTask = Task.Run(() => SuperviseClientAsync(token), token);
             freshnessTask = Task.Run(() => MonitorFreshnessAsync(token), token);
+            exposureTask = Task.Run(() => MonitorExposureAsync(token), token);
         }
     }
 
@@ -210,7 +225,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                 }
 
                 source.Cancel();
-                tasks = new[] { clientTask!, freshnessTask! };
+                tasks = new[] { clientTask!, freshnessTask!, exposureTask! };
             }
 
             try
@@ -229,6 +244,8 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                         lifetime = null;
                         clientTask = null;
                         freshnessTask = null;
+                        exposureTask = null;
+                        exposureObservation = null;
                     }
                 }
                 source.Dispose();
@@ -289,6 +306,20 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
         }
     }
 
+    private Task MonitorExposureAsync(CancellationToken cancellationToken) =>
+        new ExposureProgressClient().RunAsync(HandleProgressAsync, cancellationToken);
+
+    internal Task HandleProgressAsync(
+        ExposureProgressObservation? observation,
+        CancellationToken cancellationToken) =>
+        DispatchAsync(
+            () =>
+            {
+                exposureObservation = observation;
+                RefreshPresentation();
+            },
+            cancellationToken);
+
     private async Task HandleFrameAsync(PreviewFrame frame, CancellationToken cancellationToken)
     {
         BitmapSource? decoded = null;
@@ -309,7 +340,8 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                     {
                         Image = decoded;
                         metadata = frame.Metadata;
-                        lastFrameReceivedTimestamp = Stopwatch.GetTimestamp();
+                        frameClock.RecordFrame(
+                            frame.Metadata.CapturedAtUnixMs, frame.Metadata.SessionGeneration, frame.Metadata.Sequence);
                         frameError = null;
                     }
                     else
@@ -323,7 +355,7 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
             .ConfigureAwait(false);
     }
 
-    private Task HandleStateAsync(
+    internal Task HandleStateAsync(
         PreviewStreamState state,
         CancellationToken cancellationToken) =>
         DispatchAsync(
@@ -335,6 +367,10 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
                 if (state.Phase != PreviewStreamPhase.Live)
                 {
                     frameError = null;
+                }
+                if (state.Phase is PreviewStreamPhase.Connecting or PreviewStreamPhase.Reconnecting)
+                {
+                    exposureObservation = null;
                 }
                 RefreshPresentation();
             },
@@ -409,28 +445,31 @@ public sealed class PierCameraPreviewRuntime : IPierCameraPreviewRuntime
         RaisePropertyChanged(nameof(DroppedFramesText));
     }
 
-    private TimeSpan FrameAge() => lastFrameReceivedTimestamp is null
-        ? TimeSpan.MaxValue
-        : Stopwatch.GetElapsedTime(lastFrameReceivedTimestamp.Value);
+    private TimeSpan FrameAge() => frameClock.Age;
+
+    private TimeSpan ExposureObservationAge() => exposureObservation?.Age ?? TimeSpan.MaxValue;
+
+    private string? ProgressStage()
+    {
+        if (!ExposurePresentation.IsCurrent(exposureObservation, ExposureObservationAge()))
+        {
+            return null;
+        }
+
+        ExposureProgressStatus status = exposureObservation!.Status;
+        if (!status.IsActive)
+        {
+            return status.State == "faulted" ? "Capture failed" : "Capture stopped";
+        }
+
+        return status.Exposure is { } progress ? progress.Settling ? "Settling" : "Exposing" : null;
+    }
 
     private string RetrySuffix() => retryDelay is TimeSpan delay
         ? $" in {delay.TotalSeconds:0.#} seconds"
         : string.Empty;
 
-    internal static string FormatExposure(long exposureUs)
-    {
-        if (exposureUs >= 1_000_000)
-        {
-            return $"{exposureUs / 1_000_000d:0.###} s";
-        }
-
-        if (exposureUs >= 1_000)
-        {
-            return $"{exposureUs / 1_000d:0.###} ms";
-        }
-
-        return $"{exposureUs:N0} µs";
-    }
+    internal static string FormatExposure(long exposureUs) => ExposurePresentation.FormatExposure(exposureUs);
 
     internal static string FormatAge(TimeSpan age)
     {
