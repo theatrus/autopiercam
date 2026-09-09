@@ -20,6 +20,13 @@ No endpoint, camera, or credential configuration is required. The plugin uses
 the protected local `autopiercam-preview-v1` named pipe. If AutoPierCam is not
 running yet, the panel waits and reconnects automatically.
 
+Read-only `status.get` polling on `autopiercam-control-v1` adds settling and
+estimated exposure progress, including before the first snapshot. At night,
+one frame may take 30 or 60 seconds; the panel uses exposure-aware freshness
+instead of declaring every image stale after five seconds. Old agents without
+progress remain supported using the last frame's exposure. See
+[Long exposures and night capture](../../docs/exposure.md).
+
 The panel displays the latest snapshot, local capture time, age, dimensions,
 exposure, gain, day/night mode, and the producer's skipped-preview count. A
 lost or stalled stream does not blank the pane: the last good image remains

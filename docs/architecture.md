@@ -140,6 +140,16 @@ Phase one uses the SDK's auto exposure and gain only when the camera reports
 that both controls support automatic mode. AutoPierCam clamps them with maximum
 exposure, maximum gain, and target-brightness controls discovered at runtime.
 
+The default maximum is 60 seconds; explicit saved limits are unchanged. The
+agent reads back the effective SDK ceiling and publishes it with monotonic
+per-frame progress through `status.get`. Startup settling budgets the requested
+minimum frame count plus four convergence frames at that ceiling. Completed
+frames feed preview while settling, and the final settling frame becomes the
+first still without waiting for another exposure. Short SDK polls retain
+responsive cancellation; a separate exposure-aware no-frame deadline faults a
+stalled camera so the supervisor can reconnect. See [Long exposures](exposure.md)
+for timing, fallback behavior, and the SDK-auto ceiling versus sensor limits.
+
 The deterministic controller in phase two operates in log exposure-value space:
 
 1. Calculate raw p50, p90, and highlight-clipping fraction from a sparse sample.

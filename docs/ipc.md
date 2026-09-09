@@ -49,6 +49,17 @@ Reserved methods currently return a structured `not_implemented` error:
       "frames_captured": 42,
       "frames_saved": 4,
       "last_artifact": "captures/frame-....jpg",
+      "exposure": {
+        "session_generation": 4,
+        "settling": false,
+        "exposure_us": 60000000,
+        "gain": 300,
+        "max_exposure_us": 60000000,
+        "settling_frames": 6,
+        "settling_min_frames": 6,
+        "wait_elapsed_ms": 32000,
+        "frame_timeout_ms": 125000
+      },
       "upload": {
         "pending": 2,
         "active": 1,
@@ -73,14 +84,38 @@ Reserved methods currently return a structured `not_implemented` error:
       "capabilities": [
         "uploads.list",
         "uploads.requeue",
-        "storage.retention"
+        "storage.retention",
+        "exposure.progress"
       ]
     }
 
-`camera`, `last_artifact`, the agent-level `last_error`, `upload`, and `storage`
+`camera`, `last_artifact`, the agent-level `last_error`, `upload`, `storage`, and `exposure`
 are omitted when unavailable. `capabilities` is omitted only when empty; clients
 must gate optional operations on exact advertised strings so they remain safe
 with older protocol-v1 agents.
+
+The `exposure.progress` capability advertises the optional exposure object.
+It is present during startup settling and active capture (including paused
+scheduled stills), and cleared on stop, fault, or camera-attempt restart.
+`session_generation` matches preview v1; a headless run without preview uses
+zero. `max_exposure_us` is the effective ceiling read back from the SDK, not
+necessarily the requested configuration value. Exposure/gain are asynchronous
+SDK readback estimates, not exact metadata for an individual frame.
+
+`wait_elapsed_ms` is monotonic time since the most recent completed frame (or
+stream startup). `frame_timeout_ms` is the total permitted no-frame wait,
+including all short SDK polls. It is twice the longest relevant observed
+exposure plus five seconds, retaining one previous frame's exposure allowance
+to tolerate a queued night frame during a transition to daylight. The agent
+never shortens an in-flight deadline. `settling_frames` counts complete startup
+frames and `settling_min_frames` is the effective minimum, at least four;
+reaching that count alone does not guarantee convergence.
+
+Both image clients independently poll read-only `status.get` for progress every
+two seconds, with two-second connect and response bounds and one poll in flight.
+These polls do not reload configuration or overwrite unsaved edits. Missing or
+malformed progress falls back to preview metadata. This additive control field
+does not change the strict preview-v1 wire format.
 
 The upload object is published while the durable uploader is enabled. Its five
 counters are always present; the last-success, last-failure, and upload-error
@@ -243,5 +278,12 @@ unbounded.
 The Viewer exposes connecting, waiting, live, and reconnecting stream states,
 clears an image when the connection epoch changes, and verifies metadata,
 monotonic sequence/session values, JPEG markers, and decoded dimensions. A live
-image is marked stale after five seconds without a newer frame; malformed or
-undecodable data is shown as a frame error.
+image is marked stale using twice its reported exposure plus five seconds
+(five seconds when telemetry is absent), extended by fresh same-session
+exposure progress while the camera ramps toward a longer exposure. Progress
+expires after eight seconds without a successful status observation. Neither
+repeated status polls nor receiving the same cached frame on reconnect can
+indefinitely refresh an old image. A session change, inactive agent state, or
+expired no-frame deadline makes the old image stale. Malformed or undecodable
+data is shown as a frame error. These rules also apply to the N.I.N.A. panel;
+see [Long exposures](exposure.md).

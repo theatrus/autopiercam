@@ -28,6 +28,8 @@ The repository now contains a hardware-validated background capture slice:
 - a validated, forward-looking TOML configuration model;
 - a continuous camera drain loop with auto-exposure settling and a bounded
   still-writer queue;
+- minute-long SDK auto-exposure limits, startup previews, exposure progress,
+  and exposure-aware stale-frame detection in both viewers;
 - a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
   backoff;
 - a Windows notification-area host that owns and supervises the camera worker;
@@ -106,6 +108,12 @@ operator can issue the same request without loading the camera SDK:
 `autopiercam run` remains available for a console-only installation or capture
 test.
 
+New configurations allow auto exposure up to **60 seconds**; existing saved
+limits are preserved. In the Viewer, enter `30000` ms for 30 seconds or `60000`
+ms for one minute. This is a ceiling, not a forced exposure: the camera still
+adapts to daylight. See [Long exposures and night capture](docs/exposure.md)
+for camera limits, startup behavior, progress, and opt-in hardware checks.
+
 Set AUTOPIERCAM_ASI_SDK_PATH or pass --sdk when the SDK DLL is not in the
 bundled location. The x64 runtime DLL is expected at:
 
@@ -143,6 +151,8 @@ troubleshooting, development, and package details.
 - docs/installation.md: installed paths, start-at-sign-in, logs, diagnostics,
   silent setup, removal, and installer build/signing seam.
 - docs/architecture.md: target agent, UI, storage, video, and upload design.
+- docs/exposure.md: automatic exposure limits, night startup, progress, and
+  hardware diagnostics.
 - docs/upload.md: implemented HTTP request, retry, and durability contract.
 - docs/retention.md: implemented retention policy, upload-ledger safety, and
   storage-pressure behavior.
@@ -211,8 +221,10 @@ healthy.
   documentation calls control 11 microseconds, while the ASI676MC exposes
   AutoExpMaxExpMS. The implementation detects the runtime control name and
   converts accordingly.
-- The Viewer renders the live preview and marks it stale after five seconds
-  without a new frame. Its camera selector remains read-only. Max exposure,
+- The Viewer and N.I.N.A. panel distinguish settling, exposing, and stalled
+  frames using exposure-aware deadlines. SDK readback is approximate telemetry,
+  not a frame-exact exposure measurement. The Viewer's camera selector remains
+  read-only. Max exposure,
   max gain, still interval, managed-image and minimum-free-space limits, upload
   endpoint/enable, and video enable are backed by versioned configuration
   replacement. Capability checks keep new retention fields safe when the Viewer
