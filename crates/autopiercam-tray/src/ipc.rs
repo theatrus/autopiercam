@@ -868,8 +868,8 @@ fn wide_pointer_to_string(pointer: PWSTR) -> io::Result<String> {
 mod tests {
     use super::*;
     use autopiercam_protocol::{
-        AgentState, CAPABILITY_STORAGE_RETENTION, CAPABILITY_UPLOADS_LIST,
-        CAPABILITY_UPLOADS_REQUEUE, PROTOCOL_VERSION,
+        AgentState, CAPABILITY_EXPOSURE_PROGRESS, CAPABILITY_STORAGE_RETENTION,
+        CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, PROTOCOL_VERSION,
     };
     use std::{
         fs,
@@ -1055,7 +1055,8 @@ mod tests {
             [
                 CAPABILITY_UPLOADS_LIST,
                 CAPABILITY_UPLOADS_REQUEUE,
-                CAPABILITY_STORAGE_RETENTION
+                CAPABILITY_STORAGE_RETENTION,
+                CAPABILITY_EXPOSURE_PROGRESS
             ]
         );
 

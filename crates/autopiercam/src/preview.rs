@@ -340,6 +340,46 @@ fn lock_unpoisoned<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn settling_observer_publishes_preview_before_capture_transition() {
+        let monitor = crate::AgentMonitor::new();
+        let hub = PreviewHub::new();
+        let session = hub.begin_session();
+        let queue = Arc::new(LatestPreviewQueue::default());
+        let sink = PreviewSink {
+            queue: Arc::clone(&queue),
+        };
+        let mut observer =
+            crate::CaptureObserver::new(BayerPattern::Rg, Some(&monitor), Some(&sink));
+        let frame = crate::CompletedFrame {
+            meta: autopiercam_asi::FrameMeta {
+                width: 4,
+                height: 4,
+                image_type: autopiercam_asi::ImageType::Raw8,
+            },
+            data: vec![100; 16],
+            captured_at_unix_ms: 1000,
+            exposure_us: 60_000_000,
+            gain: 400,
+        };
+        observer.frame_received(&frame, true, false);
+        // Consume synchronously: this verifies the complete preview path
+        // without making a test depend on the encoder thread's scheduling.
+        let queued = lock_unpoisoned(&queue.state).pending.take().unwrap();
+        encode_and_publish(queued, &session).unwrap();
+        let preview = hub.snapshot().frame.unwrap();
+        assert_eq!(preview.metadata.session_generation, session.generation());
+        assert_eq!(preview.metadata.exposure_us, Some(60_000_000));
+        assert_eq!(preview.metadata.gain, Some(400));
+        assert_eq!(preview.metadata.captured_at_unix_ms, 1000);
+        assert_eq!(
+            monitor.snapshot().state,
+            autopiercam_protocol::AgentState::Starting
+        );
+        assert_eq!(monitor.snapshot().frames_captured, 1);
+        assert_eq!(monitor.capturing_generation(), 0);
+    }
+
     fn metadata() -> PreviewMetadata {
         PreviewMetadata {
             version: PROTOCOL_VERSION,

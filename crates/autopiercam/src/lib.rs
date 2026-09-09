@@ -8,9 +8,10 @@ use autopiercam_core::{
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
 use autopiercam_protocol::{
-    AgentState, AgentStatus, CAPABILITY_STORAGE_RETENTION, CAPABILITY_UPLOADS_LIST,
-    CAPABILITY_UPLOADS_REQUEUE, StatusCamera, StatusStorage, StatusUpload, StoragePressure,
-    UploadListRequest, UploadListResponse, UploadRequeueRequest, UploadRequeueResult,
+    AgentState, AgentStatus, CAPABILITY_EXPOSURE_PROGRESS, CAPABILITY_STORAGE_RETENTION,
+    CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, StatusCamera, StatusExposure,
+    StatusStorage, StatusUpload, StoragePressure, UploadListRequest, UploadListResponse,
+    UploadRequeueRequest, UploadRequeueResult,
 };
 use image::{
     ColorType, ImageEncoder,
@@ -29,11 +30,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+#[cfg(test)]
+mod auto_limits_tests;
+mod exposure;
 mod ledger_maintenance;
 mod preview;
 mod retention;
 mod upload;
 
+use exposure::{FrameWait, Settling, WaitDecision, poll_timeout_ms};
 use ledger_maintenance::LedgerLease;
 pub use ledger_maintenance::{
     LedgerArchiveReport, LedgerMaintenanceError, LedgerMigrationReport, archive_upload_ledger,
@@ -291,6 +296,7 @@ impl AgentMonitor {
             CAPABILITY_UPLOADS_LIST.to_owned(),
             CAPABILITY_UPLOADS_REQUEUE.to_owned(),
             CAPABILITY_STORAGE_RETENTION.to_owned(),
+            CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
@@ -311,6 +317,7 @@ impl AgentMonitor {
     pub fn report_fault(&self, message: impl Into<String>) {
         let mut status = self.write();
         status.state = AgentState::Faulted;
+        status.exposure = None;
         status.last_error = Some(message.into());
     }
 
@@ -400,6 +407,7 @@ impl AgentMonitor {
         status.last_error = None;
         status.upload = None;
         status.storage = None;
+        status.exposure = None;
     }
 
     fn set_camera(&self, info: &CameraInfo) {
@@ -415,6 +423,21 @@ impl AgentMonitor {
             self.capturing_generation.fetch_add(1, Ordering::AcqRel);
         }
         status.state = state;
+        if matches!(
+            status.state,
+            AgentState::Idle | AgentState::Stopping | AgentState::Faulted
+        ) {
+            status.exposure = None;
+        }
+    }
+
+    fn exposure_progress(&self, exposure: StatusExposure) {
+        self.write().exposure = Some(exposure);
+    }
+
+    fn settling_frame_captured(&self) {
+        let mut status = self.write();
+        status.frames_captured = status.frames_captured.saturating_add(1);
     }
 
     fn frame_captured(&self, paused: bool) {
@@ -561,28 +584,31 @@ pub fn snapshot(
         image_type: ImageType::Raw8,
     })?;
     camera.start_video()?;
-    let mut frame_data = Vec::new();
+    let mut progress = CaptureProgress::new(&camera, auto_limits, 0, settle_frames);
+    let mut observer = CaptureObserver::new(bayer, None, None);
     let frame = wait_for_auto_settle(
         &mut camera,
         settle_frames,
         auto_limits,
-        &mut frame_data,
         None,
+        &mut progress,
+        &mut observer,
     )?
     .context("snapshot was cancelled while automatic exposure was settling")?;
     camera.stop_video()?;
-    let rgb = match frame.image_type {
-        ImageType::Raw8 => demosaic_bilinear(&frame_data, frame.width, frame.height, bayer)?,
-        ImageType::Rgb24 => frame_data,
-        ImageType::Y8 => frame_data.iter().flat_map(|value| [*value; 3]).collect(),
+    let meta = frame.meta;
+    let rgb = match meta.image_type {
+        ImageType::Raw8 => demosaic_bilinear(&frame.data, meta.width, meta.height, bayer)?,
+        ImageType::Rgb24 => frame.data,
+        ImageType::Y8 => frame.data.iter().flat_map(|value| [*value; 3]).collect(),
         other => bail!("snapshot output does not yet support {other:?}"),
     };
     let stats = luma_stats(&rgb, 64)?;
-    save_rgb(output, frame.width, frame.height, &rgb, jpeg_quality)?;
+    save_rgb(output, meta.width, meta.height, &rgb, jpeg_quality)?;
     println!(
         "Saved {}x{} image to {} (mean {:.1}, p50 {}, p90 {}, clipped {:.2}%)",
-        frame.width,
-        frame.height,
+        meta.width,
+        meta.height,
         output.display(),
         stats.mean,
         stats.p50,
@@ -610,6 +636,144 @@ struct AutoLimits {
     min_gain: i64,
     max_gain: i64,
     target_brightness: i64,
+}
+
+/// A successful SDK sample owns its bytes so a subsequent timed-out read can
+/// never replace the image while leaving its old dimensions and telemetry.
+#[derive(Debug)]
+struct CompletedFrame {
+    meta: FrameMeta,
+    data: Vec<u8>,
+    captured_at_unix_ms: u64,
+    exposure_us: i64,
+    gain: i64,
+}
+
+struct CaptureProgress {
+    started: Instant,
+    wait: FrameWait,
+    status: StatusExposure,
+}
+
+impl CaptureProgress {
+    fn new(
+        camera: &Camera,
+        limits: AutoLimits,
+        session_generation: u64,
+        minimum_frames: u32,
+    ) -> Self {
+        let exposure_us = current_exposure(camera, limits.max_exposure_us);
+        let gain = current_gain(camera, limits.min_gain);
+        Self {
+            started: Instant::now(),
+            wait: FrameWait::new(exposure_us),
+            status: StatusExposure {
+                session_generation,
+                settling: true,
+                exposure_us,
+                gain,
+                max_exposure_us: limits.max_exposure_us,
+                settling_frames: 0,
+                settling_min_frames: minimum_frames.max(4),
+                wait_elapsed_ms: 0,
+                frame_timeout_ms: 0,
+            },
+        }
+    }
+
+    fn refresh(&mut self, camera: &Camera, limits: AutoLimits) {
+        self.status.exposure_us = current_exposure(camera, limits.max_exposure_us);
+        self.status.gain = current_gain(camera, self.status.gain);
+        self.wait.observe_exposure(self.status.exposure_us);
+    }
+
+    fn publish(&self, observer: &CaptureObserver<'_>) {
+        if let Some(monitor) = observer.monitor {
+            let mut status = self.status.clone();
+            status.wait_elapsed_ms = duration_millis(self.wait.elapsed(self.started.elapsed()));
+            status.frame_timeout_ms = duration_millis(self.wait.timeout());
+            monitor.exposure_progress(status);
+        }
+    }
+
+    fn completed_frame(&mut self, meta: FrameMeta, data: &mut Vec<u8>) -> CompletedFrame {
+        self.wait.frame_received(self.started.elapsed());
+        CompletedFrame {
+            meta,
+            data: std::mem::take(data),
+            captured_at_unix_ms: unix_time_millis(),
+            exposure_us: self.status.exposure_us,
+            gain: self.status.gain,
+        }
+    }
+}
+
+fn current_exposure(camera: &Camera, fallback_us: i64) -> i64 {
+    camera
+        .control_value(ControlType::EXPOSURE)
+        .map(|value| value.value)
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback_us.max(1))
+}
+
+fn current_gain(camera: &Camera, fallback: i64) -> i64 {
+    camera
+        .control_value(ControlType::GAIN)
+        .map(|value| value.value)
+        .unwrap_or(fallback)
+}
+
+fn duration_millis(value: Duration) -> u64 {
+    value.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+struct CaptureObserver<'a> {
+    bayer: BayerPattern,
+    monitor: Option<&'a AgentMonitor>,
+    preview: Option<&'a PreviewSink>,
+    next_preview: Instant,
+}
+
+impl<'a> CaptureObserver<'a> {
+    fn new(
+        bayer: BayerPattern,
+        monitor: Option<&'a AgentMonitor>,
+        preview: Option<&'a PreviewSink>,
+    ) -> Self {
+        Self {
+            bayer,
+            monitor,
+            preview,
+            next_preview: Instant::now(),
+        }
+    }
+
+    fn frame_received(&mut self, frame: &CompletedFrame, settling: bool, paused: bool) {
+        if let Some(monitor) = self.monitor {
+            if settling {
+                monitor.settling_frame_captured();
+            } else {
+                monitor.frame_captured(paused);
+            }
+        }
+        let now = Instant::now();
+        if let Some(preview) = self.preview
+            && now >= self.next_preview
+        {
+            let _ = preview.try_publish(|dropped_frames| PreviewJob {
+                width: frame.meta.width,
+                height: frame.meta.height,
+                bayer: self.bayer,
+                data: frame.data.clone(),
+                captured_at_unix_ms: frame.captured_at_unix_ms,
+                exposure_us: frame.exposure_us,
+                gain: frame.gain,
+                dropped_frames,
+            });
+            self.next_preview = now + PREVIEW_INTERVAL;
+        }
+    }
 }
 
 pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) -> Result<()> {
@@ -758,6 +922,13 @@ fn run_agent_inner(
         config.camera.max_gain,
         config.camera.target_brightness,
     )?;
+    CaptureProgress::new(
+        &camera,
+        auto_limits,
+        preview.map(PreviewSession::generation).unwrap_or(0),
+        config.camera.settle_frames,
+    )
+    .publish(&CaptureObserver::new(bayer, Some(monitor), None));
 
     if !info.supported_bins.contains(&config.camera.bin) {
         bail!(
@@ -826,6 +997,7 @@ fn run_agent_inner(
         upload_health.as_ref(),
         retention_sink.as_ref(),
         preview_sink.as_ref(),
+        preview.map(PreviewSession::generation).unwrap_or(0),
         capture_session_nonce,
     );
     monitor.set_state(AgentState::Stopping);
@@ -886,22 +1058,36 @@ fn capture_loop(
     upload_health: Option<&UploadHealth>,
     retention: Option<&RetentionSink>,
     preview: Option<&PreviewSink>,
+    preview_session_generation: u64,
     capture_session_nonce: CaptureSessionNonce,
 ) -> Result<()> {
     camera.start_video()?;
     let result = (|| {
-        let mut frame_buffer = Vec::new();
-        if wait_for_auto_settle(
+        let mut progress = CaptureProgress::new(
+            camera,
+            auto_limits,
+            preview_session_generation,
+            config.camera.settle_frames,
+        );
+        let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+        progress.publish(&observer);
+        let Some(settling_frame) = wait_for_auto_settle(
             camera,
             config.camera.settle_frames,
             auto_limits,
-            &mut frame_buffer,
             Some(control),
+            &mut progress,
+            &mut observer,
         )?
-        .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
+        progress.status.settling = false;
+        progress.publish(&observer);
+        // Settling already observed and published this frame. Reuse its owned
+        // sample for the first still without another exposure or double count.
+        let mut pending_frame = Some(settling_frame);
+        let mut frame_buffer = Vec::new();
         // Each AgentControl belongs to one camera attempt, so generation zero
         // preserves requests made during startup/auto-exposure settling.
         let mut seen_capture_generation = 0;
@@ -912,7 +1098,6 @@ fn capture_loop(
         });
         let interval = Duration::from_millis(config.capture.interval_ms);
         let mut next_capture = Instant::now();
-        let mut next_preview = Instant::now();
         let mut queued = 0_u64;
 
         while !control.is_shutdown() {
@@ -922,42 +1107,48 @@ fn capture_loop(
             if retention.is_some_and(RetentionSink::is_stopped) {
                 bail!("capture retention worker stopped unexpectedly");
             }
-            let exposure_us = camera
-                .control_value(ControlType::EXPOSURE)
-                .map(|value| value.value)
-                .unwrap_or(config.camera.max_exposure_us);
-            let timeout_ms = (exposure_us / 1_000 + 500).clamp(500, 2_000) as i32;
-            let meta = match camera.next_video_frame_into(&mut frame_buffer, timeout_ms) {
-                Ok(meta) => meta,
-                Err(error) if error.is_timeout() => continue,
-                Err(error) => return Err(error.into()),
+            let frame = if let Some(frame) = pending_frame.take() {
+                frame
+            } else {
+                progress.refresh(camera, auto_limits);
+                progress.publish(&observer);
+                if progress.wait.expired(progress.started.elapsed()) {
+                    bail!(
+                        "camera produced no frame within its exposure deadline ({} ms)",
+                        duration_millis(progress.wait.timeout())
+                    );
+                }
+                let result = camera.next_video_frame_into(
+                    &mut frame_buffer,
+                    poll_timeout_ms(progress.status.exposure_us),
+                );
+                if control.is_shutdown() {
+                    break;
+                }
+                progress.refresh(camera, auto_limits);
+                progress.publish(&observer);
+                let meta = match result {
+                    Ok(meta) => meta,
+                    Err(error) if error.is_timeout() => {
+                        if progress.wait.expired(progress.started.elapsed()) {
+                            bail!(
+                                "camera produced no frame within its exposure deadline ({} ms)",
+                                duration_millis(progress.wait.timeout())
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let frame = progress.completed_frame(meta, &mut frame_buffer);
+                observer.frame_received(&frame, false, control.is_paused());
+                progress.publish(&observer);
+                frame
             };
-            if control.is_shutdown() {
-                break;
-            }
-            monitor.frame_captured(control.is_paused());
-
+            let meta = frame.meta;
+            let exposure_us = frame.exposure_us;
+            frame_buffer = frame.data;
             let now = Instant::now();
-            if let Some(preview) = preview
-                && now >= next_preview
-            {
-                let gain = camera
-                    .control_value(ControlType::GAIN)
-                    .map(|value| value.value)
-                    .unwrap_or(0);
-                let captured_at_unix_ms = unix_time_millis();
-                let _ = preview.try_publish(|dropped_frames| PreviewJob {
-                    width: meta.width,
-                    height: meta.height,
-                    bayer,
-                    data: frame_buffer.clone(),
-                    captured_at_unix_ms,
-                    exposure_us,
-                    gain,
-                    dropped_frames,
-                });
-                next_preview = now + PREVIEW_INTERVAL;
-            }
             let capture_generation = control.capture_generation();
             let capture_requested = capture_generation != seen_capture_generation;
             if capture_requested {
@@ -1008,120 +1199,81 @@ fn wait_for_auto_settle(
     camera: &mut Camera,
     minimum_frames: u32,
     limits: AutoLimits,
-    frame_buffer: &mut Vec<u8>,
     control: Option<&AgentControl>,
-) -> Result<Option<FrameMeta>> {
-    let max_exposure_us = u64::try_from(limits.max_exposure_us.max(1)).unwrap_or(u64::MAX / 8);
-    let overall_limit = Duration::from_micros(max_exposure_us.saturating_mul(4))
-        .saturating_add(Duration::from_secs(1))
-        .max(Duration::from_secs(5));
-    let started = Instant::now();
-    let mut previous: Option<(i64, i64, u8)> = None;
-    let mut stable_samples = 0_u32;
-    let mut received = 0_u32;
-
+    progress: &mut CaptureProgress,
+    observer: &mut CaptureObserver<'_>,
+) -> Result<Option<CompletedFrame>> {
+    let mut settling = Settling::new(minimum_frames, limits);
+    progress.status.settling_min_frames = settling.minimum_frames();
+    let mut frame_buffer = Vec::new();
+    let mut latest: Option<CompletedFrame> = None;
     loop {
+        progress.refresh(camera, limits);
+        progress.publish(observer);
+        match settling.decision(
+            &progress.wait,
+            progress.started.elapsed(),
+            control.is_some_and(AgentControl::is_shutdown),
+        ) {
+            WaitDecision::Cancelled => return Ok(None),
+            WaitDecision::Stalled => bail!(
+                "camera produced no frame while automatic exposure was settling within its exposure deadline ({} ms; {} frames received)",
+                duration_millis(progress.wait.timeout()),
+                settling.received()
+            ),
+            WaitDecision::UseLatestFrame => {
+                warn!(
+                    received = settling.received(),
+                    elapsed_ms = duration_millis(progress.started.elapsed()),
+                    "automatic exposure reached its settling deadline; using latest complete frame"
+                );
+                return Ok(latest);
+            }
+            WaitDecision::Continue => {}
+        }
+        let result = camera.next_video_frame_into(
+            &mut frame_buffer,
+            poll_timeout_ms(progress.status.exposure_us),
+        );
         if control.is_some_and(AgentControl::is_shutdown) {
             return Ok(None);
         }
-        let wait_exposure = camera
-            .control_value(ControlType::EXPOSURE)
-            .map(|value| value.value)
-            .unwrap_or(max_exposure_us as i64);
-        let timeout_ms = (wait_exposure / 1_000 + 500).clamp(500, 2_000) as i32;
-        let meta = match camera.next_video_frame_into(frame_buffer, timeout_ms) {
+        progress.refresh(camera, limits);
+        progress.publish(observer);
+        let meta = match result {
             Ok(meta) => meta,
-            Err(error) if error.is_timeout() && started.elapsed() < overall_limit => {
-                if control.is_some_and(AgentControl::is_shutdown) {
-                    return Ok(None);
-                }
-                continue;
-            }
+            // Deadline handling at the top of the loop also applies when the
+            // final SDK read times out. `latest` is never the SDK scratch buffer.
+            Err(error) if error.is_timeout() => continue,
             Err(error) => return Err(error.into()),
         };
-        if control.is_some_and(AgentControl::is_shutdown) {
-            return Ok(None);
-        }
-        received = received.saturating_add(1);
-        // SDK telemetry is asynchronous, so read it after the successful frame
-        // and use it only as a convergence signal, not frame-exact metadata.
-        let exposure = camera
-            .control_value(ControlType::EXPOSURE)
-            .map(|value| value.value)
-            .unwrap_or(wait_exposure);
-        let gain = camera
-            .control_value(ControlType::GAIN)
-            .map(|value| value.value)
-            .unwrap_or(limits.min_gain);
-        let stats = raw8_stats(frame_buffer, 64)?;
-        let exposure_tolerance = (exposure.unsigned_abs() / 20).max(32);
-        let stable = previous.is_some_and(|(old_exposure, old_gain, old_p90)| {
-            old_exposure.abs_diff(exposure) <= exposure_tolerance
-                && old_gain.abs_diff(gain) <= 3
-                && old_p90.abs_diff(stats.p90) <= 3
-        });
-        stable_samples = if stable {
-            stable_samples.saturating_add(1)
-        } else {
-            0
-        };
-        previous = Some((exposure, gain, stats.p90));
-
-        let dynamic_minimum = Duration::from_micros(
-            exposure
-                .unsigned_abs()
-                .saturating_mul(2)
-                .saturating_add(100_000),
-        )
-        .max(Duration::from_secs(5));
-        let dark_threshold =
-            u8::try_from((limits.target_brightness / 4).clamp(8, 64)).unwrap_or(32);
-        let luma_acceptable = stats.p90 >= dark_threshold && stats.clipped_fraction <= 0.05;
-        let at_dark_limit = exposure >= limits.max_exposure_us.saturating_mul(95) / 100
-            && gain >= limits.max_gain.saturating_sub(3);
-        let at_bright_limit = exposure
-            <= limits
-                .min_exposure_us
-                .saturating_add((limits.min_exposure_us / 20).max(32))
-            && gain <= limits.min_gain.saturating_add(3);
-        if received >= minimum_frames.max(2)
-            && stable_samples >= 3
-            && started.elapsed() >= dynamic_minimum
-            && (luma_acceptable || at_dark_limit || at_bright_limit)
-        {
-            if luma_acceptable {
-                info!(
-                    received,
-                    exposure_us = exposure,
-                    gain,
-                    p90 = stats.p90,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "automatic exposure settled"
-                );
-            } else {
-                warn!(
-                    received,
-                    exposure_us = exposure,
-                    gain,
-                    p90 = stats.p90,
-                    at_dark_limit,
-                    at_bright_limit,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "automatic exposure settled at a control limit"
-                );
-            }
-            return Ok(Some(meta));
-        }
-        if started.elapsed() >= overall_limit {
-            warn!(
-                received,
-                exposure_us = exposure,
-                gain,
+        // The SDK readback is asynchronous. It is a convergence/progress signal,
+        // not an assertion that exposure/gain are exact for these sensor bytes.
+        let stats = raw8_stats(&frame_buffer, 64)?;
+        let frame = progress.completed_frame(meta, &mut frame_buffer);
+        let settled = settling.observe_frame(
+            progress.started.elapsed(),
+            frame.exposure_us,
+            frame.gain,
+            stats.p90,
+            stats.clipped_fraction,
+        );
+        progress.status.settling_frames = settling.received();
+        observer.frame_received(&frame, true, control.is_some_and(AgentControl::is_paused));
+        progress.publish(observer);
+        if settled {
+            info!(
+                received = settling.received(),
+                exposure_us = frame.exposure_us,
+                gain = frame.gain,
                 p90 = stats.p90,
-                elapsed_ms = started.elapsed().as_millis(),
-                "automatic exposure reached its settling deadline"
+                elapsed_ms = duration_millis(progress.started.elapsed()),
+                "automatic exposure settled"
             );
-            return Ok(Some(meta));
+            return Ok(Some(frame));
+        }
+        if let Some(previous) = latest.replace(frame) {
+            frame_buffer = previous.data;
         }
     }
 }
@@ -1377,6 +1529,9 @@ fn configure_sdk_auto(
     max_gain: i64,
     target_brightness: i64,
 ) -> Result<AutoLimits> {
+    if max_exposure_us <= 0 || max_gain < 0 {
+        bail!("maximum exposure must be positive and maximum gain non-negative");
+    }
     let exposure_caps =
         control(controls, ControlType::EXPOSURE).context("camera has no exposure control")?;
     let gain_caps = control(controls, ControlType::GAIN).context("camera has no gain control")?;
@@ -1389,12 +1544,17 @@ fn configure_sdk_auto(
 
     // SDK documentation calls control 11 microseconds, while current cameras
     // expose AutoExpMaxExpMS. Honor the runtime capability name.
-    let auto_max_exposure_caps = control(controls, ControlType::AUTO_MAX_EXPOSURE);
-    let auto_max_exposure = auto_max_exposure_caps
-        .map(|caps| {
-            auto_exposure_limit_value(caps, max_exposure_us).clamp(caps.min_value, caps.max_value)
-        })
-        .unwrap_or(max_exposure_us);
+    let auto_max_exposure_caps = control(controls, ControlType::AUTO_MAX_EXPOSURE)
+        .filter(|caps| caps.writable)
+        .context("camera has no writable automatic exposure ceiling; bounded SDK auto mode is unavailable")?;
+    let auto_max_exposure = auto_exposure_limit_value(
+        auto_max_exposure_caps,
+        max_exposure_us.clamp(exposure_caps.min_value, exposure_caps.max_value),
+    )
+    .clamp(
+        auto_max_exposure_caps.min_value,
+        auto_max_exposure_caps.max_value,
+    );
     set_if_available(
         camera,
         controls,
@@ -1402,10 +1562,32 @@ fn configure_sdk_auto(
         auto_max_exposure,
         false,
     )?;
-    let effective_max_exposure_us = auto_max_exposure_caps
-        .map(|caps| auto_exposure_limit_us(caps, auto_max_exposure))
-        .unwrap_or(max_exposure_us)
+    let readback = camera
+        .control_value(ControlType::AUTO_MAX_EXPOSURE)
+        .context("reading back the SDK automatic exposure ceiling")?;
+    if !(auto_max_exposure_caps.min_value..=auto_max_exposure_caps.max_value)
+        .contains(&readback.value)
+    {
+        bail!("SDK returned an automatic exposure ceiling outside its advertised limits");
+    }
+    let effective_max_exposure_us = auto_exposure_limit_us(auto_max_exposure_caps, readback.value)
         .clamp(exposure_caps.min_value, exposure_caps.max_value);
+    if effective_max_exposure_us <= 0 {
+        bail!("SDK returned a non-positive automatic exposure ceiling");
+    }
+    if effective_max_exposure_us != max_exposure_us {
+        warn!(
+            requested_max_exposure_us = max_exposure_us,
+            effective_max_exposure_us, "camera adjusted the requested automatic exposure ceiling"
+        );
+    }
+    info!(
+        requested_max_exposure_us = max_exposure_us,
+        effective_max_exposure_us,
+        sdk_auto_max_exposure_us =
+            auto_exposure_limit_us(auto_max_exposure_caps, auto_max_exposure_caps.max_value),
+        "configured automatic exposure limits"
+    );
 
     let effective_max_gain = control(controls, ControlType::AUTO_MAX_GAIN)
         .map(|caps| max_gain.clamp(caps.min_value, caps.max_value))
@@ -1435,6 +1617,10 @@ fn configure_sdk_auto(
         .ok()
         .or_else(|| control(controls, ControlType::EXPOSURE).map(|caps| caps.default_value))
         .context("camera has no exposure control")?;
+    // A camera can retain an exposure from a previous application/session.
+    // Seed auto mode within the newly confirmed ceiling, including on restart
+    // after the operator lowers the maximum for daylight.
+    let exposure = exposure.clamp(exposure_caps.min_value, effective_max_exposure_us);
     set_if_available(camera, controls, ControlType::EXPOSURE, exposure, true)?;
     let gain = camera
         .control_value(ControlType::GAIN)
@@ -1442,6 +1628,7 @@ fn configure_sdk_auto(
         .ok()
         .or_else(|| control(controls, ControlType::GAIN).map(|caps| caps.default_value))
         .context("camera has no gain control")?;
+    let gain = gain.clamp(gain_caps.min_value, effective_max_gain);
     set_if_available(camera, controls, ControlType::GAIN, gain, true)?;
     Ok(AutoLimits {
         min_exposure_us: exposure_caps.min_value,
@@ -1649,6 +1836,121 @@ fn camera_json(camera: &CameraInfo) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    fn test_exposure_progress(session_generation: u64) -> CaptureProgress {
+        CaptureProgress {
+            started: Instant::now(),
+            wait: FrameWait::new(60_000_000),
+            status: StatusExposure {
+                session_generation,
+                settling: true,
+                exposure_us: 60_000_000,
+                gain: 400,
+                max_exposure_us: 60_000_000,
+                settling_frames: 0,
+                settling_min_frames: 6,
+                wait_elapsed_ms: 0,
+                frame_timeout_ms: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn timeout_fallback_retains_matching_complete_bytes_and_metadata() {
+        let mut progress = test_exposure_progress(7);
+        progress.started = Instant::now() - Duration::from_secs(600);
+        let mut scratch = vec![1, 2, 3, 4];
+        let meta = FrameMeta {
+            width: 2,
+            height: 2,
+            image_type: ImageType::Raw8,
+        };
+        let frame = progress.completed_frame(meta, &mut scratch);
+        let mut settling = Settling::new(
+            6,
+            AutoLimits {
+                min_exposure_us: 32,
+                max_exposure_us: 60_000_000,
+                min_gain: 0,
+                max_gain: 400,
+                target_brightness: 100,
+            },
+        );
+        settling.observe_frame(
+            Duration::from_secs(600),
+            frame.exposure_us,
+            frame.gain,
+            4,
+            0.0,
+        );
+        // The final SDK read times out after touching its destination buffer.
+        scratch.resize(16, 255);
+        assert_eq!(
+            settling.decision(&progress.wait, Duration::from_secs(605), false),
+            WaitDecision::UseLatestFrame
+        );
+        assert_eq!(frame.meta, meta);
+        assert_eq!(frame.data, [1, 2, 3, 4]);
+        assert_eq!(frame.exposure_us, 60_000_000);
+        assert_eq!(frame.gain, 400);
+        assert!(frame.captured_at_unix_ms > 0);
+    }
+
+    #[test]
+    fn settling_counts_frames_without_entering_capturing() {
+        let monitor = AgentMonitor::new();
+        let hub = PreviewHub::new();
+        let session = hub.begin_session();
+        let mut observer = CaptureObserver::new(BayerPattern::Rg, Some(&monitor), None);
+        let mut progress = test_exposure_progress(session.generation());
+        let mut raw = vec![100; 16];
+        let frame = progress.completed_frame(
+            FrameMeta {
+                width: 4,
+                height: 4,
+                image_type: ImageType::Raw8,
+            },
+            &mut raw,
+        );
+        progress.status.settling_frames = 1;
+        observer.frame_received(&frame, true, false);
+        progress.publish(&observer);
+        let status = monitor.snapshot();
+        assert_eq!(status.state, AgentState::Starting);
+        assert_eq!(status.frames_captured, 1);
+        assert_eq!(status.frames_saved, 0);
+        assert_eq!(monitor.capturing_generation(), 0);
+        let exposure = status.exposure.unwrap();
+        assert!(exposure.settling);
+        assert_eq!(exposure.settling_frames, 1);
+        assert_eq!(exposure.session_generation, session.generation());
+        assert_eq!(exposure.frame_timeout_ms, 125_000);
+
+        progress.status.settling = false;
+        progress.publish(&observer);
+        monitor.set_state(AgentState::Capturing);
+        assert_eq!(monitor.snapshot().frames_captured, 1);
+        assert_eq!(monitor.capturing_generation(), 1);
+    }
+
+    #[test]
+    fn exposure_progress_clears_on_stop_fault_and_restart() {
+        let monitor = AgentMonitor::new();
+        let observer = CaptureObserver::new(BayerPattern::Rg, Some(&monitor), None);
+        let progress = test_exposure_progress(42);
+        for state in [AgentState::Stopping, AgentState::Idle, AgentState::Faulted] {
+            progress.publish(&observer);
+            assert!(monitor.snapshot().exposure.is_some());
+            monitor.set_state(state);
+            assert!(monitor.snapshot().exposure.is_none());
+        }
+        progress.publish(&observer);
+        monitor.report_fault("camera disconnected");
+        assert!(monitor.snapshot().exposure.is_none());
+        progress.publish(&observer);
+        monitor.begin_attempt();
+        assert!(monitor.snapshot().exposure.is_none());
+    }
+
     #[test]
     fn agent_control_tracks_pause_capture_and_shutdown_requests() {
         let control = AgentControl::new();
@@ -1725,7 +2027,8 @@ mod tests {
             [
                 CAPABILITY_UPLOADS_LIST.to_owned(),
                 CAPABILITY_UPLOADS_REQUEUE.to_owned(),
-                CAPABILITY_STORAGE_RETENTION.to_owned()
+                CAPABILITY_STORAGE_RETENTION.to_owned(),
+                CAPABILITY_EXPOSURE_PROGRESS.to_owned()
             ]
         );
         let upload = status.upload.expect("upload telemetry");
