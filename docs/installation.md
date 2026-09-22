@@ -12,6 +12,9 @@ session.
   includes the reviewed `ASICamera2.dll` SDK runtime, but hardware drivers are
   supplied separately by ZWO.
 - Close any developer build of AutoPierCam that is already using the camera.
+- Optional security recording requires a separately installed FFmpeg executable
+  with libx264 support; see [video setup](video.md). Stills and live preview do
+  not need FFmpeg.
 
 Open `AutoPierCam-<version>-x64.msi` and review the Apache-2.0 license. The
 feature page includes **Start AutoPierCam when I sign in (recommended)**,
@@ -22,6 +25,12 @@ The installer starts AutoPierCam when setup finishes, independently of the
 start-at-sign-in choice. The tray menu can open the Viewer, captures, and logs;
 pause capture; capture immediately; or stop the application. The Start menu
 also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
+
+If several ASI cameras are connected, open the Viewer and set **Camera name
+contains** to `ASI676MC` or `ASI662MC`, then save. AutoPierCam refuses ambiguous
+matches instead of choosing another imaging camera. For exposures beyond the
+SDK's automatic ceiling, enable application-controlled exposure; see the
+[exposure guide](exposure.md).
 
 ## What is installed
 

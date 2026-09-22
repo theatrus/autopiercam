@@ -252,6 +252,15 @@ fn finish_segment(
 }
 
 fn encode_segment(segment: &Segment, executable: &Path, output: &Path) -> Result<()> {
+    encode_segment_with_timeout(segment, executable, output, ENCODER_TIMEOUT)
+}
+
+fn encode_segment_with_timeout(
+    segment: &Segment,
+    executable: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<()> {
     ensure!(!segment.frames.is_empty(), "cannot encode an empty segment");
     let mut manifest = File::create(segment.directory.path().join("frames.ffconcat"))?;
     manifest.write_all(segment.concat().as_bytes())?;
@@ -316,12 +325,11 @@ fn encode_segment(segment: &Segment, executable: &Path, output: &Path) -> Result
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
-                Ok(None) if started.elapsed() < ENCODER_TIMEOUT => {
-                    thread::sleep(Duration::from_millis(50))
-                }
+                Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
                 Ok(None) => {
                     break Err(anyhow!(
-                        "FFmpeg exceeded the 20-second segment encoding deadline"
+                        "FFmpeg exceeded the segment encoding deadline ({} ms)",
+                        timeout.as_millis()
                     ));
                 }
                 Err(error) => break Err(error.into()),
@@ -434,5 +442,28 @@ mod tests {
         assert!(encode_segment(&segment, &executable, &output).is_err());
         assert!(!output.exists());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1); // private spool only
+    }
+
+    #[test]
+    #[ignore = "requires AUTOPIERCAM_TEST_FFMPEG pointing to a verified FFmpeg executable"]
+    fn encoder_deadline_kills_and_reaps_the_process_without_publishing() {
+        let executable = PathBuf::from(
+            std::env::var_os("AUTOPIERCAM_TEST_FFMPEG").expect("set test FFmpeg path"),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut segment = Segment::new(root.path()).unwrap();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[80; 32 * 32 * 3], 32, 32, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        segment.push(&jpeg).unwrap();
+        let output = root.path().join("clip.mp4");
+        let started = Instant::now();
+        let error = encode_segment_with_timeout(&segment, &executable, &output, Duration::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

@@ -294,15 +294,16 @@ Ordered shutdown:
 1. Reject new tray capture actions, publish stopping state, and signal the
    camera owner.
 2. Stop and close the camera, then close the still queue on its owner thread.
-3. Drain the still writer so every accepted JPEG is atomically published,
-   durably recorded when upload is enabled, and followed by a retention wake.
+3. Drain the still writer and preview encoder, then finalize the active video
+   segment. Accepted artifacts are atomically published, durably recorded when
+   upload is enabled, and followed by a retention wake.
 4. Complete the queued final retention sweep and stop retention while its shared
    ledger authority is still valid.
 5. Revoke upload-administration sessions and wait for already accepted list or
    requeue operations to leave the shared ledger.
 6. Finish and commit the active bounded HTTP result, release any claim not yet
    submitted, interrupt retry waits, and leave all remaining intents durable.
-7. Join the preview encoder and capture supervisor. The tray then stops the
+7. Join the capture supervisor. The tray then stops the
    preview and control pipes, removes the notification icon, and exits its event
    loop.
 

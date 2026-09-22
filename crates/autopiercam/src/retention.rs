@@ -1443,6 +1443,62 @@ mod tests {
     }
 
     #[test]
+    fn modern_png_and_mp4_obey_the_same_retention_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        for extension in ["png", "mp4"] {
+            fs::write(
+                directory.path().join(format!(
+                    "frame-1700000000-123-00112233445566778899aabbccddeeff-000042.{extension}"
+                )),
+                b"media",
+            )
+            .unwrap();
+        }
+        // Nonce-free PNG/video and unrelated files are never adopted for deletion.
+        fs::write(
+            directory.path().join("frame-1700000000-123-000042.mp4"),
+            b"keep",
+        )
+        .unwrap();
+        fs::write(directory.path().join("personal.png"), b"keep").unwrap();
+        let platform = RecordingPlatform {
+            free_bytes: 1_000,
+            deleted: Mutex::new(Vec::new()),
+        };
+        let limits = RetentionPolicy {
+            max_managed_bytes: Some(0),
+            ..policy()
+        };
+        let protected = sweep_retention(
+            limits,
+            directory.path(),
+            &crate::parse_generated_capture_filename,
+            &ProtectAllRetentionAuthority,
+            &platform,
+            &FixedClock(1_800_000_000_000),
+        );
+        assert_eq!(protected.protected_bytes, 10);
+        assert_eq!(protected.reclaimed_file_count, 0);
+        let local = sweep_retention(
+            limits,
+            directory.path(),
+            &crate::parse_generated_capture_filename,
+            &LocalOnlyRetentionAuthority,
+            &platform,
+            &FixedClock(1_800_000_000_000),
+        );
+        assert_eq!(local.reclaimed_file_count, 2);
+        assert_eq!(local.reclaimed_bytes, 10);
+        assert!(directory.path().join("personal.png").exists());
+        assert!(
+            directory
+                .path()
+                .join("frame-1700000000-123-000042.mp4")
+                .exists()
+        );
+    }
+
+    #[test]
     fn failed_post_delete_free_space_probe_stays_blocked() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("frame-100.jpg"), b"old").unwrap();
