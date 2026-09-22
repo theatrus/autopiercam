@@ -2,7 +2,11 @@
 param(
     [string] $MsiPath = (Join-Path `
         $PSScriptRoot `
-        '..\artifacts\installer\output\AutoPierCam-0.1.0-x64.msi')
+        '..\artifacts\installer\output\AutoPierCam-0.1.0-x64.msi'),
+
+    # Must share the user-data volume: cleanup preserves identity using one
+    # atomic directory rename, never a cross-volume copy/delete fallback.
+    [string] $ArtifactParent = (Join-Path $PSScriptRoot '..\artifacts\installer')
 )
 
 Set-StrictMode -Version Latest
@@ -1415,9 +1419,7 @@ if ($preflightConflicts.Count -ne 0) {
     )
 }
 
-$artifactParent = [IO.Path]::GetFullPath(
-    (Join-Path $repositoryRoot 'artifacts\installer')
-).TrimEnd('\')
+$artifactParent = [IO.Path]::GetFullPath($ArtifactParent).TrimEnd('\')
 $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
 $artifactRoot = Join-Path $artifactParent (
     'lifecycle-test-{0}-{1}' -f $timestamp, [Guid]::NewGuid().ToString('N')
@@ -1434,6 +1436,11 @@ try {
         throw "Refusing to overwrite lifecycle artifacts: $artifactRoot"
     }
     New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+    $artifactVolume = (Get-DirectoryIdentity $artifactRoot).Split(':')[0]
+    $userVolume = (Get-DirectoryIdentity $env:LOCALAPPDATA).Split(':')[0]
+    if ($artifactVolume -cne $userVolume) {
+        throw 'Choose -ArtifactParent on the Local AppData volume; atomic archival cannot cross volumes. No installation was run.'
+    }
 
     Write-Host 'Cycle 1: default per-user install with sign-in startup enabled.'
     Invoke-MsiOperation `

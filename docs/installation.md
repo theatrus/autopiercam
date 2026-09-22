@@ -164,6 +164,12 @@ ordinary user PowerShell rather than a layered or virtualized development
 shell, so Windows Installer and the harness observe the same Local AppData
 namespace.
 
+If the checkout is on a different volume from Local AppData, pass
+`-ArtifactParent "$env:LOCALAPPDATA\AutoPierCam-InstallerTests"`. Atomic archival
+requires a same-volume directory rename; the harness rejects an incompatible
+archive location before installing anything. GitHub's Windows runner uses this
+override because its checkout is on `D:` and user data is on `C:`.
+
 Before a release, verify that the committed Windows-target Rust license report
 matches the locked dependency graph. This check requires `cargo-about 0.9.1`:
 

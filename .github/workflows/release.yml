@@ -227,8 +227,12 @@ jobs:
       - name: Validate the signed installer and installed lifecycle
         shell: pwsh
         run: |
+          # Hosted Windows keeps checkout on D: and Local AppData on C:.
+          # Preserve atomic, identity-checked archival on the user-data volume.
+          $diagnostics = Join-Path $env:LOCALAPPDATA 'AutoPierCam-InstallerTests'
+          "AUTOPIERCAM_LIFECYCLE_DIAGNOSTICS=$diagnostics" >> $env:GITHUB_ENV
           ./scripts/Test-InstallerPackage.ps1
-          ./scripts/Test-InstalledAutoPierCam.ps1
+          ./scripts/Test-InstalledAutoPierCam.ps1 -ArtifactParent $diagnostics
 
       - name: Prepare release assets and checksums
         shell: pwsh
@@ -265,5 +269,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: installer-diagnostics-${{ github.run_id }}
-          path: artifacts/installer/lifecycle-test-*/**/*.log
+          path: ${{ env.AUTOPIERCAM_LIFECYCLE_DIAGNOSTICS }}/lifecycle-test-*/**/*.log
           if-no-files-found: ignore
