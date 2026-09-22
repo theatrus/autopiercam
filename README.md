@@ -12,6 +12,14 @@ AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
+## Download
+
+[Download the signed Windows x64 installer (0.1.0)](https://github.com/theatrus/autopiercam/releases/download/v0.1.0/AutoPierCam-0.1.0-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.1.0)
+also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
+See the [installation guide](docs/installation.md) for setup. ZWO's camera
+driver is installed separately; optional video recording also needs FFmpeg.
+
 The camera-on-pier mark uses cyan for night operation and amber for daylight
 operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
