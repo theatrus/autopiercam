@@ -33,6 +33,10 @@ permissions:
   contents: write
   id-token: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -44,6 +48,7 @@ jobs:
     # `repo:theatrus/autopiercam:environment:release`. Without it the OIDC
     # token carries a different subject and azure/login fails.
     environment: release
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v5
@@ -57,6 +62,8 @@ jobs:
           # mistake worth failing on, and Build-Installer.ps1 asserts it too.
           cargo_ver=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
                       | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          [[ "$cargo_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid workspace version" >&2; exit 1; }
+          test -f "docs/releases/$cargo_ver.md"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             tag_ver="${GITHUB_REF#refs/tags/v}"
             if [[ "$tag_ver" != "$cargo_ver" ]]; then
@@ -69,7 +76,9 @@ jobs:
 
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       - name: Install WiX 6
         shell: bash
@@ -82,6 +91,8 @@ jobs:
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
           rustup target add x86_64-pc-windows-msvc
           rustc -V
 
@@ -89,10 +100,33 @@ jobs:
         with:
           key: release-x86_64-pc-windows-msvc
 
+      - name: Test and lint Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --locked
+
+      - name: Test N.I.N.A. and shared preview logic
+        shell: bash
+        run: dotnet test integrations/AutoPierCam.NINA/AutoPierCam.NINA.slnx --configuration Release
+
+      - name: Verify dependency license inventory
+        shell: pwsh
+        run: |
+          cargo install cargo-about --version 0.9.1 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Installing cargo-about failed.' }
+          ./third-party/rust/Generate-Notices.ps1 -Check
+
       # ---- 1. build and stage --------------------------------------------
       - name: Stage the payload
         shell: pwsh
         run: ./scripts/Build-Installer.ps1 -Version ${{ steps.ver.outputs.version }} -StageOnly
+
+      - name: Stage the N.I.N.A. plugin
+        shell: pwsh
+        run: ./integrations/AutoPierCam.NINA/build-nina-package.ps1 -Version '${{ steps.ver.outputs.version }}.0' -StageOnly
 
       # ---- 2. sign the programs -------------------------------------------
       # Failure at this step means the OIDC subject did not match the federated
@@ -105,7 +139,7 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # Exactly the four paths in the script's $signableStagePaths, no more.
+      # Exactly the four installer signable paths and the separate plugin DLL.
       # `files` takes a newline-separated list of absolute paths. Do not switch
       # this to files-folder: it would also sign ASICamera2.dll and the .NET
       # runtime, and -PackageOnly rejects a changed hash on any non-signable
@@ -121,6 +155,7 @@ jobs:
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam-tray.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.dll
+            ${{ github.workspace }}\integrations\AutoPierCam.NINA\artifacts\nina-plugin\package\AutoPierCam\AutoPierCam.NINA.dll
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -129,6 +164,10 @@ jobs:
       - name: Package the MSI
         shell: pwsh
         run: ./scripts/Build-Installer.ps1 -Version ${{ steps.ver.outputs.version }} -PackageOnly
+
+      - name: Package the signed N.I.N.A. plugin
+        shell: pwsh
+        run: ./integrations/AutoPierCam.NINA/build-nina-package.ps1 -Version '${{ steps.ver.outputs.version }}.0' -PackageOnly
 
       # ---- 4. sign the container ------------------------------------------
       - name: Sign the MSI
@@ -158,6 +197,7 @@ jobs:
                    "$stage/autopiercam-tray.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.dll" \
+                   "integrations/AutoPierCam.NINA/artifacts/nina-plugin/package/AutoPierCam/AutoPierCam.NINA.dll" \
                    "artifacts/installer/output/AutoPierCam-${{ steps.ver.outputs.version }}-x64.msi"; do
             echo "--- $f"
             if "$signtool" verify //pa //v "$f" > "$RUNNER_TEMP/v.txt" 2>&1; then
@@ -171,12 +211,24 @@ jobs:
             fi
           done
           test "$fail" = "0" || { echo "signature verification failed"; exit 1; }
-          echo "all five artifacts signed and verified"
+          echo "all six artifacts signed and verified"
+
+      - name: Validate the signed installer and installed lifecycle
+        shell: pwsh
+        run: |
+          ./scripts/Test-InstallerPackage.ps1
+          ./scripts/Test-InstalledAutoPierCam.ps1
+
+      - name: Prepare release assets and checksums
+        shell: pwsh
+        run: |
+          ./scripts/Test-ReleaseAssets.ps1
+          ./scripts/Stage-ReleaseAssets.ps1 -Version '${{ steps.ver.outputs.version }}'
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AutoPierCam-${{ steps.ver.outputs.version }}-x64-msi
-          path: artifacts/installer/output/*.msi
+          name: AutoPierCam-${{ steps.ver.outputs.version }}-release
+          path: artifacts/release/*
           if-no-files-found: error
 
       - name: Publish the release
@@ -187,9 +239,20 @@ jobs:
         run: |
           set -euo pipefail
           v="${{ steps.ver.outputs.version }}"
-          msi="artifacts/installer/output/AutoPierCam-$v-x64.msi"
+          # Never replace assets of an existing version. A retry uses a new
+          # version if an earlier release has already been made public.
           if gh release view "v$v" >/dev/null 2>&1; then
-            gh release upload "v$v" "$msi" --clobber
-          else
-            gh release create "v$v" "$msi" --title "AutoPierCam $v" --generate-notes
+            echo "Release v$v already exists; refusing to overwrite it." >&2
+            exit 1
           fi
+          gh release create "v$v" artifacts/release/* --target "$GITHUB_SHA" \
+            --title "AutoPierCam $v" --notes-file "docs/releases/$v.md" --draft
+          gh release edit "v$v" --draft=false
+
+      - name: Preserve installer diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-diagnostics-${{ github.run_id }}
+          path: artifacts/installer/lifecycle-test-*/**/*.log
+          if-no-files-found: ignore
