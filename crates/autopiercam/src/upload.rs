@@ -824,7 +824,13 @@ impl UploadTransport for UreqTransport {
         let mut request = self
             .agent
             .put(self.endpoint.clone())
-            .content_type("image/jpeg")
+            .content_type(if claim.filename.ends_with(".png") {
+                "image/png"
+            } else if claim.filename.ends_with(".mp4") {
+                "video/mp4"
+            } else {
+                "image/jpeg"
+            })
             .header(CONTENT_LENGTH, claim.file_size.to_string())
             .header("X-AutoPierCam-Filename", file_name)
             .header("Idempotency-Key", idempotency_key);
@@ -2019,6 +2025,40 @@ mod tests {
         assert_eq!(request.headers["idempotency-key"], expected_idempotency_key);
         assert_eq!(request.headers["authorization"], "Bearer contract-secret");
         assert_eq!(request.body, jpeg);
+    }
+
+    #[test]
+    fn new_media_types_are_ledgered_and_uploaded_with_correct_content_type() {
+        for (extension, content_type) in [("png", "image/png"), ("mp4", "video/mp4")] {
+            let environment = TestEnvironment::new();
+            let artifact = environment.capture.join(format!(
+                "frame-1700000000-123-0123456789abcdef0123456789abcdef-000040.{extension}"
+            ));
+            let bytes = b"\x89PNG\r\n\x1a\nverified-test-payload";
+            fs::write(&artifact, bytes).unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = format!("http://{}/latest", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+            let server = thread::spawn(move || read_one_request(listener));
+            let mut transport = UreqTransport::new(UploadOptions::new(endpoint, None, 1));
+            let mut store = UploadStore::open(
+                &environment.database,
+                &environment.capture,
+                TEST_DESTINATION,
+                transport.durable_ledger_authorization_fingerprint(),
+            )
+            .unwrap();
+            store.record_artifact(&artifact, 40_000).unwrap();
+            let claim = store.claim_due(40_000).unwrap().unwrap();
+            assert_eq!(
+                transport.upload(&claim),
+                AttemptOutcome::Success { status: 204 }
+            );
+            let request = server.join().unwrap();
+            assert_eq!(request.headers["content-type"], content_type);
+            assert_eq!(request.body, bytes);
+        }
     }
 
     struct CapturedRequest {

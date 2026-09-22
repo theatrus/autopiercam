@@ -125,6 +125,10 @@ struct PreviewSessionInner {
 }
 
 impl PreviewSession {
+    pub(crate) fn snapshot(&self) -> PreviewSnapshot {
+        self.inner.hub.snapshot()
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.generation
     }
@@ -148,9 +152,11 @@ pub(crate) struct PreviewJob {
     pub(crate) height: u32,
     pub(crate) bayer: BayerPattern,
     pub(crate) data: Vec<u8>,
+    pub(crate) raw16: bool,
     pub(crate) captured_at_unix_ms: u64,
     pub(crate) exposure_us: i64,
     pub(crate) gain: i64,
+    pub(crate) mode: PreviewMode,
     pub(crate) dropped_frames: u64,
 }
 
@@ -277,8 +283,15 @@ fn preview_encoder_loop(queue: &LatestPreviewQueue, session: &PreviewSession) {
 }
 
 fn encode_and_publish(job: PreviewJob, session: &PreviewSession) -> Result<()> {
+    let converted;
+    let raw = if job.raw16 {
+        converted = autopiercam_core::image::raw16_to_raw8(&job.data)?;
+        &converted
+    } else {
+        &job.data
+    };
     let (width, height, rgb) = demosaic_bilinear_preview(
-        &job.data,
+        raw,
         job.width,
         job.height,
         job.bayer,
@@ -307,7 +320,7 @@ fn encode_and_publish(job: PreviewJob, session: &PreviewSession) -> Result<()> {
         exposure_us: Some(job.exposure_us),
         gain: Some(job.gain),
         content_type: PreviewContentType::Jpeg,
-        mode: PreviewMode::Unknown,
+        mode: job.mode,
         dropped_frames: job.dropped_frames,
     };
     let _ = session.publish(metadata, jpeg)?;
@@ -398,6 +411,8 @@ mod tests {
 
     fn job(value: u8, dropped_frames: u64) -> PreviewJob {
         PreviewJob {
+            raw16: false,
+            mode: PreviewMode::Unknown,
             width: 2,
             height: 2,
             bayer: BayerPattern::Rg,

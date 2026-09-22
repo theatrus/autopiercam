@@ -324,6 +324,13 @@
                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                         Text="30,000 ms = 30 seconds · 60,000 ms = 1 minute. Automatic exposure adapts within the camera's supported limit."
                         TextWrapping="Wrap" />
+                    <CheckBox x:Name="AdaptiveExposureCheckBox" Content="Application-controlled day/night exposure"
+                              IsEnabled="False" Checked="ExposureControl_Changed" Unchecked="ExposureControl_Changed" />
+                    <CheckBox x:Name="Raw16CheckBox" Content="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
+                    <TextBlock Text="Application control can exceed the SDK's 60-second auto limit, within the camera's manual range. RAW16 uses more storage."
+                               FontSize="12" TextWrapping="Wrap" />
+                    <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
+                             IsEnabled="False" />
                     <StackPanel Spacing="6">
                         <TextBlock Text="Still interval" />
                         <NumberBox
@@ -389,6 +396,10 @@
                         IsEnabled="False"
                         OffContent="Disabled"
                         OnContent="Enabled" />
+                    <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
+                             PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
+                    <TextBlock Text="Security recording saves H.264 MP4 segments from previews (up to 2 fps). Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
+                               TextWrapping="Wrap" />
                     <InfoBar
                         x:Name="ConfigInfoBar"
                         IsClosable="False"

@@ -150,12 +150,12 @@ responsive cancellation; a separate exposure-aware no-frame deadline faults a
 stalled camera so the supervisor can reconnect. See [Long exposures](exposure.md)
 for timing, fallback behavior, and the SDK-auto ceiling versus sensor limits.
 
-The deterministic controller in phase two operates in log exposure-value space:
+The opt-in deterministic `adaptive` controller uses bounded proportional p90 feedback:
 
 1. Calculate raw p50, p90, and highlight-clipping fraction from a sparse sample.
-2. Adjust exposure first within the current mode's bounds.
-3. Add gain only after exposure reaches its mode limit.
-4. Rate-limit changes and require several samples before reversing direction.
+2. Adjust exposure first within the configured, hardware-clamped manual bounds.
+3. Add gain only after exposure reaches its limit.
+4. Bound each change and apply a ten-percent brightness deadband.
 5. Enter or leave night mode only after sustained evidence and hysteresis.
 6. Record requested and read-back exposure/gain with every selected frame.
 
@@ -165,9 +165,10 @@ still cadence. Solar elevation can later act as a prior when site coordinates
 are configured, but image feedback remains authoritative for storms, enclosure
 lights, and obstructions.
 
-RAW8 is the preview/security path. RAW16 preserves night still dynamic range;
-its valid-bit alignment will be characterized on both target cameras before
-normalization. Debayer is applied only after a sink selects a frame. The current
+RAW8 is the default capture path. RAW16 preserves SDK samples in 16-bit RGB PNGs;
+preview/security images use its high byte without inferring an ADC shift.
+ASI676MC characterization observed nonzero low bits; ASI662MC remains untested.
+Debayer is applied only after a sink selects a frame. The current
 bilinear implementation is the reference path; a higher-quality method can be
 added behind the same interface.
 
@@ -224,15 +225,16 @@ finishes and its outcome is committed, an unsubmitted claim is released, retry
 waits are interrupted, and all other intents remain durable. The full contract
 and operator caveats are in `docs/upload.md`.
 
-Planned security video starts with an FFmpeg child process receiving sampled
-raw or RGB frames. It writes short H.264 Matroska segments because each
-completed segment is independently usable after a crash. A segment is finalized
-and validated before it is renamed and queued. Optional MP4 remuxing happens
-after close.
+Security video samples the bounded latest JPEG preview into a bounded private
+spool and invokes an explicitly configured external FFmpeg executable to encode
+H.264 MP4. Completed segments are synced, published without overwrite, and
+ledgered. Encoding runs off the camera thread with a deadline and bounded
+diagnostics. Pause and retention pressure suspend sampling. See [video](video.md)
+for limits, configuration, and the incomplete-segment crash limitation.
 
 Retention starts with a synchronous sweep before the camera is opened, then runs
 every 60 seconds and after each writer result has been published and durably
-recorded for upload. It inventories only regular direct-child JPEGs with the
+recorded for upload. It inventories only regular direct-child JPEG/PNG/MP4 files with the
 exact generated capture grammar. Age-expired reclaimable files are selected
 first; the oldest remaining reclaimable files are then selected until the
 optional maximum-managed-byte and minimum-free-byte targets are both met.
@@ -304,8 +306,8 @@ Ordered shutdown:
    preview and control pipes, removes the notification icon, and exits its event
    loop.
 
-Future durable video work will also finalize the current video segment before
-exit.
+Preview encoding drains and the current video segment finalizes before retention
+and upload workers stop, keeping publication inside the ledger lifecycle lease.
 
 The implemented startup path validates configuration and automatically retries
 startup or runtime faults. When upload is enabled it opens and validates the
@@ -335,5 +337,7 @@ WinUI preview, status, capture-now, and configuration client; artifact browsing
 remains. Item 6 has atomic still publication, a durable SQLite HTTP outbox with
 restart recovery and revision-fenced operator list/requeue, and safe automated
 retention with age/byte policies, upload-ledger protection, pressure telemetry,
-and scheduled-capture suspension. Security video remains the next major storage
-sink.
+and scheduled-capture suspension. Item 5 includes opt-in adaptive exposure and
+RAW16 PNG output, tested on ASI676MC; ASI662MC and physical optical-transition
+validation remain. Item 7 includes bounded external-FFmpeg MP4 recording and
+signed installer packaging; unfinished-segment crash recovery remains.

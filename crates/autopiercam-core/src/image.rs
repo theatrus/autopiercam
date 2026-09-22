@@ -110,6 +110,23 @@ pub fn raw8_stats(raw: &[u8], sample_stride_pixels: usize) -> Result<LumaStats, 
     stats_from_histogram(&histogram, sum, count)
 }
 
+pub fn raw16_stats(raw: &[u8], sample_stride_pixels: usize) -> Result<LumaStats, ImageError> {
+    if !raw.len().is_multiple_of(2) {
+        return Err(ImageError::BufferLength {
+            expected: raw.len() / 2 * 2,
+            actual: raw.len(),
+        });
+    }
+    let mut histogram = [0_u64; 256];
+    let (mut sum, mut count) = (0, 0);
+    for pixel in raw.chunks_exact(2).step_by(sample_stride_pixels.max(1)) {
+        histogram[pixel[1] as usize] += 1;
+        sum += u64::from(pixel[1]);
+        count += 1;
+    }
+    stats_from_histogram(&histogram, sum, count)
+}
+
 pub fn luma_stats(rgb: &[u8], sample_stride_pixels: usize) -> Result<LumaStats, ImageError> {
     if !rgb.len().is_multiple_of(3) {
         return Err(ImageError::InvalidRgbLength(rgb.len()));
@@ -159,6 +176,80 @@ fn validate_raw8(raw: &[u8], width: u32, height: u32) -> Result<(), ImageError> 
         return Err(ImageError::EmptyImage);
     }
     Ok(())
+}
+
+/// Debayer little-endian RAW16 without throwing away low-order sensor bits.
+/// Values are preserved in the SDK's 16-bit range; no inferred bit shift is applied.
+pub fn demosaic_bilinear16(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    pattern: BayerPattern,
+) -> Result<Vec<u16>, ImageError> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(ImageError::DimensionsOverflow)?;
+    let expected = pixels
+        .checked_mul(2)
+        .ok_or(ImageError::DimensionsOverflow)?;
+    if raw.len() != expected {
+        return Err(ImageError::BufferLength {
+            expected,
+            actual: raw.len(),
+        });
+    }
+    if width == 0 || height == 0 {
+        return Err(ImageError::EmptyImage);
+    }
+    let mut rgb = vec![
+        0_u16;
+        pixels
+            .checked_mul(3)
+            .ok_or(ImageError::DimensionsOverflow)?
+    ];
+    let sample = |x: u32, y: u32| {
+        let offset = (y as usize * width as usize + x as usize) * 2;
+        u16::from_le_bytes([raw[offset], raw[offset + 1]])
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let native = color_at(x, y, pattern);
+            for requested in [Color::Red, Color::Green, Color::Blue] {
+                let value = if native == requested {
+                    sample(x, y)
+                } else {
+                    let mut sum = 0_u32;
+                    let mut count = 0;
+                    for ny in y.saturating_sub(1)..=y.saturating_add(1).min(height - 1) {
+                        for nx in x.saturating_sub(1)..=x.saturating_add(1).min(width - 1) {
+                            if color_at(nx, ny, pattern) == requested {
+                                sum += u32::from(sample(nx, ny));
+                                count += 1;
+                            }
+                        }
+                    }
+                    (sum + count / 2)
+                        .checked_div(count)
+                        .map(|value| value as u16)
+                        .unwrap_or_else(|| sample(x, y))
+                };
+                rgb[(y as usize * width as usize + x as usize) * 3 + requested as usize] = value;
+            }
+        }
+    }
+    Ok(rgb)
+}
+
+/// Preview and feedback use the high byte of ZWO's 16-bit range. The still
+/// writer retains both bytes; conversion here never changes persisted samples.
+pub fn raw16_to_raw8(raw: &[u8]) -> Result<Vec<u8>, ImageError> {
+    if !raw.len().is_multiple_of(2) {
+        return Err(ImageError::BufferLength {
+            expected: raw.len() / 2 * 2,
+            actual: raw.len(),
+        });
+    }
+    Ok(raw.chunks_exact(2).map(|pixel| pixel[1]).collect())
 }
 
 fn allocate_rgb(width: u32, height: u32) -> Result<Vec<u8>, ImageError> {
@@ -295,6 +386,27 @@ fn stats_from_histogram(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw16_retains_precision_and_all_bayer_phases() {
+        for pattern in [
+            BayerPattern::Rg,
+            BayerPattern::Bg,
+            BayerPattern::Gr,
+            BayerPattern::Gb,
+        ] {
+            let raw: Vec<u8> = (0..16).flat_map(|_| 12_345_u16.to_le_bytes()).collect();
+            assert_eq!(
+                demosaic_bilinear16(&raw, 4, 4, pattern).unwrap(),
+                vec![12_345; 48]
+            );
+            assert_eq!(raw16_to_raw8(&raw).unwrap(), vec![48; 16]);
+            let rgb = demosaic_bilinear16(&[255; 32], 4, 4, pattern).unwrap();
+            assert!(rgb.iter().all(|v| *v == u16::MAX));
+        }
+        assert!(raw16_to_raw8(&[1]).is_err());
+        assert!(demosaic_bilinear16(&[0; 31], 4, 4, BayerPattern::Rg).is_err());
+    }
 
     #[test]
     fn uniform_bayer_image_remains_neutral() {

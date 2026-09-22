@@ -14,7 +14,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Opt-in 30/60-second camera and production-worker diagnostic")]
+#[command(about = "Opt-in long-exposure camera and production-worker diagnostic")]
 struct Options {
     #[arg(long, default_value_t = 0)]
     camera_id: i32,
@@ -28,6 +28,8 @@ enum Mode {
     Sdk {
         #[arg(long, value_delimiter = ',', default_value = "30,60")]
         seconds: Vec<u32>,
+        #[arg(long)]
+        raw16: bool,
     },
     /// Run the real auto worker with a temporary configuration and print progress.
     Agent {
@@ -38,6 +40,13 @@ enum Mode {
         stop_after_seconds: u32,
         #[arg(long, default_value_t = 2)]
         stills: u64,
+        #[arg(long)]
+        adaptive: bool,
+        #[arg(long)]
+        raw16: bool,
+        /// Also exercise production segmented recording using this installed FFmpeg.
+        #[arg(long)]
+        ffmpeg: Option<std::path::PathBuf>,
     },
 }
 
@@ -49,17 +58,25 @@ fn main() -> Result<()> {
     let cancel = control.clone();
     ctrlc::set_handler(move || cancel.shutdown())?;
     match options.mode {
-        Mode::Sdk { seconds } => check_sdk(&sdk, options.camera_id, &seconds, &control),
+        Mode::Sdk { seconds, raw16 } => {
+            check_sdk(&sdk, options.camera_id, &seconds, raw16, &control)
+        }
         Mode::Agent {
             max_seconds,
             stop_after_seconds,
             stills,
+            adaptive,
+            raw16,
+            ffmpeg,
         } => check_agent(
             &sdk,
             options.camera_id,
             max_seconds,
             stop_after_seconds,
             stills,
+            adaptive,
+            raw16,
+            ffmpeg.as_deref(),
             &control,
         ),
     }
@@ -138,11 +155,12 @@ fn check_sdk(
     sdk: &Arc<Sdk>,
     camera_id: i32,
     seconds: &[u32],
+    raw16: bool,
     control: &AgentControl,
 ) -> Result<()> {
     ensure!(
-        !seconds.is_empty() && seconds.iter().all(|s| (1..=60).contains(s)),
-        "SDK check durations must be in 1..=60 seconds"
+        !seconds.is_empty() && seconds.iter().all(|s| (1..=2000).contains(s)),
+        "SDK check durations must be in 1..=2000 seconds and supported by the camera"
     );
     let info = sdk
         .cameras()?
@@ -157,7 +175,11 @@ fn check_sdk(
             width: info.max_width,
             height: info.max_height,
             bin: 1,
-            image_type: ImageType::Raw8,
+            image_type: if raw16 {
+                ImageType::Raw16
+            } else {
+                ImageType::Raw8
+            },
         })?;
         camera.set_control(ControlType::GAIN, 0, false)?;
         for &seconds in seconds {
@@ -182,7 +204,24 @@ fn check_sdk(
                 return Ok(());
             };
             let elapsed = started.elapsed();
-            let stats = raw8_stats(&buffer, 64)?;
+            let stats = if raw16 {
+                let bitwise_or = buffer.chunks_exact(2).fold(0_u16, |bits, pixel| {
+                    bits | u16::from_le_bytes([pixel[0], pixel[1]])
+                });
+                let maximum = buffer
+                    .chunks_exact(2)
+                    .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
+                    .max()
+                    .unwrap_or(0);
+                println!(
+                    "RAW16 sensor_bits={} maximum={maximum} bitwise_or={bitwise_or:#06x} trailing_zero_bits={}",
+                    info.bit_depth,
+                    bitwise_or.trailing_zeros()
+                );
+                autopiercam_core::image::raw16_stats(&buffer, 64)?
+            } else {
+                raw8_stats(&buffer, 64)?
+            };
             println!(
                 "SDK exposure={seconds}s frame_interval={:.3}s timeouts={polls} bytes={} p90={}",
                 elapsed.as_secs_f64(),
@@ -254,17 +293,23 @@ fn receive_frame(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_agent(
     sdk: &Arc<Sdk>,
     camera_id: i32,
     max_seconds: u32,
     stop_after_seconds: u32,
     stills: u64,
+    adaptive: bool,
+    raw16: bool,
+    ffmpeg: Option<&std::path::Path>,
     control: &AgentControl,
 ) -> Result<()> {
     ensure!(
-        (1..=60).contains(&max_seconds) && stop_after_seconds > 0 && stills > 0,
-        "max-seconds must be in 1..=60; stop-after-seconds and stills must be positive"
+        (1..=if adaptive { 2000 } else { 60 }).contains(&max_seconds)
+            && stop_after_seconds > 0
+            && stills > 0,
+        "max-seconds must be in 1..=60 (1..=2000 with --adaptive); stop-after-seconds and stills must be positive"
     );
     let temporary = tempfile::Builder::new()
         .prefix("autopiercam-exposure-check-")
@@ -273,9 +318,21 @@ fn check_agent(
     let snapshot = store.snapshot()?;
     let mut config = snapshot.config;
     config.camera.camera_id = Some(camera_id);
+    config.camera.exposure_control = if adaptive {
+        autopiercam_core::config::ExposureControl::Adaptive
+    } else {
+        autopiercam_core::config::ExposureControl::Sdk
+    };
+    config.camera.raw16 = raw16;
     config.camera.max_exposure_us = i64::from(max_seconds) * 1_000_000;
     config.capture.interval_ms = 1;
     config.capture.retention_days = 0;
+    if let Some(ffmpeg) = ffmpeg {
+        config.video.enabled = true;
+        config.video.ffmpeg_path = Some(ffmpeg.to_path_buf());
+        config.video.segment_seconds = 10;
+    }
+    let capture_directory = temporary.path().join(&config.capture.directory);
     store.replace(snapshot.revision, config)?;
     let info = sdk
         .cameras()?
@@ -372,6 +429,33 @@ fn check_agent(
     let result = (|| -> Result<()> {
         observation_result?;
         worker_result?;
+        if let Some(ffmpeg) = ffmpeg {
+            let clips: Vec<_> = std::fs::read_dir(&capture_directory)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "mp4"))
+                .collect();
+            ensure!(
+                !clips.is_empty(),
+                "video enabled but no MP4 segments were published"
+            );
+            for clip in &clips {
+                let decoded = std::process::Command::new(ffmpeg)
+                    .args(["-nostdin", "-v", "error", "-i"])
+                    .arg(clip)
+                    .args(["-f", "null", "-"])
+                    .output()?;
+                ensure!(
+                    decoded.status.success(),
+                    "recorded MP4 could not be decoded: {}",
+                    String::from_utf8_lossy(&decoded.stderr)
+                );
+            }
+            println!(
+                "Validated {} published H.264 video segments by decoding them",
+                clips.len()
+            );
+        }
         let final_status = monitor.snapshot();
         println!(
             "Finished: saved={} saw_progress={saw_progress} saw_settling_preview={saw_settling_preview} peak_exposure_us={peak_exposure_us}",

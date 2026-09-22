@@ -5,8 +5,8 @@
 AutoPierCam is a Windows-first capture suite for ZWO ASI planetary cameras,
 built around a portable Rust core and capture agent. On Windows it lives in the
 system tray, adapts between bright days and dark nights, saves debayered stills,
-and can upload completed artifacts. Short security-video segments remain a
-planned storage sink rather than an implemented feature.
+and can upload completed artifacts. Optional H.264 security-video segments use
+a separately installed FFmpeg executable.
 
 AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
@@ -23,13 +23,16 @@ The repository now contains a hardware-validated background capture slice:
 - checked C ABI layouts and safe camera lifecycle/control wrappers;
 - camera enumeration and capability probing without capture or exposure/gain
   changes (opening normalizes the SDK's persisted dark-subtraction flag);
-- bounded full-resolution RAW8 capture from the attached ASI676MC;
+- bounded full-resolution RAW8 and RAW16 capture from the attached ASI676MC;
 - bilinear RG/BG/GR/GB debayering, JPEG/PNG output, and luminance statistics;
 - a validated, forward-looking TOML configuration model;
 - a continuous camera drain loop with auto-exposure settling and a bounded
   still-writer queue;
 - minute-long SDK auto-exposure limits, startup previews, exposure progress,
   and exposure-aware stale-frame detection in both viewers;
+- opt-in application-controlled exposure beyond 60 seconds, lossless 16-bit PNG
+  stills, and bounded preview-resolution MP4 recording; see
+  [exposure](docs/exposure.md) and [video](docs/video.md);
 - a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
   backoff;
 - a Windows notification-area host that owns and supervises the camera worker;
@@ -39,7 +42,7 @@ The repository now contains a hardware-validated background capture slice:
 - a current-user-only, remote-rejected named pipe with versioned JSON control;
 - a separate same-user, outbound-only preview pipe backed by a bounded
   latest-frame producer and isolated fan-out to four concurrent viewers;
-- a durable SQLite HTTP outbox that records atomically published JPEGs, resumes
+- a durable SQLite HTTP outbox that records atomically published JPEG/PNG/MP4 files, resumes
   retries after restart, and supports bounded operator inspection and safe,
   revision-fenced requeue without delaying capture for network work;
 - a Windows-safe retention worker with age, managed-byte, and minimum-free-space
@@ -223,12 +226,13 @@ healthy.
   converts accordingly.
 - The Viewer and N.I.N.A. panel distinguish settling, exposing, and stalled
   frames using exposure-aware deadlines. SDK readback is approximate telemetry,
-  not a frame-exact exposure measurement. The Viewer's camera selector remains
-  read-only. Max exposure,
+  not a frame-exact exposure measurement. The detected-camera list is read-only;
+  a camera-name filter selects a model when multiple cameras are attached. Max exposure,
   max gain, still interval, managed-image and minimum-free-space limits, upload
   endpoint/enable, and video enable are backed by versioned configuration
   replacement. Capability checks keep new retention fields safe when the Viewer
   talks to an older agent. It reports durable upload counts, offers newest-first
   outbox inspection and confirmed requeue of eligible permanent failures, and
   shows managed/protected/reclaimable bytes plus the latest retention sweep.
-  Security video remains a designed seam rather than an active sink.
+  Security video samples the preview feed, honors Pause and storage pressure,
+  and finalizes its current segment on orderly shutdown.

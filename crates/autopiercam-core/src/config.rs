@@ -38,6 +38,11 @@ impl Config {
                 "camera.max_exposure_us must be >= camera.min_exposure_us",
             ));
         }
+        if self.camera.max_gain < 0 || !(1..=250).contains(&self.camera.target_brightness) {
+            return Err(ConfigError::Validation(
+                "camera gain must be non-negative and target_brightness in 1..=250",
+            ));
+        }
         if !(1..=100).contains(&self.capture.jpeg_quality) {
             return Err(ConfigError::Validation(
                 "capture.jpeg_quality must be between 1 and 100",
@@ -66,6 +71,24 @@ impl Config {
         if self.upload.queue_capacity == 0 {
             return Err(ConfigError::Validation(
                 "upload.queue_capacity must be greater than zero",
+            ));
+        }
+        if !(1..=600).contains(&self.video.segment_seconds)
+            || !(1..=30).contains(&self.video.frames_per_second)
+        {
+            return Err(ConfigError::Validation(
+                "video segment_seconds must be in 1..=600 and frames_per_second in 1..=30",
+            ));
+        }
+        if self.video.enabled
+            && self
+                .video
+                .ffmpeg_path
+                .as_ref()
+                .is_none_or(|path| !path.is_absolute())
+        {
+            return Err(ConfigError::Validation(
+                "video.ffmpeg_path must be an absolute FFmpeg executable path when video is enabled",
             ));
         }
         if self.upload.enabled && self.upload.endpoint.is_none() {
@@ -136,6 +159,12 @@ pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
+    /// Opt-in application control uses the sensor's manual exposure limits.
+    #[serde(skip_serializing_if = "ExposureControl::is_sdk")]
+    pub exposure_control: ExposureControl,
+    /// Preserve the SDK's full 16-bit Bayer samples in debayered PNG stills.
+    #[serde(skip_serializing_if = "is_false")]
+    pub raw16: bool,
     pub camera_id: Option<i32>,
     pub name_contains: Option<String>,
     pub width: Option<u32>,
@@ -151,6 +180,8 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
+            exposure_control: ExposureControl::Sdk,
+            raw16: false,
             camera_id: None,
             name_contains: None,
             width: None,
@@ -163,6 +194,24 @@ impl Default for CameraConfig {
             settle_frames: 6,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExposureControl {
+    #[default]
+    Sdk,
+    Adaptive,
+}
+
+impl ExposureControl {
+    fn is_sdk(&self) -> bool {
+        *self == Self::Sdk
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -220,6 +269,8 @@ impl Default for UploadConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<PathBuf>,
     pub enabled: bool,
     pub segment_seconds: u32,
     pub frames_per_second: u32,
@@ -228,6 +279,7 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
+            ffmpeg_path: None,
             enabled: false,
             segment_seconds: 300,
             frames_per_second: 4,
@@ -266,6 +318,41 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_requires_explicit_executable_and_bounded_sampling() {
+        let mut config = Config::default();
+        config.video.enabled = true;
+        assert!(config.validate().is_err());
+        config.video.ffmpeg_path = Some(PathBuf::from("ffmpeg.exe"));
+        assert!(config.validate().is_err());
+        config.video.ffmpeg_path = Some(std::env::current_dir().unwrap().join("ffmpeg.exe"));
+        config.validate().unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.video.ffmpeg_path, config.video.ffmpeg_path);
+        config.video.segment_seconds = 601;
+        assert!(config.validate().is_err());
+        config.video.segment_seconds = 60;
+        config.video.frames_per_second = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn advanced_camera_fields_are_opt_in_and_roundtrip() {
+        let defaults = toml::to_string(&Config::default()).unwrap();
+        assert!(!defaults.contains("exposure_control"));
+        assert!(!defaults.contains("raw16"));
+        let config: Config = toml::from_str(
+            "[camera]\nexposure_control = 'adaptive'\nraw16 = true\nmax_exposure_us = 120000000",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(restored.camera.raw16);
+        assert_eq!(restored.camera.exposure_control, ExposureControl::Adaptive);
+        assert_eq!(restored.camera.max_exposure_us, 120_000_000);
+        assert!(toml::from_str::<Config>("[camera]\nexposure_control='typo'").is_err());
+    }
 
     #[test]
     fn defaults_are_valid() {

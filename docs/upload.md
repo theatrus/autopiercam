@@ -1,6 +1,6 @@
 # Durable HTTP upload outbox
 
-The uploader sends finalized JPEGs without putting filesystem, database, or
+The uploader sends finalized JPEG, PNG, and MP4 files without putting filesystem, database, or
 network work on the camera thread. SQLite is the authoritative outbox: artifact
 identity, attempts, retry deadlines, successes, and terminal failures survive
 an orderly shutdown, process crash, or machine restart.
@@ -66,7 +66,12 @@ New captures use the exact generated grammar
 `frame-<unix-seconds>-<three-digit-milliseconds>-<32-lowercase-hex-session-nonce>-<six-or-more-digit-sequence>.jpg`.
 The 128-bit OS-random nonce makes names collision-resistant across process
 restart and wall-clock correction. Reconciliation also recognizes the legacy
-form without a nonce and accepts `.jpeg` for recovery compatibility.
+form without a nonce and accepts `.jpeg` for recovery compatibility. RAW16
+stills use `.png` and video segments use `.mp4`; these two extensions require
+the modern nonce-bearing grammar. They participate in the same reconciliation,
+identity verification, and protected-retention rules. HTTP content types are
+`image/jpeg`, `image/png`, and `video/mp4`, respectively. Configure the endpoint
+to accept the enabled media types; video does not use a separate destination.
 
 Because activation records the paths that actually existed rather than
 comparing filename timestamps, enabling upload does not adopt old captures

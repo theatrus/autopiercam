@@ -2943,7 +2943,9 @@ fn sha256_from_database(job_id: UploadJobId, value: Vec<u8>) -> Result<[u8; 32],
 pub(crate) fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
     let stem = filename
         .strip_suffix(".jpg")
-        .or_else(|| filename.strip_suffix(".jpeg"));
+        .or_else(|| filename.strip_suffix(".jpeg"))
+        .or_else(|| filename.strip_suffix(".png"))
+        .or_else(|| filename.strip_suffix(".mp4"));
     let stem = stem?;
     let mut parts = stem.split('-');
     let (Some("frame"), Some(seconds), Some(millis), Some(fourth)) =
@@ -2957,6 +2959,9 @@ pub(crate) fn parse_generated_frame_filename(filename: &str) -> Option<u64> {
         (Some(sequence), None) => (Some(fourth), sequence),
         _ => return None,
     };
+    if (filename.ends_with(".png") || filename.ends_with(".mp4")) && session_nonce.is_none() {
+        return None;
+    }
     if seconds.is_empty()
         || !seconds.bytes().all(|byte| byte.is_ascii_digit())
         || millis.len() != 3
@@ -4060,6 +4065,18 @@ mod tests {
 
     #[test]
     fn generated_filename_parser_accepts_nonce_and_legacy_grammars_exactly() {
+        for extension in ["png", "mp4"] {
+            assert_eq!(
+                parse_generated_frame_filename(&format!(
+                    "frame-1700000000-123-00112233445566778899aabbccddeeff-000042.{extension}"
+                )),
+                Some(1_700_000_000_123)
+            );
+            assert_eq!(
+                parse_generated_frame_filename(&format!("frame-1700000000-123-000042.{extension}")),
+                None
+            );
+        }
         assert_eq!(
             parse_generated_frame_filename(
                 "frame-1700000000-123-00112233445566778899aabbccddeeff-000042.jpg"

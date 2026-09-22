@@ -4,6 +4,10 @@ use autopiercam_asi::{
     ImageType, Roi, Sdk,
 };
 use autopiercam_core::{
+    config::ExposureControl,
+    exposure::{AdaptiveExposure, ExposureSetting, LightMode},
+};
+use autopiercam_core::{
     config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
@@ -37,6 +41,7 @@ mod ledger_maintenance;
 mod preview;
 mod retention;
 mod upload;
+mod video;
 
 use exposure::{FrameWait, Settling, WaitDecision, poll_timeout_ms};
 use ledger_maintenance::LedgerLease;
@@ -297,6 +302,9 @@ impl AgentMonitor {
             CAPABILITY_UPLOADS_REQUEUE.to_owned(),
             CAPABILITY_STORAGE_RETENTION.to_owned(),
             CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
+            "camera.adaptive_exposure".to_owned(),
+            "camera.raw16".to_owned(),
+            "video.ffmpeg".to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
@@ -627,6 +635,7 @@ struct CaptureJob {
     data: Vec<u8>,
     output: PathBuf,
     jpeg_quality: u8,
+    raw16: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -647,6 +656,14 @@ struct CompletedFrame {
     captured_at_unix_ms: u64,
     exposure_us: i64,
     gain: i64,
+}
+
+fn frame_stats(meta: FrameMeta, data: &[u8]) -> Result<autopiercam_core::image::LumaStats> {
+    Ok(if meta.image_type == ImageType::Raw16 {
+        autopiercam_core::image::raw16_stats(data, 64)?
+    } else {
+        raw8_stats(data, 64)?
+    })
 }
 
 struct CaptureProgress {
@@ -733,6 +750,8 @@ struct CaptureObserver<'a> {
     monitor: Option<&'a AgentMonitor>,
     preview: Option<&'a PreviewSink>,
     next_preview: Instant,
+    adaptive: Option<AdaptiveExposure>,
+    video: Option<&'a video::VideoWorker>,
 }
 
 impl<'a> CaptureObserver<'a> {
@@ -746,7 +765,31 @@ impl<'a> CaptureObserver<'a> {
             monitor,
             preview,
             next_preview: Instant::now(),
+            adaptive: None,
+            video: None,
         }
+    }
+
+    fn adapt(&mut self, camera: &mut Camera, frame: &CompletedFrame) -> Result<bool> {
+        let Some(controller) = &mut self.adaptive else {
+            return Ok(false);
+        };
+        let current = ExposureSetting {
+            exposure_us: frame.exposure_us,
+            gain: frame.gain,
+        };
+        let next = controller.observe(current, frame_stats(frame.meta, &frame.data)?);
+        if next == current {
+            return Ok(false);
+        }
+        // Discard the SDK pipeline before changing manual controls, so the next
+        // sample cannot drive feedback using a queued image with old settings.
+        camera.stop_video()?;
+        camera.set_control(ControlType::EXPOSURE, next.exposure_us, false)?;
+        camera.set_control(ControlType::GAIN, next.gain, false)?;
+        camera.start_video()?;
+        info!(exposure_us = next.exposure_us, gain = next.gain, mode = ?controller.mode(), "adaptive exposure updated");
+        Ok(true)
     }
 
     fn frame_received(&mut self, frame: &CompletedFrame, settling: bool, paused: bool) {
@@ -766,9 +809,15 @@ impl<'a> CaptureObserver<'a> {
                 height: frame.meta.height,
                 bayer: self.bayer,
                 data: frame.data.clone(),
+                raw16: frame.meta.image_type == ImageType::Raw16,
                 captured_at_unix_ms: frame.captured_at_unix_ms,
                 exposure_us: frame.exposure_us,
                 gain: frame.gain,
+                mode: match self.adaptive.as_ref().map(AdaptiveExposure::mode) {
+                    None => autopiercam_protocol::PreviewMode::Unknown,
+                    Some(LightMode::Day) => autopiercam_protocol::PreviewMode::Day,
+                    Some(LightMode::Night) => autopiercam_protocol::PreviewMode::Night,
+                },
                 dropped_frames,
             });
             self.next_preview = now + PREVIEW_INTERVAL;
@@ -862,6 +911,10 @@ fn run_agent_inner(
     let config_path = std::path::absolute(config_path)
         .with_context(|| format!("resolving configuration path {}", config_path.display()))?;
     let config = Config::load(&config_path)?;
+    // Headless recording uses the same bounded preview encoder as the tray.
+    let video_preview =
+        (config.video.enabled && preview.is_none()).then(|| PreviewHub::new().begin_session());
+    let preview = preview.or(video_preview.as_ref());
     let configured_capture_directory = if config.capture.directory.is_absolute() {
         config.capture.directory.clone()
     } else {
@@ -911,17 +964,27 @@ fn run_agent_inner(
         None => (None, None),
     };
     let info = select_configured_camera(sdk, &config.camera)?;
+    if !info.is_color {
+        bail!(
+            "{} is not a color camera; AutoPierCam requires a color ASI camera",
+            info.name
+        );
+    }
     monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
     let mut camera = sdk.open(info.clone())?;
     let controls = camera.controls()?;
-    let auto_limits = configure_sdk_auto(
-        &mut camera,
-        &controls,
-        config.camera.max_exposure_us,
-        config.camera.max_gain,
-        config.camera.target_brightness,
-    )?;
+    let auto_limits = if config.camera.exposure_control == ExposureControl::Adaptive {
+        configure_adaptive(&mut camera, &controls, &config.camera)?
+    } else {
+        configure_sdk_auto(
+            &mut camera,
+            &controls,
+            config.camera.max_exposure_us,
+            config.camera.max_gain,
+            config.camera.target_brightness,
+        )?
+    };
     CaptureProgress::new(
         &camera,
         auto_limits,
@@ -938,15 +1001,30 @@ fn run_agent_inner(
             info.supported_bins
         );
     }
-    if !info.supported_formats.contains(&ImageType::Raw8) {
-        bail!("camera {} does not support RAW8 video", info.name);
+    let image_type = if config.camera.raw16 {
+        ImageType::Raw16
+    } else {
+        ImageType::Raw8
+    };
+    if !info.is_color {
+        bail!(
+            "{} is not a color camera; AutoPierCam's current debayer pipeline requires a color ASI camera",
+            info.name
+        );
+    }
+    if !info.supported_formats.contains(&image_type) {
+        bail!(
+            "camera {} does not support {:?} video",
+            info.name,
+            image_type
+        );
     }
     let bin = u32::try_from(config.camera.bin).context("camera bin must be positive")?;
     let roi = Roi {
         width: config.camera.width.unwrap_or(info.max_width / bin),
         height: config.camera.height.unwrap_or(info.max_height / bin),
         bin: config.camera.bin,
-        image_type: ImageType::Raw8,
+        image_type,
     };
     camera.set_roi(roi)?;
 
@@ -955,6 +1033,19 @@ fn run_agent_inner(
     // keeping the ledger lifecycle lease held until publication has drained.
     let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
+    let video_worker = if config.video.enabled {
+        Some(video::VideoWorker::start(
+            &config.video,
+            &capture_directory,
+            preview.context("video preview session missing")?.clone(),
+            capture_session_nonce,
+            upload_sink.clone(),
+            retention_sink.clone(),
+            control.clone(),
+        )?)
+    } else {
+        None
+    };
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let upload_health = upload_sink.as_ref().map(UploadSink::health);
     let writer_retention_sink = retention_sink.clone();
@@ -999,12 +1090,19 @@ fn run_agent_inner(
         preview_sink.as_ref(),
         preview.map(PreviewSession::generation).unwrap_or(0),
         capture_session_nonce,
+        video_worker.as_ref(),
     );
     monitor.set_state(AgentState::Stopping);
     drop(writer_tx);
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("still-writer thread panicked"));
+    let preview_result = preview_encoder
+        .map(PreviewEncoder::stop_and_join)
+        .unwrap_or(Ok(()));
+    let video_result = video_worker
+        .map(video::VideoWorker::stop_and_join)
+        .unwrap_or(Ok(()));
     let retention_result = retention_worker
         .map(RetentionWorker::stop_and_join)
         .unwrap_or(Ok(()));
@@ -1012,10 +1110,8 @@ fn run_agent_inner(
     let upload_result = upload_worker
         .map(UploadWorker::stop_and_join)
         .unwrap_or(Ok(()));
-    let preview_result = preview_encoder
-        .map(PreviewEncoder::stop_and_join)
-        .unwrap_or(Ok(()));
     drop(disabled_upload_ledger_lease);
+    video_result.context("recording video")?;
     capture_result?;
     writer_result??;
     retention_result.context("stopping capture retention worker")?;
@@ -1060,6 +1156,7 @@ fn capture_loop(
     preview: Option<&PreviewSink>,
     preview_session_generation: u64,
     capture_session_nonce: CaptureSessionNonce,
+    video: Option<&video::VideoWorker>,
 ) -> Result<()> {
     camera.start_video()?;
     let result = (|| {
@@ -1070,6 +1167,16 @@ fn capture_loop(
             config.camera.settle_frames,
         );
         let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+        observer.video = video;
+        if config.camera.exposure_control == ExposureControl::Adaptive {
+            observer.adaptive = Some(AdaptiveExposure::new(
+                auto_limits.min_exposure_us,
+                auto_limits.max_exposure_us,
+                auto_limits.min_gain,
+                auto_limits.max_gain,
+                auto_limits.target_brightness as u8,
+            ));
+        }
         progress.publish(&observer);
         let Some(settling_frame) = wait_for_auto_settle(
             camera,
@@ -1101,6 +1208,9 @@ fn capture_loop(
         let mut queued = 0_u64;
 
         while !control.is_shutdown() {
+            if video.is_some_and(video::VideoWorker::is_finished) {
+                bail!("video worker stopped unexpectedly");
+            }
             if upload_health.is_some_and(UploadHealth::is_stopped) {
                 bail!("durable upload worker stopped unexpectedly");
             }
@@ -1141,6 +1251,8 @@ fn capture_loop(
                     Err(error) => return Err(error.into()),
                 };
                 let frame = progress.completed_frame(meta, &mut frame_buffer);
+                observer.adapt(camera, &frame)?;
+                progress.refresh(camera, auto_limits);
                 observer.frame_received(&frame, false, control.is_paused());
                 progress.publish(&observer);
                 frame
@@ -1160,7 +1272,11 @@ fn capture_loop(
             if !capture_requested && !periodic_capture_due {
                 continue;
             }
-            let output = capture_directory.join(capture_filename(capture_session_nonce, queued));
+            let mut output =
+                capture_directory.join(capture_filename(capture_session_nonce, queued));
+            if config.camera.raw16 {
+                output.set_extension("png");
+            }
             let job = CaptureJob {
                 sequence: queued,
                 width: meta.width,
@@ -1169,6 +1285,7 @@ fn capture_loop(
                 data: frame_buffer.clone(),
                 output,
                 jpeg_quality: config.capture.jpeg_quality,
+                raw16: config.camera.raw16,
             };
             match writer.try_send(job) {
                 Ok(()) => {
@@ -1208,6 +1325,9 @@ fn wait_for_auto_settle(
     let mut frame_buffer = Vec::new();
     let mut latest: Option<CompletedFrame> = None;
     loop {
+        if observer.video.is_some_and(video::VideoWorker::is_finished) {
+            bail!("video worker stopped while exposure was settling");
+        }
         progress.refresh(camera, limits);
         progress.publish(observer);
         match settling.decision(
@@ -1249,7 +1369,7 @@ fn wait_for_auto_settle(
         };
         // The SDK readback is asynchronous. It is a convergence/progress signal,
         // not an assertion that exposure/gain are exact for these sensor bytes.
-        let stats = raw8_stats(&frame_buffer, 64)?;
+        let stats = frame_stats(meta, &frame_buffer)?;
         let frame = progress.completed_frame(meta, &mut frame_buffer);
         let settled = settling.observe_frame(
             progress.started.elapsed(),
@@ -1259,9 +1379,11 @@ fn wait_for_auto_settle(
             stats.clipped_fraction,
         );
         progress.status.settling_frames = settling.received();
+        let adjusted = observer.adapt(camera, &frame)?;
+        progress.refresh(camera, limits);
         observer.frame_received(&frame, true, control.is_some_and(AgentControl::is_paused));
         progress.publish(observer);
-        if settled {
+        if settled && !adjusted {
             info!(
                 received = settling.received(),
                 exposure_us = frame.exposure_us,
@@ -1416,10 +1538,26 @@ fn writer_loop(
     retention: Option<&RetentionSink>,
 ) -> Result<()> {
     for job in receiver {
-        let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
-            .with_context(|| format!("debayering frame {}", job.sequence))?;
-        let stats = luma_stats(&rgb, 64)?;
-        save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
+        let stats = if job.raw16 {
+            let rgb = autopiercam_core::image::demosaic_bilinear16(
+                &job.data, job.width, job.height, job.bayer,
+            )?;
+            let bytes: Vec<u8> = rgb.iter().flat_map(|value| value.to_ne_bytes()).collect();
+            save_rgb_samples(
+                &job.output,
+                job.width,
+                job.height,
+                &bytes,
+                job.jpeg_quality,
+                ColorType::Rgb16,
+            )?;
+            autopiercam_core::image::raw16_stats(&job.data, 64)?
+        } else {
+            let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
+                .with_context(|| format!("debayering frame {}", job.sequence))?;
+            save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
+            luma_stats(&rgb, 64)?
+        };
         monitor.artifact_saved(&job.output);
         if let Some(upload) = upload {
             match upload.try_enqueue(job.output.clone()) {
@@ -1520,6 +1658,46 @@ fn select_configured_camera(sdk: &Arc<Sdk>, config: &CameraConfig) -> Result<Cam
         bail!("more than one connected camera matches the configuration");
     }
     Ok(selected)
+}
+
+fn configure_adaptive(
+    camera: &mut Camera,
+    controls: &[ControlCaps],
+    config: &CameraConfig,
+) -> Result<AutoLimits> {
+    let exposure = control(controls, ControlType::EXPOSURE)
+        .filter(|c| c.writable)
+        .context("camera needs a writable manual exposure control")?;
+    let gain = control(controls, ControlType::GAIN)
+        .filter(|c| c.writable)
+        .context("camera needs a writable manual gain control")?;
+    let max_exposure_us = config
+        .max_exposure_us
+        .clamp(exposure.min_value.max(1), exposure.max_value);
+    let min_exposure_us = config
+        .min_exposure_us
+        .clamp(exposure.min_value.max(1), max_exposure_us);
+    let max_gain = config.max_gain.clamp(gain.min_value, gain.max_value);
+    camera.set_control(
+        ControlType::EXPOSURE,
+        100_000_i64.clamp(min_exposure_us, max_exposure_us),
+        false,
+    )?;
+    camera.set_control(ControlType::GAIN, gain.min_value, false)?;
+    set_if_available(camera, controls, ControlType::FLIP, 0, false)?;
+    info!(
+        min_exposure_us,
+        max_exposure_us,
+        max_gain,
+        "configured application-controlled exposure within manual camera limits"
+    );
+    Ok(AutoLimits {
+        min_exposure_us,
+        max_exposure_us,
+        min_gain: gain.min_value,
+        max_gain,
+        target_brightness: config.target_brightness,
+    })
 }
 
 fn configure_sdk_auto(
@@ -1691,6 +1869,17 @@ fn core_bayer(pattern: AsiBayerPattern) -> Result<BayerPattern> {
 }
 
 fn save_rgb(path: &Path, width: u32, height: u32, rgb: &[u8], quality: u8) -> Result<()> {
+    save_rgb_samples(path, width, height, rgb, quality, ColorType::Rgb8)
+}
+
+fn save_rgb_samples(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    quality: u8,
+    color: ColorType,
+) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1717,12 +1906,12 @@ fn save_rgb(path: &Path, width: u32, height: u32, rgb: &[u8], quality: u8) -> Re
         match extension.as_str() {
             "jpg" | "jpeg" => {
                 JpegEncoder::new_with_quality(&mut writer, quality)
-                    .write_image(rgb, width, height, ColorType::Rgb8.into())
+                    .write_image(rgb, width, height, color.into())
                     .context("encoding JPEG")?;
             }
             "png" => {
                 PngEncoder::new(&mut writer)
-                    .write_image(rgb, width, height, ColorType::Rgb8.into())
+                    .write_image(rgb, width, height, color.into())
                     .context("encoding PNG")?;
             }
             _ => unreachable!("extension validated above"),
@@ -1835,6 +2024,19 @@ fn camera_json(camera: &CameraInfo) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw16_png_roundtrip_preserves_low_sensor_bits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("precision.png");
+        let samples: Vec<u16> = (0..48).map(|n| 12_345 + n * 17).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        save_rgb_samples(&path, 4, 4, &bytes, 88, ColorType::Rgb16).unwrap();
+        let decoded = image::open(&path).unwrap();
+        assert_eq!(decoded.color(), ColorType::Rgb16);
+        assert_eq!(decoded.to_rgb16().into_raw(), samples);
+        assert!(save_rgb_samples(&path, 4, 4, &bytes, 88, ColorType::Rgb16).is_err());
+    }
 
     fn test_exposure_progress(session_generation: u64) -> CaptureProgress {
         CaptureProgress {
@@ -2028,7 +2230,10 @@ mod tests {
                 CAPABILITY_UPLOADS_LIST.to_owned(),
                 CAPABILITY_UPLOADS_REQUEUE.to_owned(),
                 CAPABILITY_STORAGE_RETENTION.to_owned(),
-                CAPABILITY_EXPOSURE_PROGRESS.to_owned()
+                CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
+                "camera.adaptive_exposure".to_owned(),
+                "camera.raw16".to_owned(),
+                "video.ffmpeg".to_owned()
             ]
         );
         let upload = status.upload.expect("upload telemetry");

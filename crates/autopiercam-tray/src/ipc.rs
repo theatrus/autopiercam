@@ -1056,7 +1056,10 @@ mod tests {
                 CAPABILITY_UPLOADS_LIST,
                 CAPABILITY_UPLOADS_REQUEUE,
                 CAPABILITY_STORAGE_RETENTION,
-                CAPABILITY_EXPOSURE_PROGRESS
+                CAPABILITY_EXPOSURE_PROGRESS,
+                "camera.adaptive_exposure",
+                "camera.raw16",
+                "video.ffmpeg"
             ]
         );
 

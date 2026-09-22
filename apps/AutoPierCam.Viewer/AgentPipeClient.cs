@@ -749,6 +749,14 @@ internal sealed record AgentConfiguration
 
 internal sealed record AgentCameraConfiguration
 {
+    [JsonPropertyName("exposure_control")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExposureControl { get; init; }
+
+    [JsonPropertyName("raw16")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Raw16 { get; init; }
+
     [JsonPropertyName("camera_id")]
     public int? CameraId { get; init; }
 
@@ -840,6 +848,10 @@ internal sealed record AgentUploadConfiguration
 
 internal sealed record AgentVideoConfiguration
 {
+    [JsonPropertyName("ffmpeg_path")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? FfmpegPath { get; init; }
+
     [JsonPropertyName("enabled")]
     [JsonRequired]
     public bool Enabled { get; init; }

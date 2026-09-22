@@ -302,7 +302,7 @@ public sealed partial class MainWindow : Window
             _progressObservation?.Status.Exposure is { } currentExposure)
         {
             ExposureProgressText.Text +=
-                $" Automatic exposure limit: {FormatExposure(currentExposure.MaxExposureUs)} · gain {currentExposure.Gain:N0}.";
+                $" Exposure limit: {FormatExposure(currentExposure.MaxExposureUs)} · gain {currentExposure.Gain:N0}.";
         }
 
         // A status response cannot repair a broken preview transport or JPEG.
@@ -1044,9 +1044,12 @@ public sealed partial class MainWindow : Window
         }
 
         AgentConfiguration configuration = snapshot.Config;
+        AdaptiveExposureCheckBox.IsChecked = configuration.Camera.ExposureControl == "adaptive";
+        Raw16CheckBox.IsChecked = configuration.Camera.Raw16 == true;
+        CameraNameFilterTextBox.Text = configuration.Camera.NameContains ?? string.Empty;
         double maxExposureMs = configuration.Camera.MaxExposureUs / 1000.0;
         double stillIntervalSeconds = configuration.Capture.IntervalMs / 1000.0;
-        MaxExposureNumberBox.Maximum = Math.Max(60_000, maxExposureMs);
+        MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureCheckBox.IsChecked == true ? 2_000_000 : 60_000, maxExposureMs);
         MaxGainNumberBox.Maximum = Math.Max(600, configuration.Camera.MaxGain);
         StillIntervalNumberBox.Maximum = Math.Max(86_400, stillIntervalSeconds);
         MaxExposureNumberBox.Value = maxExposureMs;
@@ -1062,6 +1065,7 @@ public sealed partial class MainWindow : Window
         UploadEnabledToggle.IsOn = configuration.Upload.Enabled;
         UploadEndpointTextBox.Text = configuration.Upload.Endpoint ?? string.Empty;
         VideoEnabledToggle.IsOn = configuration.Video.Enabled;
+        FfmpegPathTextBox.Text = configuration.Video.FfmpegPath ?? string.Empty;
 
         _configurationSnapshot = snapshot;
         _configurationNeedsRefresh = false;
@@ -1144,12 +1148,27 @@ public sealed partial class MainWindow : Window
                 "Bearer-authenticated uploads require an HTTPS endpoint.");
         }
 
+        string? ffmpegPath = _latestAgentStatus?.HasCapability("video.ffmpeg") == true
+            ? NormalizeOptionalText(FfmpegPathTextBox.Text) : original.Video.FfmpegPath;
+        if (_latestAgentStatus?.HasCapability("video.ffmpeg") == true && VideoEnabledToggle.IsOn &&
+            (ffmpegPath is null || !System.IO.Path.IsPathFullyQualified(ffmpegPath) || !System.IO.File.Exists(ffmpegPath)))
+        {
+            throw new UserInputException("Select an existing, fully qualified FFmpeg executable path before enabling video.");
+        }
+
         return original with
         {
             Camera = original.Camera with
             {
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
+                ExposureControl = _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true
+                    ? AdaptiveExposureCheckBox.IsChecked == true ? "adaptive" : null : original.Camera.ExposureControl,
+                Raw16 = _latestAgentStatus?.HasCapability("camera.raw16") == true
+                    ? Raw16CheckBox.IsChecked == true ? true : null : original.Camera.Raw16,
+                NameContains = string.IsNullOrWhiteSpace(CameraNameFilterTextBox.Text) ? null : CameraNameFilterTextBox.Text.Trim(),
+                CameraId = string.Equals(original.Camera.NameContains ?? string.Empty, CameraNameFilterTextBox.Text.Trim(), StringComparison.Ordinal)
+                    ? original.Camera.CameraId : null,
             },
             Capture = original.Capture with
             {
@@ -1165,6 +1184,7 @@ public sealed partial class MainWindow : Window
             Video = original.Video with
             {
                 Enabled = VideoEnabledToggle.IsOn,
+                FfmpegPath = ffmpegPath,
             },
         };
     }
@@ -1506,17 +1526,29 @@ public sealed partial class MainWindow : Window
             !_configurationNeedsRefresh;
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
+        AdaptiveExposureCheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
+        Raw16CheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
+        CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled;
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
-        VideoEnabledToggle.IsEnabled = configurationControlsEnabled;
+        VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
+        FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
         SaveButton.IsEnabled = configurationControlsEnabled;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
 
-        // Camera selection is descriptive in this viewer. Config replacement
-        // preserves the agent's complete camera selector unchanged.
+        // The detected camera is descriptive; the model filter is editable.
         CameraComboBox.IsEnabled = false;
+    }
+
+    private void ExposureControl_Changed(object sender, RoutedEventArgs args)
+    {
+        if (MaxExposureNumberBox is not null)
+        {
+            MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureCheckBox.IsChecked == true ? 2_000_000 : 60_000,
+                double.IsNaN(MaxExposureNumberBox.Value) ? 0 : MaxExposureNumberBox.Value);
+        }
     }
 
     private void UpdateOutboxControlAvailability()

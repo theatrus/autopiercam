@@ -17,7 +17,7 @@ settle_frames = 6
 
 The effective limit appears in the Viewer and agent logs. Configuration changes
 restart the camera session; an in-flight exposure is cancelled before applying
-the new controls. Pause affects scheduled still persistence, not exposure or
+the new controls. Pause affects scheduled still persistence and video sampling, not exposure or
 preview. Capture now requests the next eligible completed frame; it does not
 force a long exposure to finish early.
 
@@ -31,10 +31,34 @@ runtime units, clamps the requested ceiling, and reads back the effective
 value. Another camera may report different limits; the ASI662MC has not been
 hardware-tested here.
 
-Requesting more than 60 seconds on this ASI676MC therefore does not enable
-longer automatic exposures. That needs the planned application-owned
-day/night controller using manual exposure commands. RAW16 night stills and
-segmented video also remain separate, unimplemented milestones.
+In SDK mode, requesting more than 60 seconds on this ASI676MC is clamped to
+60 seconds. Enable **Application-controlled exposure** in the Viewer to use
+the sensor's manual range instead. For a two-minute limit, set Max exposure to
+`120000` milliseconds, or use:
+
+```toml
+[camera]
+exposure_control = "adaptive"
+max_exposure_us = 120000000
+max_gain = 300
+raw16 = true
+```
+
+The controller targets the sampled raw p90 brightness, prioritizes exposure
+before increasing gain, shortens clipped frames aggressively, and uses a
+brightness deadband plus three-frame day/night hysteresis. It stops and restarts
+SDK video on control changes to discard queued frames with old settings.
+Limits are clamped to the attached camera's manual capabilities; a high maximum
+does not force a long exposure. The Viewer allows up to 2,000 seconds, subject
+to the camera limit. Actual dark-to-daylight optical behavior still needs field
+validation; the controller's transitions are covered by deterministic tests.
+
+**RAW16 capture** is independently selectable. It saves lossless, debayered
+16-bit RGB PNGs and retains the SDK samples without assuming an ADC bit shift.
+The ASI676MC is a 12-bit sensor, not a 16-bit ADC. Its SDK output included
+nonzero low bits during characterization. Preview/video use the high byte for
+8-bit display; RAW16 doubles the input buffer size and PNGs can be large.
+See [security recording](video.md) for optional MP4 segments.
 
 ## Startup, cadence, and recovery
 
@@ -126,3 +150,17 @@ Both worker checks restored the saved controls and ROI format successfully.
 Automated tests cover six complete 30/60-second settling frames, exposure
 transitions, missing-frame deadlines, cancellation, fallback-buffer ownership,
 and both clients' stale-frame and progress handling without requiring hardware.
+
+On 2026-09-21, the same ASI676MC delivered a forced 90-second exposure at a
+measured **90.136-second** frame interval; stopping a subsequent exposure took
+**0.331 seconds**. RAW16 returned 25,233,408 bytes at full resolution. A production
+adaptive run with a 120-second ceiling converged to **12.308 seconds** in the
+available scene, saved two full-resolution 16-bit PNGs and seven MP4 segments,
+and restored camera controls after shutdown. Every MP4 decoded successfully.
+This demonstrates the pipeline, not automatic convergence at 120 seconds.
+
+To repeat the combined test (select the correct ID from camera enumeration):
+
+```powershell
+cargo run --release -p autopiercam --example check_long_exposure -- --camera-id 1 agent --adaptive --raw16 --max-seconds 120 --ffmpeg C:\Tools\ffmpeg\bin\ffmpeg.exe
+```

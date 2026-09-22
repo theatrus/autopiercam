@@ -109,9 +109,19 @@ jobs:
         shell: bash
         run: dotnet test integrations/AutoPierCam.NINA/AutoPierCam.NINA.slnx --configuration Release
 
+      - name: Test external H.264 encoder integration
+        shell: pwsh
+        run: |
+          $env:AUTOPIERCAM_TEST_FFMPEG = ./scripts/Get-FFmpegForTests.ps1
+          cargo test -p autopiercam video::tests --locked -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg integration tests failed.' }
+
       - name: Verify dependency license inventory
         shell: pwsh
         run: |
+          # Frozen metadata resolves all targets, not only Windows.
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Fetching locked license inventory sources failed.' }
           cargo install cargo-about --version 0.9.1 --locked --features cli
           if ($LASTEXITCODE -ne 0) { throw 'Installing cargo-about failed.' }
           ./third-party/rust/Generate-Notices.ps1 -Check
