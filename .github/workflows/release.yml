@@ -112,7 +112,7 @@ jobs:
       - name: Verify dependency license inventory
         shell: pwsh
         run: |
-          cargo install cargo-about --version 0.9.1 --locked
+          cargo install cargo-about --version 0.9.1 --locked --features cli
           if ($LASTEXITCODE -ne 0) { throw 'Installing cargo-about failed.' }
           ./third-party/rust/Generate-Notices.ps1 -Check
 
