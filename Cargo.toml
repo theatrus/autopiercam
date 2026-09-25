@@ -2,6 +2,7 @@
 members = [
     "crates/autopiercam",
     "crates/autopiercam-asi",
+    "crates/autopiercam-chatstronomy",
     "crates/autopiercam-core",
     "crates/autopiercam-protocol",
     "crates/autopiercam-tray",

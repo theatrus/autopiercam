@@ -1,0 +1,18 @@
+[package]
+name = "autopiercam-chatstronomy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Portable Chatstronomy client protocol and privacy boundaries"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true

@@ -1,21 +1,30 @@
 # Chatstronomy integration
 
-Status: Hub implementation proposed; **AutoPierCam 0.1.0 does not yet connect
+Status: Hub implementation merged; **AutoPierCam 0.1.0 does not yet connect
 to Chatstronomy**. Pairing a Hub device is not a working AutoPierCam connection
 until the client and local sharing controls below are implemented.
 
 The local `spacecat` checkout is `theatrus/chatstronomy`. Its centralized Hub
 lives in `src/hub`, not a separate `chatstronomy-hub` GitHub repository.
 
-Hub work is split into two stacked PRs:
+Hub work landed in two PRs:
 
 1. [Device pairing and channel management, #184](https://github.com/theatrus/chatstronomy/pull/184).
 2. [Bidirectional events and snapshot requests, #185](https://github.com/theatrus/chatstronomy/pull/185).
 
 The exact wire contract is maintained in
-[`docs/DEVICE_PROTOCOL.md` on the transport branch](https://github.com/theatrus/chatstronomy/blob/codex/piercam-event-transport/docs/DEVICE_PROTOCOL.md).
-The PRs are not deployed by creating them. Merge the foundation before the
-transport PR and retarget the transport PR to `main` after that merge.
+[`docs/DEVICE_PROTOCOL.md` on main](https://github.com/theatrus/chatstronomy/blob/main/docs/DEVICE_PROTOCOL.md).
+Both PRs were merged on 2026-09-25. Merging does not deploy the Hub.
+
+The first AutoPierCam implementation slice is the portable
+`autopiercam-chatstronomy` crate. It validates Hub origins, constructs the fixed
+pairing/WSS endpoints, models pairing/authentication and incoming messages,
+redacts credentials in debug output, and fences snapshot requests to local
+consent, capture session, freshness, JPEG size, and a monotonic deadline.
+Tests use protocol fixtures and synthetic metadata; there is no network worker
+or image transmission yet. This crate is not wired into the capture executable.
+OS credential storage, persistent installation identity, the HTTPS/WSS worker,
+WinUI consent/pairing controls, and event detection remain to be implemented.
 
 ## Boundaries
 
