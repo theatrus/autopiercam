@@ -24,6 +24,42 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 ignore-transitive-dependencies = false
 
+[rand.clarify]
+license = "MIT OR Apache-2.0"
+
+[[rand.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b"
+
+[[rand.clarify.files]]
+path = "COPYRIGHT"
+license = "MIT"
+checksum = "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+
+[rand_core.clarify]
+license = "MIT OR Apache-2.0"
+
+[[rand_core.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "8b6e9feec03e7c9a5facb26855cecd31662bf989b636bcfe79521bdf8ac863f0"
+
+[[rand_core.clarify.files]]
+path = "COPYRIGHT"
+license = "MIT"
+checksum = "92b81db30f7ab6d693e0af5661a40d273ca1947e891123ed823924192c10cbc7"
+
+# sync_wrapper's packaged Apache text omits the optional appendix; preserve
+# the exact source file rather than accepting the scanner's generic fallback.
+[sync_wrapper.clarify]
+license = "Apache-2.0"
+
+[[sync_wrapper.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+
 # Crate-specific, checksum-backed clarifications follow. They are deliberately
 # kept in this repository so a dependency update fails closed when upstream
 # licensing files change.
