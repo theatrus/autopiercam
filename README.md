@@ -245,8 +245,8 @@ healthy.
   converts accordingly.
 - The Viewer and N.I.N.A. panel distinguish settling, exposing, and stalled
   frames using exposure-aware deadlines. SDK readback is approximate telemetry,
-  not a frame-exact exposure measurement. The detected-camera list is read-only;
-  a camera-name filter selects a model when multiple cameras are attached. Max exposure,
+  not a frame-exact exposure measurement. The detected-camera picker saves an explicit
+  SDK camera ID and model; automatic mode uses the camera-name filter. Max exposure,
   max gain, still interval, managed-image and minimum-free-space limits, upload
   endpoint/enable, and video enable are backed by versioned configuration
   replacement. Capability checks keep new retention fields safe when the Viewer

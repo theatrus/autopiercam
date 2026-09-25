@@ -86,7 +86,8 @@ process abruptly.
 
 The C#/XAML WinUI 3 app is deliberately thin. The current application displays
 agent/camera state, frame counters, and the most recent artifact; it can request
-an immediate still, render the latest JPEG preview with exposure/gain metadata,
+an immediate still, pause/resume recording, select a detected camera even when
+selection has faulted, render the latest JPEG preview with exposure/gain metadata,
 and edit max exposure, max gain, still cadence, HTTP upload, and video
 enablement. It preserves all hidden configuration fields when it writes a
 complete replacement. The preview UI reports connecting, waiting, live,
@@ -100,7 +101,7 @@ and scheduled-capture suspension. The two optional byte limits are editable only
 when the connected agent advertises retention support. Planned additions include:
 
 - camera temperature;
-- camera and output settings with capability-aware ranges;
+- additional camera and output settings with capability-aware ranges;
 - segmented-video settings;
 - recent artifacts and recoverable errors.
 
