@@ -153,7 +153,12 @@ pub(crate) async fn run(shared: Arc<Shared>) {
             _ = changes.changed() => { outbox = None; attempt = 0; continue; }
             result = session(&shared, &settings, &origin, &credential, &mut outbox, epoch, &mut last_new_event) => result
         };
-        if matches!(result, Ok(false)) {
+        if matches!(&result, Ok(false))
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<crate::protocol::InvalidMessage>())
+        {
             status(
                 &shared,
                 "Hub rejected authentication/protocol; pair again or update",

@@ -644,3 +644,42 @@ async fn privacy_change_cancels_a_late_pairing_response_before_credential_storag
     assert!(client.status().device_id.is_none());
     assert!(!client.status().preferences.enabled);
 }
+
+#[tokio::test]
+async fn unsupported_hub_ready_version_requires_operator_action() {
+    let fixture = Fixture::paired().await;
+    let client = fixture.service.client();
+    let status = client.status();
+    client
+        .update(
+            status.revision,
+            Preferences {
+                enabled: true,
+                ..status.preferences
+            },
+        )
+        .unwrap();
+    let (stream, _) = fixture.listener.accept().await.unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    text(&mut socket).await;
+    socket
+        .send(Message::Text(
+            json!({"type":"ready","protocol_version":999,"device_id":42})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while !client.status().connection.contains("rejected") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        timeout(Duration::from_millis(1200), fixture.listener.accept())
+            .await
+            .is_err()
+    );
+}

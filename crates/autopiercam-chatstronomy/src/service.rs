@@ -252,8 +252,14 @@ impl SharingClient {
         // Cancel before disk I/O; a failed save must never leave sharing active.
         {
             let mut current = self.0.settings.write().unwrap();
+            if current.device_id != settings.device_id
+                || current.preferences.hub_origin != settings.preferences.hub_origin
+            {
+                *self.0.last_delivery.lock().unwrap() = None;
+            }
             current.preferences.enabled = false;
         }
+        *self.0.connection.lock().unwrap() = "Disabled".into();
         self.invalidate();
         persist(&self.0.path, &settings)?;
         *self.0.settings.write().unwrap() = settings;
