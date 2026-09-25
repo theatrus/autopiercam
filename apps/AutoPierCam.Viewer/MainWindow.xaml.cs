@@ -1519,6 +1519,7 @@ public sealed partial class MainWindow : Window
         bool generalControlsEnabled = !inProgress && !_closed;
         RefreshButton.IsEnabled = generalControlsEnabled;
         CaptureButton.IsEnabled = generalControlsEnabled;
+        SharingButton.IsEnabled = generalControlsEnabled && _latestAgentStatus?.HasCapability("sharing.get") == true;
 
         bool configurationControlsEnabled =
             generalControlsEnabled &&

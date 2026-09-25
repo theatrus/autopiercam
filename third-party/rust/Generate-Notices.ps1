@@ -60,7 +60,7 @@ try {
     $unexpectedFallbacks = @($jsonDiagnostics | Where-Object {
             $line = $_.ToString()
             $line -match 'falling back to canonical text' -and
-            $line -notmatch "crate 'autopiercam(?:-(?:asi|core|protocol|tray))? [^']+'"
+            $line -notmatch "crate 'autopiercam(?:-(?:asi|chatstronomy|core|protocol|tray))? [^']+'"
         })
     if ($unexpectedFallbacks.Count -ne 0) {
         throw "A third-party crate fell back to generic license text:`n$(Format-Diagnostics $unexpectedFallbacks)"

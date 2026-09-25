@@ -59,8 +59,87 @@ struct DispatchContext {
     config_store: ConfigStore,
 }
 
+fn sharing_response(request: Request, sharing: &autopiercam::SharingClient) -> Response {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Revision {
+        expected_revision: u64,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Configure {
+        expected_revision: u64,
+        preferences: autopiercam_chatstronomy::service::Preferences,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Pair {
+        expected_revision: u64,
+        pairing_token: autopiercam_chatstronomy::protocol::Secret,
+    }
+    if request.validate().is_err() {
+        return Response::failure(
+            request.request_id,
+            ErrorBody::new("invalid_request", "Invalid sharing request"),
+        );
+    }
+    let invalid = || "Invalid sharing request".to_owned();
+    let result = match request.method {
+        Method::SharingGet => Ok(sharing.status()),
+        Method::SharingConfigure => serde_json::from_value::<Configure>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .update(value.expected_revision, value.preferences)
+                    .map_err(|e| e.to_string())
+            }),
+        Method::SharingPair => serde_json::from_value::<Pair>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .pair(value.expected_revision, value.pairing_token)
+                    .map_err(|e| e.to_string())
+            }),
+        Method::SharingForget => serde_json::from_value::<Revision>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .forget(value.expected_revision)
+                    .map_err(|e| e.to_string())
+            }),
+        _ => Err(invalid()),
+    };
+    match result {
+        Ok(status) => Response::success(
+            request.request_id,
+            serde_json::to_value(status).expect("sharing status is serializable"),
+        ),
+        Err(message) => {
+            Response::failure(request.request_id, ErrorBody::new("sharing_error", message))
+        }
+    }
+}
+
 impl DispatchContext {
     fn dispatch(&self, request: Request) -> Response {
+        if matches!(
+            request.method,
+            Method::SharingGet
+                | Method::SharingConfigure
+                | Method::SharingPair
+                | Method::SharingForget
+        ) {
+            return match self.worker.sharing() {
+                Some(sharing) => sharing_response(request, &sharing),
+                None => Response::failure(
+                    request.request_id,
+                    ErrorBody::new(
+                        "sharing_unavailable",
+                        "Sharing could not start. Check the tray log and sharing settings, then restart the tray. Local capture is unaffected.",
+                    ),
+                ),
+            };
+        }
         dispatch(request, &self.worker, &self.monitor, &self.config_store)
     }
 }
@@ -380,7 +459,12 @@ fn dispatch(
         }
         Method::UploadsList => upload_list_response(request_id, request.payload, monitor),
         Method::UploadsRequeue => upload_requeue_response(request_id, request.payload, monitor),
-        Method::CamerasList | Method::ArtifactsList => Response::failure(
+        Method::CamerasList
+        | Method::ArtifactsList
+        | Method::SharingGet
+        | Method::SharingConfigure
+        | Method::SharingPair
+        | Method::SharingForget => Response::failure(
             request_id,
             ErrorBody::new(
                 "not_implemented",
@@ -616,7 +700,7 @@ async fn read_request(
     read_exact(server, &mut payload, stop).await?;
     serde_json::from_slice(&payload)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control request"))
 }
 
 async fn read_exact(
@@ -882,6 +966,35 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn sharing_ipc_is_revision_checked_redacted_and_separate_from_camera_config() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let original = fs::read(store.path()).unwrap();
+        let service = autopiercam::SharingService::start(store.path(), Arc::new(|| None)).unwrap();
+        let client = service.client();
+        let response = sharing_response(Request::new("sharing", Method::SharingGet), &client);
+        assert_eq!(response.result.unwrap()["preferences"]["enabled"], false);
+        let configure =
+            Request::new("configure", Method::SharingConfigure).with_payload(serde_json::json!({
+                "expected_revision": 1,
+                "preferences": { "hub_origin": "https://example.invalid", "enabled": false }
+            }));
+        assert!(sharing_response(configure.clone(), &client).error.is_none());
+        assert!(sharing_response(configure, &client).error.is_some());
+        assert_eq!(fs::read(store.path()).unwrap(), original);
+        let malformed = Request::new("pair", Method::SharingPair).with_payload(serde_json::json!({
+            "expected_revision": 2, "pairing_token": { "csdp_must_not_leak": true }
+        }));
+        let response = sharing_response(malformed, &client);
+        assert!(response.error.is_some());
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("csdp_must_not_leak")
+        );
+    }
+
     #[derive(Default)]
     struct TestCommands {
         sent: Mutex<Vec<TrayCommand>>,
@@ -1057,6 +1170,7 @@ mod tests {
                 CAPABILITY_UPLOADS_REQUEUE,
                 CAPABILITY_STORAGE_RETENTION,
                 CAPABILITY_EXPOSURE_PROGRESS,
+                "sharing.get",
                 "camera.adaptive_exposure",
                 "camera.raw16",
                 "video.ffmpeg"

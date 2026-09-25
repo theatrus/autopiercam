@@ -43,6 +43,7 @@ mod retention;
 mod upload;
 mod video;
 
+pub use autopiercam_chatstronomy::service::{SharingClient, SharingService};
 use exposure::{FrameWait, Settling, WaitDecision, poll_timeout_ms};
 use ledger_maintenance::LedgerLease;
 pub use ledger_maintenance::{
@@ -51,6 +52,31 @@ pub use ledger_maintenance::{
 };
 use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
+
+/// Adapt the existing preview to sharing without acquiring another SDK handle.
+pub fn sharing_frame(
+    preview: &PreviewHub,
+    monitor: &AgentMonitor,
+) -> Option<autopiercam_chatstronomy::service::Frame> {
+    if monitor.snapshot().state != AgentState::Capturing {
+        return None;
+    }
+    let frame = preview.snapshot().frame?;
+    Some(autopiercam_chatstronomy::service::Frame {
+        session: frame.metadata.session_generation,
+        sequence: frame.metadata.sequence,
+        captured_at_unix_ms: frame.metadata.captured_at_unix_ms,
+        exposure_us: frame.metadata.exposure_us,
+        gain: frame.metadata.gain,
+        mode: match frame.metadata.mode {
+            autopiercam_protocol::PreviewMode::Day => "day",
+            autopiercam_protocol::PreviewMode::Night => "night",
+            autopiercam_protocol::PreviewMode::Unknown => "unknown",
+        }
+        .into(),
+        jpeg: frame.jpeg.clone(),
+    })
+}
 use retention::{
     LocalOnlyRetentionAuthority, ProtectAllRetentionAuthority, RetentionAuthority,
     RetentionObserver, RetentionPolicy, RetentionPressure, RetentionSink, RetentionTelemetry,
@@ -302,6 +328,7 @@ impl AgentMonitor {
             CAPABILITY_UPLOADS_REQUEUE.to_owned(),
             CAPABILITY_STORAGE_RETENTION.to_owned(),
             CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
+            "sharing.get".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.raw16".to_owned(),
             "video.ffmpeg".to_owned(),
@@ -853,7 +880,34 @@ pub fn run_agent_with_monitor(
     control: &AgentControl,
     monitor: &AgentMonitor,
 ) -> Result<()> {
-    run_agent_with_optional_preview(sdk, config_path, max_frames, control, monitor, None)
+    let hub = PreviewHub::new();
+    let source_hub = hub.clone();
+    let source_monitor = monitor.clone();
+    let source_control = control.clone();
+    let sharing = SharingService::start(
+        config_path,
+        Arc::new(move || {
+            if source_control.is_paused() || source_control.is_shutdown() {
+                None
+            } else {
+                sharing_frame(&source_hub, &source_monitor)
+            }
+        }),
+    )
+    .map_err(|error| warn!(%error, "Chatstronomy disabled; local capture remains available"))
+    .ok();
+    let preview = sharing
+        .as_ref()
+        .is_some_and(|sharing| sharing.client().status().preferences.enabled)
+        .then(|| hub.begin_session());
+    run_agent_with_optional_preview(
+        sdk,
+        config_path,
+        max_frames,
+        control,
+        monitor,
+        preview.as_ref(),
+    )
 }
 
 /// Run the worker while publishing bounded, latest-only preview frames.
@@ -2231,6 +2285,7 @@ mod tests {
                 CAPABILITY_UPLOADS_REQUEUE.to_owned(),
                 CAPABILITY_STORAGE_RETENTION.to_owned(),
                 CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
+                "sharing.get".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.raw16".to_owned(),
                 "video.ffmpeg".to_owned()

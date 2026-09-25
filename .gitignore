@@ -7,3 +7,5 @@
 **/bin/
 **/obj/
 *.local.toml
+*.chatstronomy.json
+*.chatstronomy.lock
