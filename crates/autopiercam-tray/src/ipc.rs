@@ -459,8 +459,11 @@ fn dispatch(
         }
         Method::UploadsList => upload_list_response(request_id, request.payload, monitor),
         Method::UploadsRequeue => upload_requeue_response(request_id, request.payload, monitor),
-        Method::CamerasList
-        | Method::ArtifactsList
+        Method::CamerasList => Response::success(
+            request_id,
+            serde_json::to_value(monitor.cameras()).expect("camera inventory serializes"),
+        ),
+        Method::ArtifactsList
         | Method::SharingGet
         | Method::SharingConfigure
         | Method::SharingPair
@@ -1171,6 +1174,7 @@ mod tests {
                 CAPABILITY_STORAGE_RETENTION,
                 CAPABILITY_EXPOSURE_PROGRESS,
                 "sharing.get",
+                "cameras.list",
                 "camera.adaptive_exposure",
                 "camera.raw16",
                 "video.ffmpeg"
@@ -1370,10 +1374,45 @@ mod tests {
     }
 
     #[test]
+    fn camera_inventory_remains_available_when_selection_faults() {
+        let directory = TestDirectory::new();
+        let monitor = AgentMonitor::new();
+        let cameras = vec![
+            autopiercam_protocol::DetectedCamera {
+                id: 7,
+                name: "ZWO ASI676MC".into(),
+                is_color: true,
+            },
+            autopiercam_protocol::DetectedCamera {
+                id: 9,
+                name: "ZWO ASI662MC".into(),
+                is_color: true,
+            },
+        ];
+        monitor.report_camera_inventory(Ok(cameras.clone()));
+        monitor.report_fault("more than one connected camera matches the configuration");
+        let response = dispatch(
+            Request::new("cameras", Method::CamerasList),
+            &TestCommands::default(),
+            &monitor,
+            &directory.store(),
+        );
+        let inventory: autopiercam_protocol::CameraList =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(inventory.cameras, cameras);
+        assert!(inventory.scanned_at_unix_ms.is_some());
+        assert!(inventory.error.is_none());
+        assert!(monitor.snapshot().camera.is_none());
+        monitor.report_camera_inventory(Err("SDK unavailable".into()));
+        assert!(monitor.cameras().cameras.is_empty());
+        assert_eq!(monitor.cameras().error.as_deref(), Some("SDK unavailable"));
+    }
+
+    #[test]
     fn dispatch_returns_structured_error_for_future_methods() {
         let directory = TestDirectory::new();
         let response = dispatch(
-            Request::new("cameras-1", Method::CamerasList),
+            Request::new("artifacts-1", Method::ArtifactsList),
             &TestCommands::default(),
             &AgentMonitor::new(),
             &directory.store(),

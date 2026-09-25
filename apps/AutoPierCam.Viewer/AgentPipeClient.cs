@@ -56,6 +56,19 @@ internal sealed class AgentPipeClient : IAsyncDisposable
 
     internal string PipeName => _pipeName;
 
+    internal async Task<CameraInventory> GetCamerasAsync(CancellationToken cancellationToken = default)
+    {
+        CameraInventory inventory = DeserializeResult<CameraInventory>(
+            await RequestAsync("cameras.list", cancellationToken).ConfigureAwait(false), "cameras.list");
+        if (inventory.ScannedAtUnixMs is < 0 or > 253402300799999 ||
+            inventory.Cameras is null || inventory.Cameras.Any(camera => camera is null || camera.Id < 0 || string.IsNullOrWhiteSpace(camera.Name)) ||
+            inventory.Cameras.Select(camera => camera.Id).Distinct().Count() != inventory.Cameras.Count)
+        {
+            throw new AgentProtocolException("cameras.list returned an invalid camera inventory.");
+        }
+        return inventory;
+    }
+
     internal async Task<SharingStatus> GetSharingAsync(CancellationToken cancellationToken = default) =>
         DeserializeResult<SharingStatus>(await RequestAsync("sharing.get", cancellationToken).ConfigureAwait(false), "sharing.get");
 
@@ -170,6 +183,11 @@ internal sealed class AgentPipeClient : IAsyncDisposable
     internal async Task CaptureNowAsync(CancellationToken cancellationToken = default)
     {
         _ = await RequestAsync("capture.now", cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task SetPausedAsync(bool paused, CancellationToken cancellationToken = default)
+    {
+        _ = await RequestAsync(paused ? "capture.pause" : "capture.resume", cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<AgentConfigurationSnapshot> GetConfigurationAsync(

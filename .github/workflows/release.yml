@@ -49,6 +49,8 @@ jobs:
     # token carries a different subject and azure/login fails.
     environment: release
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
 
     steps:
       - uses: actions/checkout@v5
@@ -112,6 +114,8 @@ jobs:
       - name: Test N.I.N.A. and shared preview logic
         shell: bash
         run: dotnet test integrations/AutoPierCam.NINA/AutoPierCam.NINA.slnx --configuration Release
+      - name: Test Viewer camera selection and control protocol
+        run: dotnet test apps/AutoPierCam.Viewer.Tests --configuration Release
 
       - name: Test external H.264 encoder integration
         shell: pwsh
@@ -272,3 +276,41 @@ jobs:
           name: installer-diagnostics-${{ github.run_id }}
           path: ${{ env.AUTOPIERCAM_LIFECYCLE_DIAGNOSTICS }}/lifecycle-test-*/**/*.log
           if-no-files-found: ignore
+
+  registry:
+    name: Verify public NINA registry publication
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Wait for the shared registry to publish this exact plugin
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          $asset = "https://github.com/theatrus/autopiercam/releases/download/v$version/AutoPierCam.NINA.$version.0.manifest.json"
+          $expected = Invoke-RestMethod $asset
+          $hosts = @('https://nina-plugins.psf-guard.com', 'https://nina-plugins.pulsarfab.com')
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            $ready = $true
+            foreach ($registry in $hosts) {
+              try {
+                $catalog = Invoke-RestMethod "$registry/manifests.json" -TimeoutSec 15 -Headers @{ 'Cache-Control' = 'no-cache' }
+                $entry = @($catalog | Where-Object Identifier -eq $expected.Identifier)
+                if ($entry.Count -ne 1 -or $entry[0].Installer.URL -ne $expected.Installer.URL -or
+                    $entry[0].Installer.Checksum -ne $expected.Installer.Checksum -or
+                    $entry[0].Version.Major -ne $expected.Version.Major -or
+                    $entry[0].Version.Minor -ne $expected.Version.Minor -or
+                    $entry[0].Version.Patch -ne $expected.Version.Patch -or
+                    $entry[0].Version.Build -ne $expected.Version.Build) { $ready = $false }
+              } catch { $ready = $false }
+            }
+            if ($ready) { Write-Host "AutoPierCam $version verified on both public NINA registries"; exit 0 }
+            Start-Sleep -Seconds 30
+          }
+          throw 'Plugin assets are published, but registry verification timed out. Dispatch Publish AutoPierCam plugin in theatrus/nina-plugins-registry, inspect its result, and rerun this failed verification job. Do not overwrite release assets.'

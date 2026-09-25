@@ -695,7 +695,11 @@ fn run_camera(
         None => Sdk::load_default(),
     }
     .map(Arc::new)
-    .map_err(|error| format!("loading ZWO ASI SDK: {error}"))?;
+    .map_err(|error| {
+        let message = format!("loading ZWO ASI SDK: {error}");
+        monitor.report_camera_inventory(Err(message.clone()));
+        message
+    })?;
 
     run_agent_with_monitor_and_preview(
         &sdk,

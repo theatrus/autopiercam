@@ -487,6 +487,7 @@ public sealed partial class MainWindow : Window
         AgentConfigurationSnapshot snapshot =
             await _agentClient.GetConfigurationAsync(cancellationToken);
         ApplyConfiguration(snapshot);
+        await RefreshCamerasAsync(cancellationToken, false);
     }
 
     private async Task CaptureAndRefreshAsync(CancellationToken cancellationToken)
@@ -494,6 +495,25 @@ public sealed partial class MainWindow : Window
         await _agentClient.CaptureNowAsync(cancellationToken);
         StatusText.Text = "Capture request accepted; refreshing status and configuration…";
         await RefreshStatusAndConfigurationAsync(cancellationToken);
+    }
+
+    private async void PauseButton_Click(object sender, RoutedEventArgs args)
+    {
+        await RunUiOperationAsync("Updating recording state…", async cancellationToken =>
+        {
+            AgentStatus status = await _agentClient.GetStatusAsync(cancellationToken);
+            if (status.State is not ("capturing" or "paused"))
+            {
+                ApplyStatus(status);
+                throw new UserInputException("Wait for capture to start before pausing or resuming recording.");
+            }
+            bool paused = status.State != "paused";
+            await _agentClient.SetPausedAsync(paused, cancellationToken);
+            ApplyStatus(status with { State = paused ? "paused" : "capturing" });
+            StatusText.Text = paused
+                ? "Pause requested. Live preview continues; scheduled stills, video, and sharing pause."
+                : "Resume requested. Recording and permitted sharing will resume.";
+        });
     }
 
     private async Task SaveConfigurationAsync(CancellationToken cancellationToken)
@@ -1166,9 +1186,11 @@ public sealed partial class MainWindow : Window
                     ? AdaptiveExposureCheckBox.IsChecked == true ? "adaptive" : null : original.Camera.ExposureControl,
                 Raw16 = _latestAgentStatus?.HasCapability("camera.raw16") == true
                     ? Raw16CheckBox.IsChecked == true ? true : null : original.Camera.Raw16,
-                NameContains = string.IsNullOrWhiteSpace(CameraNameFilterTextBox.Text) ? null : CameraNameFilterTextBox.Text.Trim(),
-                CameraId = string.Equals(original.Camera.NameContains ?? string.Empty, CameraNameFilterTextBox.Text.Trim(), StringComparison.Ordinal)
-                    ? original.Camera.CameraId : null,
+                NameContains = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice { Id: not null } choice
+                    ? choice.NameFilter : NormalizeOptionalText(CameraNameFilterTextBox.Text),
+                CameraId = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice selection
+                    ? selection.Id : string.Equals(original.Camera.NameContains ?? string.Empty, CameraNameFilterTextBox.Text.Trim(), StringComparison.Ordinal)
+                        ? original.Camera.CameraId : null,
             },
             Capture = original.Capture with
             {
@@ -1226,18 +1248,6 @@ public sealed partial class MainWindow : Window
             status.Storage,
             status.HasCapability(AgentPipeClient.StorageRetentionCapability));
 
-        CameraComboBox.Items.Clear();
-        if (status.Camera is null)
-        {
-            CameraComboBox.SelectedIndex = -1;
-            CameraComboBox.PlaceholderText = "No camera reported by agent";
-        }
-        else
-        {
-            CameraComboBox.Items.Add($"{status.Camera.Id}: {Compact(status.Camera.Name)}");
-            CameraComboBox.SelectedIndex = 0;
-        }
-
         if (string.IsNullOrWhiteSpace(status.LastError))
         {
             AgentLastErrorText.Text = string.Empty;
@@ -1273,7 +1283,8 @@ public sealed partial class MainWindow : Window
         AgentLastErrorText.Text = "Start or restart the local capture agent and select Refresh.";
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Reconnect and refresh to load upload activity.");
-        CameraComboBox.Items.Clear();
+        _cameraInventoryLoaded = false;
+        CameraComboBox.ItemsSource = null;
         CameraComboBox.SelectedIndex = -1;
         CameraComboBox.PlaceholderText = "Agent offline";
         ConfigInfoBar.Title = "Configuration unavailable";
@@ -1519,6 +1530,8 @@ public sealed partial class MainWindow : Window
         bool generalControlsEnabled = !inProgress && !_closed;
         RefreshButton.IsEnabled = generalControlsEnabled;
         CaptureButton.IsEnabled = generalControlsEnabled;
+        PauseButton.IsEnabled = generalControlsEnabled && _latestAgentStatus?.State is "capturing" or "paused";
+        PauseButton.Content = _latestAgentStatus?.State == "paused" ? "Resume recording" : "Pause recording";
         SharingButton.IsEnabled = generalControlsEnabled && _latestAgentStatus?.HasCapability("sharing.get") == true;
 
         bool configurationControlsEnabled =
@@ -1529,7 +1542,8 @@ public sealed partial class MainWindow : Window
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
         AdaptiveExposureCheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
         Raw16CheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
-        CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled;
+        CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled &&
+            (!_cameraInventoryLoaded || CameraComboBox.SelectedItem is not CameraChoice { Id: not null });
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
@@ -1539,8 +1553,8 @@ public sealed partial class MainWindow : Window
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
 
-        // The detected camera is descriptive; the model filter is editable.
-        CameraComboBox.IsEnabled = false;
+        CameraComboBox.IsEnabled = configurationControlsEnabled && _cameraInventoryLoaded;
+        RefreshCamerasButton.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("cameras.list") == true;
     }
 
     private void ExposureControl_Changed(object sender, RoutedEventArgs args)

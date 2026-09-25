@@ -26,13 +26,29 @@ start-at-sign-in choice. The tray menu can open the Viewer, captures, and logs;
 pause capture; capture immediately; or stop the application. The Start menu
 also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
-If several ASI cameras are connected, open the Viewer and set **Camera name
-contains** to `ASI676MC` or `ASI662MC`, then save. AutoPierCam refuses ambiguous
-matches instead of choosing another imaging camera. For exposures beyond the
+If several ASI cameras are connected, choose the desired model and camera ID
+from the Viewer's **Camera** picker, then **Save settings** to restart capture.
+The picker works even when the agent reports an ambiguous-camera fault.
+**Refresh cameras** updates the list without discarding other unsaved settings;
+discovery runs every five seconds during capture, or on retries (up to 30 seconds)
+after a fault. A saved but disconnected camera stays selected as unavailable.
+Camera IDs can change after USB reconnects; reselect when needed. Identical-model
+cameras cannot be persistently distinguished by serial number yet.
+**Automatic (use model filter)** restores model-filter selection; ambiguous
+matches still fault instead of choosing another imaging camera.
+**Pause recording** pauses scheduled stills, video and sharing while keeping the
+preview live; **Capture now** remains an explicit request for a still.
+For exposures beyond the
 SDK's automatic ceiling, enable application-controlled exposure; see the
 [exposure guide](exposure.md).
 
 ## What is installed
+
+The NINA plugin is also published to the shared theatr.us plugin source:
+`https://nina-plugins.psf-guard.com/` (alias `https://nina-plugins.pulsarfab.com/`).
+Add one URL under NINA's **Options → General → Plugin Repositories**, then install
+**AutoPierCam** in Plugin Manager. The plugin requires the separately installed
+AutoPierCam agent; it does not own or configure the camera.
 
 Application files are installed for the current user at:
 
@@ -114,19 +130,19 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.0-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.1-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.0-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.1-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.0-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.1-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

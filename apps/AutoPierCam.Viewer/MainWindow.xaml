@@ -55,6 +55,7 @@
                     Click="CaptureButton_Click"
                     Content="Capture now"
                     Style="{StaticResource AccentButtonStyle}" />
+                <Button x:Name="PauseButton" Content="Pause recording" IsEnabled="False" Click="PauseButton_Click" />
             </StackPanel>
         </Grid>
 
@@ -173,7 +174,11 @@
                         <ComboBox
                             x:Name="CameraComboBox"
                             IsEnabled="False"
+                            HorizontalAlignment="Stretch"
+                            SelectionChanged="CameraComboBox_SelectionChanged"
                             PlaceholderText="Agent not connected" />
+                        <Button x:Name="RefreshCamerasButton" Content="Refresh cameras" IsEnabled="False" Click="RefreshCamerasButton_Click" />
+                        <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
                     </StackPanel>
                     <Border Padding="12" Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="4">
