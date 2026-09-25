@@ -173,6 +173,7 @@
                         <TextBlock Text="Camera" />
                         <ComboBox
                             x:Name="CameraComboBox"
+                            DisplayMemberPath="Label"
                             IsEnabled="False"
                             HorizontalAlignment="Stretch"
                             SelectionChanged="CameraComboBox_SelectionChanged"

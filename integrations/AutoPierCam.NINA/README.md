@@ -1,5 +1,19 @@
 # AutoPierCam for N.I.N.A.
 
+## Install from the shared registry
+
+Add `https://nina-plugins.psf-guard.com/` (alias
+`https://nina-plugins.pulsarfab.com/`) in NINA's **Options → General → Plugin
+Repositories**, then install **AutoPierCam** from Plugin Manager and restart NINA.
+Install the AutoPierCam capture agent separately using its signed MSI.
+
+Every stable plugin release must be published to `theatrus/nina-plugins-registry`.
+Its synchronization workflow verifies the release ZIP and updates the manifest;
+the AutoPierCam release workflow must confirm the exact version and checksum on
+both public registry aliases before reporting success.
+
+## About the plugin
+
 This N.I.N.A. 3.2 plugin adds a **Pier Camera** panel to the Imaging tab. It is
 a read-only viewer for the local AutoPierCam preview stream: N.I.N.A. does not
 open the ZWO camera, change exposure or gain, or compete with the AutoPierCam

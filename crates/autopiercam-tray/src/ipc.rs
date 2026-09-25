@@ -1234,6 +1234,8 @@ mod tests {
 
         let mut replacement = initial.config.clone();
         replacement.capture.interval_ms = 2_500;
+        replacement.camera.camera_id = Some(7);
+        replacement.camera.name_contains = Some("ZWO ASI676MC".into());
         let request = Request::new("config-replace-1", Method::ConfigReplace).with_payload(
             serde_json::to_value(ConfigReplace {
                 expected_revision: initial.revision,
@@ -1247,6 +1249,17 @@ mod tests {
         assert!(saved.restart_scheduled);
         assert_ne!(saved.revision, initial.revision);
         assert_eq!(store.snapshot().unwrap().config.capture.interval_ms, 2_500);
+        assert_eq!(store.snapshot().unwrap().config.camera.camera_id, Some(7));
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap()
+                .config
+                .camera
+                .name_contains
+                .as_deref(),
+            Some("ZWO ASI676MC")
+        );
         assert_eq!(commands.snapshot(), [TrayCommand::Restart]);
 
         replacement.capture.interval_ms = 5_000;
