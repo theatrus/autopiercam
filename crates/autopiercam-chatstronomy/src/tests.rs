@@ -594,3 +594,53 @@ fn jpeg_encoder_respects_remote_cap_and_rejects_malformed_input() {
     };
     assert!(crate::media::jpeg(&invalid, 524288).is_err());
 }
+
+#[tokio::test]
+async fn privacy_change_cancels_a_late_pairing_response_before_credential_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vault = Arc::new(MemoryStore::default());
+    let service = SharingService::start_with_store(
+        &directory.path().join("agent.toml"),
+        Arc::new(|| None),
+        vault.clone(),
+        TransportPolicy::AllowLoopbackHttp,
+    )
+    .unwrap();
+    let client = service.client();
+    let status = client
+        .update(
+            1,
+            Preferences {
+                hub_origin: format!("http://{}", listener.local_addr().unwrap()),
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+    let pair_client = client.clone();
+    let pairing = tokio::task::spawn_blocking(move || {
+        pair_client.pair(status.revision, Secret::new("csdp_cancelled".into()))
+    });
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut bytes = [0u8; 4096];
+    assert!(stream.read(&mut bytes).await.unwrap() > 0);
+    let current = client.status();
+    client
+        .update(current.revision, current.preferences)
+        .unwrap();
+    let body = r#"{"protocol_version":1,"device_id":42,"credential":"csdc_late_response"}"#;
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(pairing.await.unwrap().is_err());
+    assert!(vault.0.lock().unwrap().is_empty());
+    assert!(client.status().device_id.is_none());
+    assert!(!client.status().preferences.enabled);
+}

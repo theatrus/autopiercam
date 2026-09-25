@@ -966,6 +966,35 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn sharing_ipc_is_revision_checked_redacted_and_separate_from_camera_config() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let original = fs::read(store.path()).unwrap();
+        let service = autopiercam::SharingService::start(store.path(), Arc::new(|| None)).unwrap();
+        let client = service.client();
+        let response = sharing_response(Request::new("sharing", Method::SharingGet), &client);
+        assert_eq!(response.result.unwrap()["preferences"]["enabled"], false);
+        let configure =
+            Request::new("configure", Method::SharingConfigure).with_payload(serde_json::json!({
+                "expected_revision": 1,
+                "preferences": { "hub_origin": "https://example.invalid", "enabled": false }
+            }));
+        assert!(sharing_response(configure.clone(), &client).error.is_none());
+        assert!(sharing_response(configure, &client).error.is_some());
+        assert_eq!(fs::read(store.path()).unwrap(), original);
+        let malformed = Request::new("pair", Method::SharingPair).with_payload(serde_json::json!({
+            "expected_revision": 2, "pairing_token": { "csdp_must_not_leak": true }
+        }));
+        let response = sharing_response(malformed, &client);
+        assert!(response.error.is_some());
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("csdp_must_not_leak")
+        );
+    }
+
     #[derive(Default)]
     struct TestCommands {
         sent: Mutex<Vec<TrayCommand>>,
