@@ -114,19 +114,19 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.1.0-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.0-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.1.0-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.0-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.1.0-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.0-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

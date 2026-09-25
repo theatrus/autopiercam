@@ -1,8 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $MsiPath = (Join-Path `
-        $PSScriptRoot `
-        '..\artifacts\installer\output\AutoPierCam-0.1.0-x64.msi'),
+    [string] $MsiPath,
 
     # Must share the user-data volume: cleanup preserves identity using one
     # atomic directory rename, never a cross-volume copy/delete fallback.
@@ -1335,6 +1333,13 @@ if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
 }
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+if ([string]::IsNullOrWhiteSpace($MsiPath)) {
+    $manifestText = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.toml') -Raw
+    $versionMatch = [Regex]::Match($manifestText,
+        '(?ms)^\[workspace\.package\]\s*$.*?^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$')
+    if (-not $versionMatch.Success) { throw 'Unable to determine installer version from Cargo.toml.' }
+    $MsiPath = Join-Path $repositoryRoot ("artifacts\installer\output\AutoPierCam-{0}-x64.msi" -f $versionMatch.Groups['version'].Value)
+}
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
 if (-not (Test-Path -LiteralPath $resolvedMsiPath -PathType Leaf)) {
     throw "The MSI path is not a file: $resolvedMsiPath"

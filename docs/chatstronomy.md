@@ -3,8 +3,8 @@
 The current source implements Windows pairing, protected credentials, outbound
 HTTPS/WSS transport, Hub-requested snapshots, automatic scene/day-night posts,
 periodic images, chat-configurable triggers and telescope-event image bursts,
-and Viewer controls. **The published 0.1.0 installer predates this feature.**
-Use a build containing this change; no live sharing is enabled by installing it.
+and Viewer controls, included in **AutoPierCam 0.2.0**.
+No live sharing is enabled by installing or upgrading the application.
 
 The Hub implementation landed in
 [device pairing #184](https://github.com/theatrus/chatstronomy/pull/184) and

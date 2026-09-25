@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.1.0 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.0 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.1.0)](https://github.com/theatrus/autopiercam/releases/download/v0.1.0/AutoPierCam-0.1.0-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.1.0)
+[Download the signed Windows x64 installer (0.2.0)](https://github.com/theatrus/autopiercam/releases/download/v0.2.0/AutoPierCam-0.2.0-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.0)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -66,10 +66,10 @@ The repository now contains a hardware-validated background capture slice:
 
 ## Install on Windows
 
-Current source builds include opt-in Chatstronomy image sharing: choose
-**Chatstronomy** in the Viewer to pair, allow Hub snapshots, or enable scene and
-day/night posts. See the [setup and privacy guide](docs/chatstronomy.md).
-This feature is not part of the published 0.1.0 installer.
+Version 0.2.0 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
+in the Viewer to pair, allow snapshots, periodic images, scene/day-night posts,
+or telescope-event bursts. Chat configuration requires explicit local permission
+and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
 
 The x64 MSI installs AutoPierCam for the current Windows user under
 `%LOCALAPPDATA%\Programs\AutoPierCam`. It includes the ZWO SDK runtime and a
