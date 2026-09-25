@@ -26,6 +26,7 @@ jobs:
           cargo test --workspace --all-targets --locked
       - run: dotnet build apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj --configuration Release -p:Platform=x64
       - run: dotnet test integrations/AutoPierCam.NINA/AutoPierCam.NINA.slnx --configuration Release
+      - run: dotnet test apps/AutoPierCam.Viewer.Tests --configuration Release
   portable:
     name: Portable client and security audit
     runs-on: ubuntu-latest

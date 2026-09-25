@@ -13,9 +13,9 @@ use autopiercam_core::{
 };
 use autopiercam_protocol::{
     AgentState, AgentStatus, CAPABILITY_EXPOSURE_PROGRESS, CAPABILITY_STORAGE_RETENTION,
-    CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, StatusCamera, StatusExposure,
-    StatusStorage, StatusUpload, StoragePressure, UploadListRequest, UploadListResponse,
-    UploadRequeueRequest, UploadRequeueResult,
+    CAPABILITY_UPLOADS_LIST, CAPABILITY_UPLOADS_REQUEUE, CameraList, DetectedCamera, StatusCamera,
+    StatusExposure, StatusStorage, StatusUpload, StoragePressure, UploadListRequest,
+    UploadListResponse, UploadRequeueRequest, UploadRequeueResult,
 };
 use image::{
     ColorType, ImageEncoder,
@@ -166,6 +166,7 @@ impl AgentControl {
 #[derive(Clone, Debug)]
 pub struct AgentMonitor {
     inner: Arc<RwLock<AgentStatus>>,
+    cameras: Arc<RwLock<CameraList>>,
     capturing_generation: Arc<AtomicU64>,
     upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
     upload_admin_generation: Arc<AtomicU64>,
@@ -329,12 +330,14 @@ impl AgentMonitor {
             CAPABILITY_STORAGE_RETENTION.to_owned(),
             CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
             "sharing.get".to_owned(),
+            "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.raw16".to_owned(),
             "video.ffmpeg".to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
+            cameras: Arc::new(RwLock::new(CameraList::default())),
             capturing_generation: Arc::new(AtomicU64::new(0)),
             upload_admin: Arc::new(RwLock::new(None)),
             upload_admin_generation: Arc::new(AtomicU64::new(0)),
@@ -346,6 +349,46 @@ impl AgentMonitor {
             Ok(status) => status.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    pub fn cameras(&self) -> CameraList {
+        self.cameras
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Called only by the SDK-owning thread, never by an IPC client.
+    pub fn report_camera_inventory(&self, result: Result<Vec<DetectedCamera>, String>) {
+        let (cameras, error) = match result {
+            Ok(cameras) => (cameras, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        *self.cameras.write().unwrap_or_else(|e| e.into_inner()) = CameraList {
+            cameras,
+            scanned_at_unix_ms: Some(unix_time_millis()),
+            error,
+        };
+    }
+
+    fn scan_cameras(&self, sdk: &Sdk) -> Result<Vec<CameraInfo>> {
+        let result = sdk.cameras();
+        self.report_camera_inventory(
+            result
+                .as_ref()
+                .map(|cameras| {
+                    cameras
+                        .iter()
+                        .map(|camera| DetectedCamera {
+                            id: camera.camera_id,
+                            name: camera.name.clone(),
+                            is_color: camera.is_color,
+                        })
+                        .collect()
+                })
+                .map_err(ToString::to_string),
+        );
+        Ok(result?)
     }
 
     /// Publish a host-level startup or transport failure before camera setup.
@@ -779,6 +822,8 @@ struct CaptureObserver<'a> {
     next_preview: Instant,
     adaptive: Option<AdaptiveExposure>,
     video: Option<&'a video::VideoWorker>,
+    inventory_sdk: Option<&'a Sdk>,
+    next_inventory: Instant,
 }
 
 impl<'a> CaptureObserver<'a> {
@@ -794,6 +839,17 @@ impl<'a> CaptureObserver<'a> {
             next_preview: Instant::now(),
             adaptive: None,
             video: None,
+            inventory_sdk: None,
+            next_inventory: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    fn refresh_inventory(&mut self) {
+        if Instant::now() >= self.next_inventory {
+            if let (Some(sdk), Some(monitor)) = (self.inventory_sdk, self.monitor) {
+                let _ = monitor.scan_cameras(sdk);
+            }
+            self.next_inventory = Instant::now() + Duration::from_secs(5);
         }
     }
 
@@ -959,6 +1015,8 @@ fn run_agent_inner(
     monitor: &AgentMonitor,
     preview: Option<&PreviewSession>,
 ) -> Result<()> {
+    // Publish all choices before configuration/selection/open can fail.
+    let cameras = monitor.scan_cameras(sdk)?;
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
     }
@@ -1017,7 +1075,7 @@ fn run_agent_inner(
         Some((worker, sink)) => (Some(worker), Some(sink)),
         None => (None, None),
     };
-    let info = select_configured_camera(sdk, &config.camera)?;
+    let info = select_configured_camera(cameras, &config.camera)?;
     if !info.is_color {
         bail!(
             "{} is not a color camera; AutoPierCam requires a color ASI camera",
@@ -1130,6 +1188,7 @@ fn run_agent_inner(
         "continuous capture worker started"
     );
     let capture_result = capture_loop(
+        sdk,
         &mut camera,
         bayer,
         auto_limits,
@@ -1196,6 +1255,7 @@ fn acquire_disabled_upload_ledger_lease(
 
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
+    sdk: &Sdk,
     camera: &mut Camera,
     bayer: BayerPattern,
     auto_limits: AutoLimits,
@@ -1221,6 +1281,7 @@ fn capture_loop(
             config.camera.settle_frames,
         );
         let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+        observer.inventory_sdk = Some(sdk);
         observer.video = video;
         if config.camera.exposure_control == ExposureControl::Adaptive {
             observer.adaptive = Some(AdaptiveExposure::new(
@@ -1262,6 +1323,7 @@ fn capture_loop(
         let mut queued = 0_u64;
 
         while !control.is_shutdown() {
+            observer.refresh_inventory();
             if video.is_some_and(video::VideoWorker::is_finished) {
                 bail!("video worker stopped unexpectedly");
             }
@@ -1379,6 +1441,7 @@ fn wait_for_auto_settle(
     let mut frame_buffer = Vec::new();
     let mut latest: Option<CompletedFrame> = None;
     loop {
+        observer.refresh_inventory();
         if observer.video.is_some_and(video::VideoWorker::is_finished) {
             bail!("video worker stopped while exposure was settling");
         }
@@ -1693,8 +1756,8 @@ fn select_camera(sdk: &Arc<Sdk>, camera_id: Option<i32>) -> Result<CameraInfo> {
     }
 }
 
-fn select_configured_camera(sdk: &Arc<Sdk>, config: &CameraConfig) -> Result<CameraInfo> {
-    let mut cameras = sdk.cameras()?.into_iter().filter(|camera| {
+fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> Result<CameraInfo> {
+    let mut cameras = cameras.into_iter().filter(|camera| {
         config
             .camera_id
             .is_none_or(|camera_id| camera.camera_id == camera_id)
@@ -1709,7 +1772,9 @@ fn select_configured_camera(sdk: &Arc<Sdk>, config: &CameraConfig) -> Result<Cam
         .next()
         .ok_or_else(|| anyhow!("no connected camera matches the configuration"))?;
     if cameras.next().is_some() {
-        bail!("more than one connected camera matches the configuration");
+        bail!(
+            "more than one connected camera matches the configuration; choose a camera in the Viewer and save settings"
+        );
     }
     Ok(selected)
 }
@@ -2079,6 +2144,77 @@ fn camera_json(camera: &CameraInfo) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    fn detected_camera(id: i32, name: &str) -> CameraInfo {
+        CameraInfo {
+            camera_id: id,
+            name: name.into(),
+            max_width: 1,
+            max_height: 1,
+            is_color: true,
+            bayer_pattern: AsiBayerPattern::Rg,
+            supported_bins: vec![1],
+            supported_formats: vec![ImageType::Raw8],
+            pixel_size_um: 1.0,
+            has_mechanical_shutter: false,
+            has_st4_port: false,
+            is_cooled: false,
+            is_usb3_camera: true,
+            bit_depth: 8,
+            is_trigger_camera: false,
+        }
+    }
+
+    #[test]
+    fn selection_requires_disambiguation_and_honors_both_saved_fields() {
+        let cameras = vec![
+            detected_camera(3, "ASI676MC"),
+            detected_camera(7, "ASI662MC"),
+        ];
+        let mut config = CameraConfig {
+            camera_id: None,
+            name_contains: None,
+            ..CameraConfig::default()
+        };
+        assert!(
+            select_configured_camera(cameras.clone(), &config)
+                .unwrap_err()
+                .to_string()
+                .contains("choose a camera")
+        );
+        config.camera_id = Some(7);
+        config.name_contains = Some("asi662".into());
+        assert_eq!(
+            select_configured_camera(cameras.clone(), &config)
+                .unwrap()
+                .camera_id,
+            7
+        );
+        config.name_contains = Some("ASI676".into());
+        assert!(select_configured_camera(cameras.clone(), &config).is_err());
+        config.camera_id = Some(99);
+        assert!(select_configured_camera(cameras, &config).is_err());
+        assert!(select_configured_camera(vec![], &CameraConfig::default()).is_err());
+    }
+
+    #[test]
+    fn duplicate_models_can_be_selected_by_id() {
+        let cameras = vec![
+            detected_camera(3, "ASI676MC"),
+            detected_camera(7, "ASI676MC"),
+        ];
+        let config = CameraConfig {
+            camera_id: Some(7),
+            name_contains: Some("ASI676MC".into()),
+            ..CameraConfig::default()
+        };
+        assert_eq!(
+            select_configured_camera(cameras, &config)
+                .unwrap()
+                .camera_id,
+            7
+        );
+    }
+
     #[test]
     fn raw16_png_roundtrip_preserves_low_sensor_bits() {
         let directory = tempfile::tempdir().unwrap();
@@ -2286,6 +2422,7 @@ mod tests {
                 CAPABILITY_STORAGE_RETENTION.to_owned(),
                 CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
                 "sharing.get".to_owned(),
+                "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.raw16".to_owned(),
                 "video.ffmpeg".to_owned()

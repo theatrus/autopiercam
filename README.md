@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.0 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.1 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.0)](https://github.com/theatrus/autopiercam/releases/download/v0.2.0/AutoPierCam-0.2.0-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.0)
+[Download the signed Windows x64 installer (0.2.1)](https://github.com/theatrus/autopiercam/releases/download/v0.2.1/AutoPierCam-0.2.1-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.1)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -64,9 +64,15 @@ The repository now contains a hardware-validated background capture slice:
 - a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
   Camera** panel to the Imaging tab.
 
+Version 0.2.1 adds a detected-camera picker that works through camera-selection
+faults, plus Pause/Resume recording in the Viewer. Select your camera and **Save
+settings** to restart capture. The NINA plugin is available in the shared
+[theatr.us registry](https://nina-plugins.psf-guard.com/), also served at
+[nina-plugins.pulsarfab.com](https://nina-plugins.pulsarfab.com/).
+
 ## Install on Windows
 
-Version 0.2.0 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
+Version 0.2.1 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
 in the Viewer to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
@@ -239,8 +245,8 @@ healthy.
   converts accordingly.
 - The Viewer and N.I.N.A. panel distinguish settling, exposing, and stalled
   frames using exposure-aware deadlines. SDK readback is approximate telemetry,
-  not a frame-exact exposure measurement. The detected-camera list is read-only;
-  a camera-name filter selects a model when multiple cameras are attached. Max exposure,
+  not a frame-exact exposure measurement. The detected-camera picker saves an explicit
+  SDK camera ID and model; automatic mode uses the camera-name filter. Max exposure,
   max gain, still interval, managed-image and minimum-free-space limits, upload
   endpoint/enable, and video enable are backed by versioned configuration
   replacement. Capability checks keep new retention fields safe when the Viewer

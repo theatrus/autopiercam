@@ -1,5 +1,19 @@
 # AutoPierCam for N.I.N.A.
 
+## Install from the shared registry
+
+Add `https://nina-plugins.psf-guard.com/` (alias
+`https://nina-plugins.pulsarfab.com/`) in NINA's **Options → General → Plugin
+Repositories**, then install **AutoPierCam** from Plugin Manager and restart NINA.
+Install the AutoPierCam capture agent separately using its signed MSI.
+
+Every stable plugin release must be published to `theatrus/nina-plugins-registry`.
+Its synchronization workflow verifies the release ZIP and updates the manifest;
+the AutoPierCam release workflow must confirm the exact version and checksum on
+both public registry aliases before reporting success.
+
+## About the plugin
+
 This N.I.N.A. 3.2 plugin adds a **Pier Camera** panel to the Imaging tab. It is
 a read-only viewer for the local AutoPierCam preview stream: N.I.N.A. does not
 open the ZWO camera, change exposure or gain, or compete with the AutoPierCam
@@ -57,11 +71,11 @@ Copying into a live N.I.N.A. plugin directory is deliberately opt-in:
 
 Build a release archive and SHA-256 N.I.N.A. manifest:
 
-    ./build-nina-package.ps1 -Version 0.2.0.0
+    ./build-nina-package.ps1 -Version 0.2.1.0
 
 The default download URL uses the matching three-part product release tag
-(`v0.2.0` in this example) while the plugin archive and manifest retain the
-four-part N.I.N.A. version. Pass `-ReleaseTag v0.2.0-preview.1` when packaging
+(`v0.2.1` in this example) while the plugin archive and manifest retain the
+four-part N.I.N.A. version. Pass `-ReleaseTag v0.2.1-preview.1` when packaging
 a prerelease of that product version. Its three numeric components must continue
 to match `-Version`. The manifest also defaults to the repository's published
 AutoPierCam featured image; pass `-FeaturedImageUrl` only when a release needs

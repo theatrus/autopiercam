@@ -32,14 +32,25 @@ Implemented methods:
 - capture.now
 - config.get
 - config.replace
+- cameras.list
 - uploads.list
 - uploads.requeue
 - agent.shutdown
 
 Reserved methods currently return a structured `not_implemented` error:
 
-- cameras.list
 - artifacts.list
+
+`cameras.list` (capability `cameras.list`) returns `{ cameras: [{ id, name,
+is_color }], scanned_at_unix_ms, error }`. The capture thread publishes this
+inventory before selecting/opening a camera, including when selection faults.
+IPC only reads the cached inventory; it never opens a camera or calls the SDK.
+Discovery refreshes every five seconds while capturing/settling, including long
+exposure waits, and on supervised retry after faults (up to 30 seconds).
+An enumeration/SDK-load failure clears the list and records an error. A null
+scan timestamp means discovery has not run yet. An empty successful list means
+no cameras were found. Selecting a camera uses the existing revision-checked
+`config.replace` with `camera_id` and a matching `name_contains`, then restarts.
 
 `status.get` returns:
 

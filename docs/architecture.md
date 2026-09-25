@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.0. Yann
+The product name is AutoPierCam and the current release line is 0.2.1. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
@@ -86,7 +86,8 @@ process abruptly.
 
 The C#/XAML WinUI 3 app is deliberately thin. The current application displays
 agent/camera state, frame counters, and the most recent artifact; it can request
-an immediate still, render the latest JPEG preview with exposure/gain metadata,
+an immediate still, pause/resume recording, select a detected camera even when
+selection has faulted, render the latest JPEG preview with exposure/gain metadata,
 and edit max exposure, max gain, still cadence, HTTP upload, and video
 enablement. It preserves all hidden configuration fields when it writes a
 complete replacement. The preview UI reports connecting, waiting, live,
@@ -100,7 +101,7 @@ and scheduled-capture suspension. The two optional byte limits are editable only
 when the connected agent advertises retention support. Planned additions include:
 
 - camera temperature;
-- camera and output settings with capability-aware ranges;
+- additional camera and output settings with capability-aware ranges;
 - segmented-video settings;
 - recent artifacts and recoverable errors.
 

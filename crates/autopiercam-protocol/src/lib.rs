@@ -226,6 +226,21 @@ pub struct StatusCamera {
     pub name: String,
 }
 
+/// Last SDK enumeration, independent of whether a camera could be selected/opened.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CameraList {
+    pub cameras: Vec<DetectedCamera>,
+    pub scanned_at_unix_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DetectedCamera {
+    pub id: i32,
+    pub name: String,
+    pub is_color: bool,
+}
+
 /// Durable outbox telemetry for the optional HTTP upload worker.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
