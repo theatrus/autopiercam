@@ -56,6 +56,18 @@ internal sealed class AgentPipeClient : IAsyncDisposable
 
     internal string PipeName => _pipeName;
 
+    internal async Task<SharingStatus> GetSharingAsync(CancellationToken cancellationToken = default) =>
+        DeserializeResult<SharingStatus>(await RequestAsync("sharing.get", cancellationToken).ConfigureAwait(false), "sharing.get");
+
+    internal async Task<SharingStatus> ConfigureSharingAsync(ulong revision, SharingPreferences preferences, CancellationToken cancellationToken = default) =>
+        DeserializeResult<SharingStatus>(await RequestAsync("sharing.configure", new { expected_revision = revision, preferences }, cancellationToken).ConfigureAwait(false), "sharing.configure");
+
+    internal async Task<SharingStatus> PairSharingAsync(ulong revision, string code, CancellationToken cancellationToken = default) =>
+        DeserializeResult<SharingStatus>(await RequestAsync("sharing.pair", new { expected_revision = revision, pairing_token = code }, cancellationToken).ConfigureAwait(false), "sharing.pair");
+
+    internal async Task<SharingStatus> ForgetSharingAsync(ulong revision, CancellationToken cancellationToken = default) =>
+        DeserializeResult<SharingStatus>(await RequestAsync("sharing.forget", new { expected_revision = revision }, cancellationToken).ConfigureAwait(false), "sharing.forget");
+
     internal async Task<AgentStatus> GetStatusAsync(CancellationToken cancellationToken = default)
     {
         JsonElement result = await RequestAsync("status.get", cancellationToken).ConfigureAwait(false);

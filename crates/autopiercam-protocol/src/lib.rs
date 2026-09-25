@@ -61,15 +61,33 @@ pub enum Method {
     UploadsRequeue,
     #[serde(rename = "agent.shutdown")]
     AgentShutdown,
+    #[serde(rename = "sharing.get")]
+    SharingGet,
+    #[serde(rename = "sharing.configure")]
+    SharingConfigure,
+    #[serde(rename = "sharing.pair")]
+    SharingPair,
+    #[serde(rename = "sharing.forget")]
+    SharingForget,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub version: u16,
     pub request_id: String,
     pub method: Method,
     #[serde(default = "empty_object")]
     pub payload: Value,
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("version", &self.version)
+            .field("method", &self.method)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Request {
@@ -1227,6 +1245,10 @@ impl fmt::Display for Method {
             Self::UploadsList => METHOD_UPLOADS_LIST,
             Self::UploadsRequeue => METHOD_UPLOADS_REQUEUE,
             Self::AgentShutdown => "agent.shutdown",
+            Self::SharingGet => "sharing.get",
+            Self::SharingConfigure => "sharing.configure",
+            Self::SharingPair => "sharing.pair",
+            Self::SharingForget => "sharing.forget",
         };
         formatter.write_str(name)
     }
@@ -1237,6 +1259,20 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
+
+    #[test]
+    fn sharing_pair_request_debug_redacts_code_and_request_id() {
+        let request = Request::new("private-request-id", Method::SharingPair).with_payload(json!({
+            "expected_revision": 1, "pairing_token": "csdp_private"
+        }));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("csdp_private"));
+        assert!(!debug.contains("private-request-id"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["method"],
+            "sharing.pair"
+        );
+    }
 
     fn preview_metadata() -> PreviewMetadata {
         PreviewMetadata {

@@ -43,6 +43,10 @@
                 Orientation="Horizontal"
                 Spacing="8">
                 <Button
+                    x:Name="SharingButton"
+                    Click="SharingButton_Click"
+                    Content="Chatstronomy" />
+                <Button
                     x:Name="RefreshButton"
                     Click="RefreshButton_Click"
                     Content="Refresh" />

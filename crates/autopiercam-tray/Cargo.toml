@@ -13,6 +13,7 @@ publish = false
 
 [target.'cfg(target_os = "windows")'.dependencies]
 autopiercam = { path = "../autopiercam" }
+autopiercam-chatstronomy = { path = "../autopiercam-chatstronomy" }
 autopiercam-asi = { path = "../autopiercam-asi" }
 autopiercam-core = { path = "../autopiercam-core" }
 autopiercam-protocol = { path = "../autopiercam-protocol" }
@@ -29,3 +30,6 @@ windows-sys.workspace = true
 
 [build-dependencies]
 embed-resource.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -47,6 +47,7 @@ pub(crate) enum WorkerEvent {
 
 #[derive(Clone)]
 pub(crate) struct WorkerClient {
+    sharing: Option<autopiercam::SharingClient>,
     commands: Arc<Mutex<Sender<TrayCommand>>>,
     monitor: AgentMonitor,
     preview: PreviewHub,
@@ -56,6 +57,8 @@ pub(crate) struct WorkerClient {
 
 #[derive(Debug, Default)]
 struct WorkerSignals {
+    sharing_paused: AtomicBool,
+    sharing_min_sequence: AtomicU64,
     restart_pending: AtomicBool,
     start_admission: Mutex<()>,
     stopping: AtomicBool,
@@ -74,6 +77,22 @@ impl WorkerClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.signals.stopping.load(Ordering::Acquire) {
             return Err(WorkerStopped);
+        }
+        if let TrayCommand::SetPaused(paused) = command {
+            self.signals.sharing_paused.store(paused, Ordering::Release);
+        }
+        if command != TrayCommand::CaptureNow {
+            let sequence = self
+                .preview
+                .snapshot()
+                .frame
+                .map_or(0, |frame| frame.metadata.sequence);
+            self.signals
+                .sharing_min_sequence
+                .store(sequence, Ordering::Release);
+            if let Some(sharing) = &self.sharing {
+                sharing.invalidate();
+            }
         }
         match command {
             TrayCommand::Restart if self.signals.restart_pending.swap(true, Ordering::AcqRel) => {
@@ -94,6 +113,10 @@ impl WorkerClient {
 
     pub(crate) fn monitor(&self) -> AgentMonitor {
         self.monitor.clone()
+    }
+
+    pub(crate) fn sharing(&self) -> Option<autopiercam::SharingClient> {
+        self.sharing.clone()
     }
 
     pub(crate) fn preview(&self) -> PreviewHub {
@@ -144,6 +167,30 @@ where
     let monitor = AgentMonitor::new();
     let preview = PreviewHub::new();
     let signals = Arc::new(WorkerSignals::default());
+    let sharing_preview = preview.clone();
+    let sharing_monitor = monitor.clone();
+    let sharing_signals = signals.clone();
+    let sharing_service = autopiercam::SharingService::start(
+        &options.config_path,
+        Arc::new(move || {
+            if sharing_signals.sharing_paused.load(Ordering::Acquire)
+                || sharing_signals.stopping.load(Ordering::Acquire)
+                || sharing_signals.restart_pending.load(Ordering::Acquire)
+            {
+                return None;
+            }
+            autopiercam::sharing_frame(&sharing_preview, &sharing_monitor).filter(|frame| {
+                frame.sequence > sharing_signals.sharing_min_sequence.load(Ordering::Acquire)
+            })
+        }),
+    )
+    .map_err(
+        |error| tracing::warn!(%error, "Chatstronomy disabled; local capture remains available"),
+    )
+    .ok();
+    let sharing = sharing_service
+        .as_ref()
+        .map(autopiercam::SharingService::client);
 
     let supervisor_monitor = monitor.clone();
     let supervisor_preview = preview.clone();
@@ -151,6 +198,7 @@ where
     let thread = thread::Builder::new()
         .name("autopiercam-supervisor".to_owned())
         .spawn(move || {
+            let _sharing_service = sharing_service;
             let mut last_status = None;
             let result = catch_unwind(AssertUnwindSafe(|| {
                 supervise_camera(
@@ -175,6 +223,7 @@ where
         })?;
 
     Ok(WorkerClient {
+        sharing,
         commands: Arc::new(Mutex::new(commands)),
         monitor,
         preview,
@@ -707,7 +756,14 @@ mod tests {
     #[test]
     fn accepting_shutdown_rejects_every_later_command() {
         let (sender, receiver) = mpsc::channel();
+        let directory = tempfile::tempdir().unwrap();
+        let sharing = autopiercam::SharingService::start(
+            &directory.path().join("config.toml"),
+            Arc::new(|| None),
+        )
+        .unwrap();
         let client = WorkerClient {
+            sharing: Some(sharing.client()),
             commands: Arc::new(Mutex::new(sender)),
             monitor: AgentMonitor::new(),
             preview: PreviewHub::new(),
@@ -724,8 +780,15 @@ mod tests {
     #[test]
     fn repeated_restart_requests_are_coalesced_until_dequeued() {
         let (sender, receiver) = mpsc::channel();
+        let directory = tempfile::tempdir().unwrap();
+        let sharing = autopiercam::SharingService::start(
+            &directory.path().join("config.toml"),
+            Arc::new(|| None),
+        )
+        .unwrap();
         let signals = Arc::new(WorkerSignals::default());
         let client = WorkerClient {
+            sharing: Some(sharing.client()),
             commands: Arc::new(Mutex::new(sender)),
             monitor: AgentMonitor::new(),
             preview: PreviewHub::new(),

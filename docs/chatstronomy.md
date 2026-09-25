@@ -1,128 +1,128 @@
-# Chatstronomy integration
+# Chatstronomy image sharing
 
-Status: Hub implementation merged; **AutoPierCam 0.1.0 does not yet connect
-to Chatstronomy**. Pairing a Hub device is not a working AutoPierCam connection
-until the client and local sharing controls below are implemented.
+The current source implements Windows pairing, protected credentials, outbound
+HTTPS/WSS transport, Hub-requested snapshots, automatic scene/day-night posts,
+and Viewer controls. **The published 0.1.0 installer predates this feature.**
+Use a build containing this change; no live sharing is enabled by installing it.
 
-The local `spacecat` checkout is `theatrus/chatstronomy`. Its centralized Hub
-lives in `src/hub`, not a separate `chatstronomy-hub` GitHub repository.
+The Hub implementation landed in
+[device pairing #184](https://github.com/theatrus/chatstronomy/pull/184) and
+[bidirectional transport #185](https://github.com/theatrus/chatstronomy/pull/185).
+Deploy a Hub containing both changes before pairing. The authoritative
+[wire protocol](https://github.com/theatrus/chatstronomy/blob/main/docs/DEVICE_PROTOCOL.md)
+is in the Chatstronomy repository (the local Spacecat checkout). Merging a PR
+does not deploy the Hub.
 
-Hub work landed in two PRs:
+## Setup
 
-1. [Device pairing and channel management, #184](https://github.com/theatrus/chatstronomy/pull/184).
-2. [Bidirectional events and snapshot requests, #185](https://github.com/theatrus/chatstronomy/pull/185).
+1. In the Hub's **Observatory devices** page, create a pier camera and generate
+   a one-use pairing code. Select its Discord destination channels. Register the
+   server under Discord delivery first; adding destinations requires server
+   management permission and a live bot/channel check.
+2. In the AutoPierCam Viewer, choose **Chatstronomy**, enter the Hub HTTPS origin
+   (for example `https://hub.example.org`), paste the code, and choose **Pair camera**.
+   Pairing resets all sharing permissions to off.
+3. Explicitly enable **Connect and permit image sharing** and whichever
+   permissions you want: Hub snapshot requests, scene-change posts, and/or stable
+   day/night transitions. Choose **Save permissions**.
+4. Use **Refresh status / reload settings** to see the connection, device ID,
+   installation ID, and latest confirmed delivery. The Hub's **Snapshot now**
+   button sends the completed preview to that device's selected channels.
 
-The exact wire contract is maintained in
-[`docs/DEVICE_PROTOCOL.md` on main](https://github.com/theatrus/chatstronomy/blob/main/docs/DEVICE_PROTOCOL.md).
-Both PRs were merged on 2026-09-25. Merging does not deploy the Hub.
+Only the entire preview is shared; there is no privacy mask or cropped sharing
+region in this version. Never enable sharing if the full preview contains
+something you do not want in those channels. The camera's credential does not
+authorize telescope commands, and the Hub cannot enable local permissions.
 
-The first AutoPierCam implementation slice is the portable
-`autopiercam-chatstronomy` crate. It validates Hub origins, constructs the fixed
-pairing/WSS endpoints, models pairing/authentication and incoming messages,
-redacts credentials in debug output, and fences snapshot requests to local
-consent, capture session, freshness, JPEG size, and a monotonic deadline.
-Tests use protocol fixtures and synthetic metadata; there is no network worker
-or image transmission yet. This crate is not wired into the capture executable.
-OS credential storage, persistent installation identity, the HTTPS/WSS worker,
-WinUI consent/pairing controls, and event detection remain to be implemented.
+**Stop sharing** disconnects and discards pending images. **Stop and forget local
+pairing** also removes the credential from Windows Credential Manager. Revoke
+the device credential in the Hub as well: the device protocol has no remote
+revocation endpoint. Messages already accepted by Discord cannot be recalled.
 
-## Boundaries
+Pairing codes are single-use and expire after an hour. If the response is lost
+or pairing fails after consuming a code, generate a new code; pairing is never
+automatically retried. Credentials never appear in command-line arguments,
+ordinary camera configuration, sharing settings, status responses, or logs.
 
-An AutoPierCam installation pairs as a user-owned `pier_camera`, not a N.I.N.A.
-profile or telescope. It has a separate installation UUID, pairing code, and
-credential. Its Discord destinations may share telescope channels, but its
-credentials never authorize telescope commands. The Hub selects destinations;
-camera messages cannot supply channel IDs or external image URLs.
+## Runtime and persistence
 
-Pairing uses a one-shot HTTPS exchange. The client then opens an outbound WSS
-connection to `/v1/devices`. This supports both event notifications and a Hub
-**Snapshot now** request, with no inbound firewall port or public preview server.
-Snapshot permission is distinct from automatic event sharing. Neither permission
-is enabled by pairing or by receiving a Hub request.
+The tray owns one dedicated network worker, independent of capture and the
+generic artifact HTTP uploader. It consumes the existing latest-frame preview
+and never opens another SDK handle or changes exposure, gain, ROI, pause state,
+or capture timing. Sharing errors do not stop local capture.
 
-The first Hub implementation supports scene-change and day/night observations,
-not semantic claims about meteors, people, animals, intrusions, or clouds.
-Actual detector choices remain a user/product decision. It does not add a
-Discord snapshot slash command yet; manual requests originate in the Hub UI.
+Non-secret preferences and the persistent random installation UUID are stored
+beside the camera TOML, with its extension replaced by `.chatstronomy.json`.
+For example, `autopiercam.toml` uses `autopiercam.chatstronomy.json`. A
+`.chatstronomy.lock` lease prevents two sharing workers owning that installation.
+Settings saves are atomic and revision-checked through dedicated sharing IPC,
+so old config editors cannot silently drop or enable sharing. To change Hub,
+forget the existing pairing first.
 
-## AutoPierCam implementation sequence
+Windows Credential Manager scopes the credential to both installation UUID
+and canonical Hub origin. There is no plaintext fallback on other platforms.
+The portable protocol, detector and worker are tested on Linux with an injected
+mock credential store; a production non-Windows store remains future work.
 
-### 1. Client, protected pairing, and on-demand snapshots
+Headless `autopiercam run --config <same TOML>` loads the same sharing settings
+and credential for the same Windows user. Stop the tray first. When sharing is
+enabled at startup it creates the same preview producer used by the tray.
+Configure/pair through the Viewer first; headless mode has no live settings UI.
+Do not edit the sidecar while a worker is running: runtime changes go through
+the Viewer, and manual file edits are read at the next startup.
 
-- Add a dedicated network worker consuming `PreviewHub::snapshot()`; never use
-  another SDK handle, hold a camera mutex during network I/O, or transmit on the
-  drain/encoder threads. In headless mode, start the existing preview producer
-  when sharing requires it, as video recording already does.
-- Keep the Hub HTTPS origin and non-secret preferences in optional validated
-  configuration. Reject credentials, fragments, query strings and arbitrary
-  paths in the origin; allow loopback HTTP/WS only under explicit development
-  configuration. Use certificate validation and refuse cross-origin redirects.
-- Persist a random installation UUID. Store the credential in Windows
-  Credential Manager, scoped to both installation and Hub origin, outside TOML,
-  the config IPC payload, logs, and command-line arguments. On other platforms,
-  require an OS credential-store implementation rather than plaintext fallback.
-- Add WinUI pairing/revoke/status controls and independent, default-off switches
-  for automatic events and requested snapshots. Show the origin and explain
-  that images go to the owner's selected Discord channels. Existing strict
-  configuration and IPC compatibility tests must cover old clients and omitted
-  settings; secrets must never be round-tripped through config editing.
-- Complete HTTPS pairing once, securely persist the returned credential, then
-  connect over WSS. A lost pair response needs a newly issued code. Reconnect
-  with bounded exponential backoff/jitter; do not loop on revoked credentials.
-- Advertise current local snapshot consent. Recheck consent and capture-session
-  identity before every upload and after every await. Turning off sharing must
-  cancel in-flight work, discard queued images, and reconnect with updated
-  consent; already posted Discord messages cannot be recalled.
-- For a snapshot, return the latest completed frame (at most 120 seconds old),
-  with its actual capture timestamp; optionally wait for the next frame within
-  the 90-second deadline. Never interrupt a 30–60+ second exposure, alter gain,
-  exposure or ROI, or treat a remote request as `capture.resume`/`capture.now`.
-  Paused/disconnected/stale sessions return `snapshot_unavailable`.
-- Bound transmitted previews to 512 KiB. Resize/re-encode on the network worker
-  if necessary. The Hub has a 720 KiB JSON limit and no RAW16/PNG/MP4 ingestion.
-  Do not upload full-resolution stills just because a preview exceeded the cap.
+Production endpoints must be HTTPS origins without credentials, paths, query
+strings or fragments. Certificate validation is enabled; HTTP pairing redirects
+are not followed. Loopback HTTP/WS is available only through explicit test
+dependency injection, not a production Viewer preference.
 
-### 2. Conservative local event detection
+Connections reconnect with bounded exponential backoff and jitter, capped at
+60 seconds. Authentication/protocol rejection stops retries until a local
+change. WebSocket messages are capped at 720 KiB; JPEGs are decoded with preview
+dimension/allocation limits and resized/re-encoded to at most 512 KiB.
 
-- Day/night transitions should use the existing capture mode with a stable
-  dwell period, not JPEG brightness alone (auto exposure compensates brightness).
-- For scene changes, use a small grayscale analysis grid, a configurable region
-  of interest and threshold, consecutive-frame confirmation, and cooldowns.
-  Suppress startup, reconnect, large exposure/gain changes and mode transitions.
-  Label results as scene changes, not object or threat classifications.
-- Analyze only new sequence numbers from the current preview session. Reset
-  the baseline on a session change, pause, camera change, or privacy change.
-- Make thresholds and event categories opt-in local settings. A remote Hub
-  request must not enable detection or widen the region being shared.
-- Keep a bounded immutable event outbox, separate from the existing generic
-  artifact HTTP uploader. Retry with the same event UUID and exact payload;
-  drop terminal failures, stale events (five minutes) and consent-revoked work.
-  Start with a bounded memory queue; disk persistence of images should be a
-  separately disclosed choice rather than implied by existing upload settings.
-- Honor the Hub's 60-second new-event cooldown and retry acknowledgments.
-  Per-route receipts suppress duplicates across reconnects/restarts, but delivery
-  remains at-least-once at the Discord acceptance/receipt-commit boundary.
+## Snapshot and event behavior
 
-### 3. Follow-on features
+**Snapshot now** uses the latest completed frame, at most 120 seconds old,
+labeled with its real capture time. It works with 30–60+ second exposures;
+it never interrupts an exposure. Paused, disconnected, stale or superseded
+capture sessions return unavailable. This version returns unavailable promptly
+rather than waiting for a new exposure when no eligible frame exists. Requests
+are bounded by a monotonic deadline of at most 90 seconds.
 
-Separately review a Discord snapshot command with explicit device/channel
-authorization, richer per-event routing, and any semantic/ML event detection.
-None should inherit a telescope's hardware-control permissions.
+Automatic events are independent opt-ins:
 
-## Acceptance tests before enabling a real camera
+- **Scene changes:** a 32×24 grayscale grid normalized for overall brightness;
+  at least the selected percentage of cells must change materially in three
+  distinct frames. Startup, session changes, mode transitions, very dark
+  frames and exposure changes over 20% or gain changes over 10 reset/suppress
+  the detector. The full preview is the analysis region.
+- **Day/night transitions:** use capture-mode metadata with a 30-second dwell,
+  not JPEG brightness alone.
 
-- Local mock Hub: valid/rejected/expired pairing, origin validation, credentials
-  redacted, wrong installation, reconnect/revocation, duplicate connections.
-- Fake preview producer: 30/60/120-second exposures, stale frame rejection,
-  session fencing, pause/shutdown, snapshot denial and cancellation.
-- Synthetic image sequences: stationary noise, exposure ramps, mode transitions,
-  persistent scene changes, ROI masking and cooldown/hysteresis behavior.
-- Delivery: bounded memory, slow/offline Hub, dropped acknowledgment, partial
-  destination failure, immutable IDs, consent disabled while queued/in flight.
-- Existing Rust workspace, WinUI and N.I.N.A. compatibility/build tests continue
-  to pass. No automatic live posts; a real Discord smoke test needs an explicitly
-  selected test device, channel and local image-sharing consent.
+These are observations, not classifications of people, animals, meteors,
+intrusions, weather or threats. There is a 60-second new-event cooldown.
+Only one immutable automatic event is retained in memory; newer events are
+dropped while it is pending. A retry or lost acknowledgment resends the exact
+event UUID and payload after at least 60 seconds. Events expire after five
+minutes. Snapshots and their retries stay within their original request and
+connection. Consent changes, pause/restart and session changes clear pending
+work. No outbox images are written to disk.
 
-The Hub PR tests use mock camera WebSockets and local fake Discord endpoints.
-No physical camera was opened and no production chat messages were sent while
-developing this integration design.
+The Hub owns destination routing and per-route receipts. Delivery is
+at-least-once, not exactly-once: a Hub crash after Discord accepts an image can
+produce a duplicate. Camera messages cannot supply arbitrary image URLs or
+channel IDs. Discord mentions are disabled by the Hub.
+
+## Validation and follow-ons
+
+Tests use synthetic JPEGs, injected credentials and a local mock HTTP/WebSocket
+Hub. They cover pairing/rejection, redirect refusal, origin binding, persistent
+identity, revision conflicts, snapshot consent and freshness, scene detection,
+revoked authentication, cancellation and an actual 60-second immutable retry
+across reconnect. A separate opt-in test writes and removes only one synthetic
+Windows Credential Manager entry. No real camera or Discord channel is needed.
+
+Follow-ons, not prerequisites for image sharing: selectable detection regions
+and privacy masks, a non-Windows OS credential store, a Discord snapshot slash
+command, richer event routing, and explicitly reviewed semantic detection.

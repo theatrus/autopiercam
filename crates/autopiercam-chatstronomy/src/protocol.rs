@@ -151,7 +151,7 @@ pub fn requires_operator_action(code: &str) -> bool {
     !matches!(code, "rate_limited" | "already_connected")
 }
 
-fn valid_uuid(value: &str) -> bool {
+pub(crate) fn valid_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(i, ch)| {
             if matches!(i, 8 | 13 | 18 | 23) {

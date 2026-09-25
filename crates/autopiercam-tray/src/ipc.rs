@@ -59,8 +59,87 @@ struct DispatchContext {
     config_store: ConfigStore,
 }
 
+fn sharing_response(request: Request, sharing: &autopiercam::SharingClient) -> Response {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Revision {
+        expected_revision: u64,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Configure {
+        expected_revision: u64,
+        preferences: autopiercam_chatstronomy::service::Preferences,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Pair {
+        expected_revision: u64,
+        pairing_token: autopiercam_chatstronomy::protocol::Secret,
+    }
+    if request.validate().is_err() {
+        return Response::failure(
+            request.request_id,
+            ErrorBody::new("invalid_request", "Invalid sharing request"),
+        );
+    }
+    let invalid = || "Invalid sharing request".to_owned();
+    let result = match request.method {
+        Method::SharingGet => Ok(sharing.status()),
+        Method::SharingConfigure => serde_json::from_value::<Configure>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .update(value.expected_revision, value.preferences)
+                    .map_err(|e| e.to_string())
+            }),
+        Method::SharingPair => serde_json::from_value::<Pair>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .pair(value.expected_revision, value.pairing_token)
+                    .map_err(|e| e.to_string())
+            }),
+        Method::SharingForget => serde_json::from_value::<Revision>(request.payload)
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                sharing
+                    .forget(value.expected_revision)
+                    .map_err(|e| e.to_string())
+            }),
+        _ => Err(invalid()),
+    };
+    match result {
+        Ok(status) => Response::success(
+            request.request_id,
+            serde_json::to_value(status).expect("sharing status is serializable"),
+        ),
+        Err(message) => {
+            Response::failure(request.request_id, ErrorBody::new("sharing_error", message))
+        }
+    }
+}
+
 impl DispatchContext {
     fn dispatch(&self, request: Request) -> Response {
+        if matches!(
+            request.method,
+            Method::SharingGet
+                | Method::SharingConfigure
+                | Method::SharingPair
+                | Method::SharingForget
+        ) {
+            return match self.worker.sharing() {
+                Some(sharing) => sharing_response(request, &sharing),
+                None => Response::failure(
+                    request.request_id,
+                    ErrorBody::new(
+                        "sharing_unavailable",
+                        "Sharing could not start. Check the tray log and sharing settings, then restart the tray. Local capture is unaffected.",
+                    ),
+                ),
+            };
+        }
         dispatch(request, &self.worker, &self.monitor, &self.config_store)
     }
 }
@@ -380,7 +459,12 @@ fn dispatch(
         }
         Method::UploadsList => upload_list_response(request_id, request.payload, monitor),
         Method::UploadsRequeue => upload_requeue_response(request_id, request.payload, monitor),
-        Method::CamerasList | Method::ArtifactsList => Response::failure(
+        Method::CamerasList
+        | Method::ArtifactsList
+        | Method::SharingGet
+        | Method::SharingConfigure
+        | Method::SharingPair
+        | Method::SharingForget => Response::failure(
             request_id,
             ErrorBody::new(
                 "not_implemented",
@@ -616,7 +700,7 @@ async fn read_request(
     read_exact(server, &mut payload, stop).await?;
     serde_json::from_slice(&payload)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control request"))
 }
 
 async fn read_exact(
@@ -1057,6 +1141,7 @@ mod tests {
                 CAPABILITY_UPLOADS_REQUEUE,
                 CAPABILITY_STORAGE_RETENTION,
                 CAPABILITY_EXPOSURE_PROGRESS,
+                "sharing.get",
                 "camera.adaptive_exposure",
                 "camera.raw16",
                 "video.ffmpeg"
