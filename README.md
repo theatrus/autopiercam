@@ -66,6 +66,11 @@ The repository now contains a hardware-validated background capture slice:
 
 ## Install on Windows
 
+Chatstronomy integration is being developed separately. See the
+[integration design and Hub PRs](docs/chatstronomy.md) for pairing, bidirectional
+snapshot requests, and the remaining local client/privacy work. It is not part
+of the 0.1.0 installer.
+
 The x64 MSI installs AutoPierCam for the current Windows user under
 `%LOCALAPPDATA%\Programs\AutoPierCam`. It includes the ZWO SDK runtime and a
 self-contained Viewer; install the ZWO Windows camera driver separately first.
