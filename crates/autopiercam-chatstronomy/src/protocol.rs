@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const TRIGGER_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_WIRE_BYTES: usize = 720 * 1024;
 pub const MAX_JPEG_BYTES: usize = 512 * 1024;
 
@@ -89,6 +90,14 @@ pub enum ServerMessage {
         status: String,
         retry_after_seconds: u64,
     },
+    ConfigureTriggers {
+        request_id: String,
+        rules: crate::triggers::TriggerRules,
+    },
+    TelescopeEvent {
+        event: String,
+        expires_at: i64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,7 +116,9 @@ impl ServerMessage {
             Self::Ready {
                 protocol_version,
                 device_id,
-            } if *protocol_version != PROTOCOL_VERSION || *device_id <= 0 => {
+            } if ![PROTOCOL_VERSION, TRIGGER_PROTOCOL_VERSION].contains(protocol_version)
+                || *device_id <= 0 =>
+            {
                 return Err(InvalidMessage);
             }
             Self::SnapshotRequest {
@@ -119,6 +130,9 @@ impl ServerMessage {
                 return Err(InvalidMessage);
             }
             Self::EventAck { event_id, .. } if !valid_uuid(event_id) => return Err(InvalidMessage),
+            Self::ConfigureTriggers { request_id, .. } if !valid_uuid(request_id) => {
+                return Err(InvalidMessage);
+            }
             _ => {}
         }
         Ok(message)
@@ -214,10 +228,37 @@ mod tests {
     }
 
     #[test]
+    fn trigger_protocol_is_strict_and_pairing_stays_v1() {
+        let rules = crate::triggers::TriggerRules::local(&crate::service::Preferences::default());
+        let message =
+            serde_json::json!({"type":"configure_triggers","request_id":ID,"rules":rules});
+        assert!(matches!(
+            ServerMessage::parse(message.to_string().as_bytes()),
+            Ok(ServerMessage::ConfigureTriggers { .. })
+        ));
+        let mut invalid = message.clone();
+        invalid["rules"]["enable_sharing"] = true.into();
+        assert!(ServerMessage::parse(invalid.to_string().as_bytes()).is_err());
+        invalid = message;
+        invalid["request_id"] = "00000000-0000-0000-0000-000000000000".into();
+        assert!(ServerMessage::parse(invalid.to_string().as_bytes()).is_err());
+        assert!(matches!(
+            ServerMessage::parse(br#"{"type":"ready","protocol_version":2,"device_id":42}"#),
+            Ok(ServerMessage::Ready { .. })
+        ));
+        assert!(
+            PairingResponse::parse(
+                br#"{"protocol_version":2,"device_id":42,"credential":"csdc_test"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_unknown_commands_fields_versions_and_oversized_input() {
         for message in [
             r#"{"type":"capture_resume"}"#,
-            r#"{"type":"ready","protocol_version":2,"device_id":42}"#,
+            r#"{"type":"ready","protocol_version":3,"device_id":42}"#,
             r#"{"type":"ready","protocol_version":1,"device_id":42,"channel_id":"1"}"#,
             r#"{"type":"snapshot_request","request_id":"not-uuid","expires_at":1,"max_jpeg_bytes":1,"max_frame_age_seconds":120}"#,
             r#"{"type":"ready","protocol_version":1,"device_id":0}"#,

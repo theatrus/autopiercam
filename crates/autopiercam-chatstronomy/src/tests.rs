@@ -189,14 +189,135 @@ impl Fixture {
         assert_eq!(auth["credential"], "csdc_test_only");
         socket
             .send(Message::Text(
-                json!({"type":"ready","protocol_version":1,"device_id":42})
+                json!({"type":"ready","protocol_version":auth["protocol_version"],"device_id":42})
                     .to_string()
                     .into(),
             ))
             .await
             .unwrap();
+        if auth["protocol_version"] == 2 {
+            assert_eq!(text(&mut socket).await["type"], "trigger_capabilities");
+        }
         socket
     }
+}
+
+#[tokio::test]
+async fn trigger_configuration_is_durable_bounded_and_reset_by_local_save() {
+    use crate::triggers::TriggerRules;
+    let fixture = Fixture::paired().await;
+    let client = fixture.service.client();
+    let old = client.status();
+    client
+        .update(
+            old.revision,
+            Preferences {
+                chat_configuration: true,
+                telescope_events: true,
+                interval_minutes: 5,
+                burst_count: 3,
+                ..old.preferences
+            },
+        )
+        .unwrap();
+    let mut socket = fixture.connect(true, true).await;
+    let before = client.status();
+    let mut rules = TriggerRules::local(&before.preferences);
+    rules.interval_minutes = 10;
+    rules.burst_count = 2;
+    let id = random_uuid().unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"configure_triggers","request_id":id,"rules":rules})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&mut socket).await,
+        json!({"type":"trigger_configuration_result","request_id":id,"accepted":true})
+    );
+    assert_eq!(client.status().active_triggers, rules);
+    assert_eq!(client.status().revision, before.revision + 1);
+    let stored: Settings = serde_json::from_slice(
+        &std::fs::read(fixture._directory.path().join("agent.chatstronomy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.rules(), rules);
+    rules.interval_minutes = 1; // faster than local permission
+    socket
+        .send(Message::Text(
+            json!({"type":"configure_triggers","request_id":id,"rules":rules})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text(&mut socket).await["accepted"], false);
+    assert_eq!(client.status().revision, before.revision + 1);
+    assert!(
+        client
+            .update(before.revision, before.preferences.clone())
+            .is_err()
+    );
+    let current = client.status();
+    client.update(current.revision, before.preferences).unwrap();
+    assert_eq!(client.status().active_triggers.interval_minutes, 5);
+}
+
+#[tokio::test]
+async fn telescope_trigger_waits_for_an_updated_frame_and_local_consent_wins() {
+    let fixture = Fixture::paired().await;
+    let client = fixture.service.client();
+    let old = client.status();
+    client
+        .update(
+            old.revision,
+            Preferences {
+                telescope_events: true,
+                ..old.preferences
+            },
+        )
+        .unwrap();
+    let mut socket = fixture.connect(false, false).await;
+    let id = random_uuid().unwrap();
+    let rules = crate::triggers::TriggerRules::local(&client.status().preferences);
+    socket
+        .send(Message::Text(
+            json!({"type":"configure_triggers","request_id":id,"rules":rules})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text(&mut socket).await["accepted"], false); // chat gate off
+    socket.send(Message::Text(json!({"type":"telescope_event","event":"mount_slew_started","expires_at":now_ms()/1000+30}).to_string().into())).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(250), socket.next())
+            .await
+            .is_err()
+    );
+    *fixture.frames.write().unwrap() = Some(frame(2, true));
+    let event = text(&mut socket).await;
+    assert_eq!(event["event"]["kind"], "telescope_event");
+    assert_eq!(event["event"]["summary"], "Pier camera: mount slew started");
+    let current = client.status();
+    client
+        .update(
+            current.revision,
+            Preferences {
+                enabled: false,
+                ..current.preferences
+            },
+        )
+        .unwrap();
+    assert!(!matches!(
+        timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap(),
+        Some(Ok(Message::Text(_)))
+    ));
 }
 
 async fn request(socket: &mut WebSocketStream<TcpStream>) -> String {

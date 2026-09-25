@@ -12,6 +12,21 @@ internal sealed record SharingPreferences
     [JsonPropertyName("scene_changes")] public bool SceneChanges { get; init; }
     [JsonPropertyName("day_night")] public bool DayNight { get; init; }
     [JsonPropertyName("scene_threshold_percent")] public byte SceneThresholdPercent { get; init; } = 20;
+    [JsonPropertyName("interval_minutes")] public ushort IntervalMinutes { get; init; }
+    [JsonPropertyName("telescope_events")] public bool TelescopeEvents { get; init; }
+    [JsonPropertyName("chat_configuration")] public bool ChatConfiguration { get; init; }
+    [JsonPropertyName("burst_count")] public byte BurstCount { get; init; } = 1;
+    [JsonPropertyName("spacing_seconds")] public ushort SpacingSeconds { get; init; } = 60;
+}
+
+internal sealed record SharingTriggerRules
+{
+    [JsonPropertyName("interval_minutes")] public ushort IntervalMinutes { get; init; }
+    [JsonPropertyName("scene_changes")] public bool SceneChanges { get; init; }
+    [JsonPropertyName("day_night")] public bool DayNight { get; init; }
+    [JsonPropertyName("telescope_events")] public bool TelescopeEvents { get; init; }
+    [JsonPropertyName("burst_count")] public byte BurstCount { get; init; }
+    [JsonPropertyName("spacing_seconds")] public ushort SpacingSeconds { get; init; }
 }
 
 internal sealed record SharingStatus
@@ -22,6 +37,7 @@ internal sealed record SharingStatus
     [JsonPropertyName("preferences")] public SharingPreferences Preferences { get; init; } = new();
     [JsonPropertyName("connection")] public string Connection { get; init; } = "";
     [JsonPropertyName("last_delivery_unix_ms")] public ulong? LastDeliveryUnixMs { get; init; }
+    [JsonPropertyName("active_triggers")] public SharingTriggerRules? ActiveTriggers { get; init; }
 }
 
 public sealed partial class MainWindow
@@ -46,6 +62,15 @@ public sealed partial class MainWindow
         var scenes = new ToggleSwitch { Header = "Post persistent scene changes (entire preview)" };
         var dayNight = new ToggleSwitch { Header = "Post stable day/night transitions" };
         var threshold = new NumberBox { Header = "Changed area threshold (%)", Minimum = 5, Maximum = 80, SmallChange = 5 };
+        var interval = new NumberBox { Header = "Periodic images: minutes (0 = disabled)", Minimum = 0, Maximum = 1440, SmallChange = 1 };
+        var telescopeEvents = new ToggleSwitch { Header = "Allow slew / sequence event images" };
+        var burst = new NumberBox { Header = "Images per scene / telescope event (maximum)", Minimum = 1, Maximum = 3, SmallChange = 1 };
+        var spacing = new NumberBox { Header = "Seconds between event images (minimum)", Minimum = 60, Maximum = 600, SmallChange = 30 };
+        var chatConfiguration = new ToggleSwitch { Header = "Allow the camera owner to configure triggers from chat" };
+        var triggerNotice = new TextBlock {
+            Text = "Chat can disable allowed triggers, slow periodic sends, or reduce bursts—but cannot enable a locally disabled source or exceed these limits. Save permissions resets chat overrides. Telescope triggers require the same owner and a shared Hub channel. Each burst waits for distinct completed frames; busy events are coalesced, not queued.",
+            TextWrapping = TextWrapping.Wrap
+        };
         var code = new PasswordBox { Header = "One-use device pairing code", PlaceholderText = "Code from Observatory devices in the Hub" };
         var pair = new Button { Content = "Pair camera (sharing stays off)" };
         var forget = new Button { Content = "Stop and forget local pairing" };
@@ -55,7 +80,7 @@ public sealed partial class MainWindow
             Text = "Events are conservative scene observations, not person/animal or threat detection. Retries can duplicate a post after a Hub crash. Turning sharing off discards queued images but cannot recall messages already posted. Forgetting removes the local credential; revoke it in the Hub as well.",
             TextWrapping = TextWrapping.Wrap
         };
-        foreach (var element in new FrameworkElement[] { notice, connection, origin, enabled, snapshots, scenes, dayNight, threshold, code, pair, forget, reload, feedback, warning })
+        foreach (var element in new FrameworkElement[] { notice, connection, origin, enabled, snapshots, scenes, dayNight, threshold, interval, telescopeEvents, burst, spacing, chatConfiguration, triggerNotice, code, pair, forget, reload, feedback, warning })
             panel.Children.Add(element);
         var dialog = new ContentDialog {
             XamlRoot = Content.XamlRoot, Title = "Chatstronomy image sharing",
@@ -73,13 +98,24 @@ public sealed partial class MainWindow
             scenes.IsOn = status.Preferences.SceneChanges;
             dayNight.IsOn = status.Preferences.DayNight;
             threshold.Value = status.Preferences.SceneThresholdPercent;
+            interval.Value = status.Preferences.IntervalMinutes;
+            telescopeEvents.IsOn = status.Preferences.TelescopeEvents;
+            burst.Value = status.Preferences.BurstCount;
+            spacing.Value = status.Preferences.SpacingSeconds;
+            chatConfiguration.IsOn = status.Preferences.ChatConfiguration;
             connection.Text = $"{status.Connection} · Device: {status.DeviceId?.ToString() ?? "not paired"}\nInstallation: {status.InstallationId}" +
                 (status.LastDeliveryUnixMs is ulong ms ? $"\nLast delivery: {DateTimeOffset.FromUnixTimeMilliseconds((long)ms).ToLocalTime():g}" : "");
+            if (status.ActiveTriggers is { } active)
+                connection.Text += $"\nActive: periodic {(active.IntervalMinutes == 0 ? "off" : $"{active.IntervalMinutes} min")}; scene {active.SceneChanges}; day/night {active.DayNight}; telescope {active.TelescopeEvents}; burst {active.BurstCount}, {active.SpacingSeconds}s spacing";
         }
         SharingPreferences Inputs(bool permit) => new() {
             HubOrigin = origin.Text.Trim(), Enabled = permit && enabled.IsOn,
             Snapshots = snapshots.IsOn, SceneChanges = scenes.IsOn, DayNight = dayNight.IsOn,
-            SceneThresholdPercent = double.IsFinite(threshold.Value) ? checked((byte)threshold.Value) : (byte)20
+            SceneThresholdPercent = double.IsFinite(threshold.Value) ? checked((byte)threshold.Value) : (byte)20,
+            IntervalMinutes = double.IsFinite(interval.Value) ? checked((ushort)interval.Value) : (ushort)0,
+            TelescopeEvents = telescopeEvents.IsOn, ChatConfiguration = chatConfiguration.IsOn,
+            BurstCount = double.IsFinite(burst.Value) ? checked((byte)burst.Value) : (byte)1,
+            SpacingSeconds = double.IsFinite(spacing.Value) ? checked((ushort)spacing.Value) : (ushort)60
         };
         async Task Operate(Func<Task> action)
         {

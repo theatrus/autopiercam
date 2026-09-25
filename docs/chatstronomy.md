@@ -2,6 +2,7 @@
 
 The current source implements Windows pairing, protected credentials, outbound
 HTTPS/WSS transport, Hub-requested snapshots, automatic scene/day-night posts,
+periodic images, chat-configurable triggers and telescope-event image bursts,
 and Viewer controls. **The published 0.1.0 installer predates this feature.**
 Use a build containing this change; no live sharing is enabled by installing it.
 
@@ -43,6 +44,53 @@ Pairing codes are single-use and expire after an hour. If the response is lost
 or pairing fails after consuming a code, generate a new code; pairing is never
 automatically retried. Credentials never appear in command-line arguments,
 ordinary camera configuration, sharing settings, status responses, or logs.
+
+## Triggered sharing and chat configuration
+
+The Viewer provides a periodic interval (0 disables, otherwise 1–1440 minutes),
+a telescope-event opt-in, and an event burst size of 1–3 distinct images spaced
+60–600 seconds apart. Periodic sends are single images. The first scheduled send
+waits a full interval; reconnects reset the interval and discard unfinished bursts
+instead of replaying a backlog. The device-wide 60-second cooldown still applies.
+
+Enable **Allow the camera owner to configure triggers from chat** locally to use
+`/piercam triggers` in a channel receiving that camera. Supply the camera's exact
+Hub name, interval, scene/day-night/telescope switches, burst count and spacing.
+For example, set interval to 10 minutes, telescope events on, count 3, spacing 60.
+Chat may only narrow local permissions: it cannot enable a locally disabled
+source, send more frequently than the local interval, shorten spacing, increase
+the burst cap, or enable snapshots/sharing. To permit periodic chat configuration,
+first choose a nonzero local interval. Chat can set it to 0 and later restore it
+within that local limit. Only the camera owner may invoke these commands; server
+manager privileges alone do not grant access. DMs and unrelated channels fail.
+
+Chat overrides are atomically saved on the camera. **Refresh status** shows the
+active rules as well as local permission limits. Any local **Save permissions**
+clears overrides. A stale Viewer save fails with a revision conflict instead of
+overwriting a newer chat update. Pairing/forgetting resets trigger permissions.
+`/piercam snapshot camera:<name>` uses the existing separate local snapshot gate
+and posts to all of the camera's configured destinations, not just the command
+channel. Triggered images likewise use all configured camera destinations.
+
+Telescope triggers currently cover slew start/end and sequence start/finish.
+The Hub admits only fresh (up to 30 seconds), new, chat-enabled events from a
+telescope with the **same owner and at least one shared guild/channel route**.
+Startup history, disabled events and cross-owner telescopes do not trigger posts.
+Camera event bursts wait for a frame completed after receipt; subsequent images
+must have new sequence numbers in the same capture session. Long exposures can
+delay delivery beyond the selected spacing. There is no pre-event image buffer.
+An active burst coalesces additional triggers; the next event cannot create an
+unbounded queue. A burst expires after 180 seconds plus its configured spacing
+between images; pause/session/consent changes cancel it. Failed delivery can
+reduce the number of images actually posted. This is not a security alarm.
+
+Periodic/chat/telescope features require the companion
+[Hub protocol-v2 update (#186)](https://github.com/theatrus/chatstronomy/pull/186).
+Pairing remains v1; old v1 cameras still connect to the updated Hub. AutoPierCam
+uses a v2 WebSocket only when these features are enabled and stops with an
+operator-visible protocol error against an older Hub, rather than silently
+ignoring the configuration. Neither these sources nor their installers are
+deployed automatically.
 
 ## Runtime and persistence
 
@@ -102,8 +150,8 @@ Automatic events are independent opt-ins:
 
 These are observations, not classifications of people, animals, meteors,
 intrusions, weather or threats. There is a 60-second new-event cooldown.
-Only one immutable automatic event is retained in memory; newer events are
-dropped while it is pending. A retry or lost acknowledgment resends the exact
+Only one immutable automatic image and one bounded burst plan are retained in
+memory; new triggers are coalesced while that burst is active. A retry or lost acknowledgment resends the exact
 event UUID and payload after at least 60 seconds. Events expire after five
 minutes. Snapshots and their retries stay within their original request and
 connection. Consent changes, pause/restart and session changes clear pending
@@ -124,5 +172,5 @@ across reconnect. A separate opt-in test writes and removes only one synthetic
 Windows Credential Manager entry. No real camera or Discord channel is needed.
 
 Follow-ons, not prerequisites for image sharing: selectable detection regions
-and privacy masks, a non-Windows OS credential store, a Discord snapshot slash
-command, richer event routing, and explicitly reviewed semantic detection.
+and privacy masks, a non-Windows OS credential store, richer selectable event
+filters, and explicitly reviewed semantic detection (for example roof/person labels).

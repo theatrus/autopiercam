@@ -41,6 +41,11 @@ pub struct Preferences {
     pub scene_changes: bool,
     pub day_night: bool,
     pub scene_threshold_percent: u8,
+    pub interval_minutes: u16,
+    pub telescope_events: bool,
+    pub chat_configuration: bool,
+    pub burst_count: u8,
+    pub spacing_seconds: u16,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -51,11 +56,22 @@ impl Default for Preferences {
             scene_changes: false,
             day_night: false,
             scene_threshold_percent: 20,
+            interval_minutes: 0,
+            telescope_events: false,
+            chat_configuration: false,
+            burst_count: 1,
+            spacing_seconds: 60,
         }
     }
 }
 impl Preferences {
     pub(crate) fn validate(&mut self, policy: TransportPolicy) -> Result<()> {
+        if self.interval_minutes > 1440
+            || !(1..=3).contains(&self.burst_count)
+            || !(60..=600).contains(&self.spacing_seconds)
+        {
+            bail!("Use 0–1440 minutes, 1–3 images, and 60–600 seconds between images");
+        }
         if !self.hub_origin.is_empty() {
             self.hub_origin = HubOrigin::parse(&self.hub_origin, policy)?.canonical();
         }
@@ -76,6 +92,18 @@ pub(crate) struct Settings {
     pub revision: u64,
     pub device_id: Option<i64>,
     pub preferences: Preferences,
+    #[serde(default)]
+    pub remote_rules: Option<crate::triggers::TriggerRules>,
+}
+
+impl Settings {
+    pub fn rules(&self) -> crate::triggers::TriggerRules {
+        self.remote_rules
+            .as_ref()
+            .filter(|r| self.preferences.chat_configuration && r.allowed_by(&self.preferences))
+            .cloned()
+            .unwrap_or_else(|| crate::triggers::TriggerRules::local(&self.preferences))
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,6 +114,7 @@ pub struct Status {
     pub preferences: Preferences,
     pub connection: String,
     pub last_delivery_unix_ms: Option<u64>,
+    pub active_triggers: crate::triggers::TriggerRules,
 }
 
 pub(crate) struct Shared {
@@ -100,6 +129,35 @@ pub(crate) struct Shared {
     path: PathBuf,
     mutation: Mutex<()>,
     pairing: AtomicBool,
+}
+
+impl Shared {
+    /// Called only by the transport task. Local mutations still cancel that
+    /// task via `changes`; remote updates cannot alter consent or identity.
+    pub fn configure_triggers(
+        &self,
+        rules: crate::triggers::TriggerRules,
+        epoch: u64,
+    ) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        let mut settings = self.settings.read().unwrap().clone();
+        if self.stopped.load(Ordering::Acquire)
+            || *self.changes.borrow() != epoch
+            || !settings.preferences.enabled
+            || !settings.preferences.chat_configuration
+            || !rules.allowed_by(&settings.preferences)
+        {
+            bail!("Trigger configuration exceeds local permissions");
+        }
+        settings.remote_rules = Some(rules);
+        settings.revision = settings
+            .revision
+            .checked_add(1)
+            .context("Sharing revision exhausted")?;
+        persist(&self.path, &settings)?;
+        *self.settings.write().unwrap() = settings;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +207,11 @@ impl SharingService {
             let mut settings: Settings = serde_json::from_slice(&std::fs::read(&path)?)
                 .map_err(|_| anyhow::anyhow!("Invalid sharing settings; sharing is disabled"))?;
             settings.preferences.validate(policy)?;
+            if settings.remote_rules.as_ref().is_some_and(|rules| {
+                !settings.preferences.chat_configuration || !rules.allowed_by(&settings.preferences)
+            }) {
+                bail!("Saved trigger rules exceed local permissions; sharing is disabled");
+            }
             if !crate::protocol::valid_uuid(&settings.installation_id)
                 || settings.device_id.is_some_and(|id| id <= 0)
             {
@@ -161,6 +224,7 @@ impl SharingService {
                 revision: 1,
                 device_id: None,
                 preferences: Preferences::default(),
+                remote_rules: None,
             };
             persist(&path, &settings)?;
             settings
@@ -213,6 +277,7 @@ impl SharingClient {
     pub fn status(&self) -> Status {
         let settings = self.0.settings.read().unwrap().clone();
         Status {
+            active_triggers: settings.rules(),
             revision: settings.revision,
             installation_id: settings.installation_id,
             device_id: settings.device_id,
@@ -240,6 +305,7 @@ impl SharingClient {
             bail!("Forget the current pairing before changing Hub");
         }
         settings.preferences = preferences;
+        settings.remote_rules = None;
         settings.revision = settings
             .revision
             .checked_add(1)
@@ -297,6 +363,10 @@ impl SharingClient {
             settings.preferences.snapshots = false;
             settings.preferences.scene_changes = false;
             settings.preferences.day_night = false;
+            settings.preferences.interval_minutes = 0;
+            settings.preferences.telescope_events = false;
+            settings.preferences.chat_configuration = false;
+            settings.remote_rules = None;
             settings.revision += 1;
             self.commit(settings.clone())?;
             settings
@@ -339,6 +409,10 @@ impl SharingClient {
         settings.preferences.snapshots = false;
         settings.preferences.scene_changes = false;
         settings.preferences.day_night = false;
+        settings.preferences.interval_minutes = 0;
+        settings.preferences.telescope_events = false;
+        settings.preferences.chat_configuration = false;
+        settings.remote_rules = None;
         settings.device_id = None;
         settings.revision += 1;
         self.commit(settings)?;

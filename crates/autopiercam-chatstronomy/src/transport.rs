@@ -7,6 +7,7 @@ use crate::{
     },
     service::{Frame, Settings, Shared, random_uuid},
     snapshot::{LocalState, SnapshotFence},
+    triggers::{Scheduler, telescope_summary},
     vault,
 };
 use anyhow::{Result, bail};
@@ -219,6 +220,14 @@ async fn session(
     epoch: u64,
     last_new_event: &mut Instant,
 ) -> Result<bool> {
+    let version = if settings.preferences.interval_minutes > 0
+        || settings.preferences.telescope_events
+        || settings.preferences.chat_configuration
+    {
+        crate::protocol::TRIGGER_PROTOCOL_VERSION
+    } else {
+        PROTOCOL_VERSION
+    };
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_WIRE_BYTES))
         .max_frame_size(Some(MAX_WIRE_BYTES))
@@ -235,7 +244,7 @@ async fn session(
     send(
         &mut socket,
         serde_json::to_string(&ClientMessage::Authenticate {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: version,
             installation_id: &settings.installation_id,
             credential: credential.expose_for_transport(),
             snapshots: settings.preferences.snapshots,
@@ -243,11 +252,19 @@ async fn session(
     )
     .await?;
     match timeout(Duration::from_secs(10), next(&mut socket)).await?? {
-        ServerMessage::Ready { device_id, .. } if Some(device_id) == settings.device_id => {}
+        ServerMessage::Ready {
+            device_id,
+            protocol_version,
+        } if Some(device_id) == settings.device_id && protocol_version == version => {}
         ServerMessage::Error { code } => return Ok(!requires_operator_action(&code)),
         _ => return Ok(false),
     }
     status(shared, "Connected");
+    if version == crate::protocol::TRIGGER_PROTOCOL_VERSION {
+        send(&mut socket, serde_json::json!({"type":"trigger_capabilities", "chat_configuration":settings.preferences.chat_configuration, "telescope_events":settings.preferences.telescope_events}).to_string()).await?;
+    }
+    let mut rules = settings.rules();
+    let mut scheduler = Scheduler::new(rules.clone(), Instant::now());
     let mut ticks = interval(Duration::from_millis(100));
     let mut last_rx = Instant::now();
     let mut detector = Detector::default();
@@ -268,6 +285,28 @@ async fn session(
                     _ => bail!("Hub disconnected"),
                 };
                 match incoming {
+                    ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version == crate::protocol::TRIGGER_PROTOCOL_VERSION => {
+                        let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
+                        if accepted {
+                            rules = proposed;
+                            scheduler = Scheduler::new(rules.clone(), Instant::now());
+                            detector = Detector::default();
+                            // Clear reconnect-retained bytes before any awaited write.
+                            *outbox = None; snapshot_outbox = None;
+                            if let Some(fence) = request.take() {
+                                send(&mut socket, serde_json::to_string(&ClientMessage::SnapshotUnavailable { request_id: fence.request_id() })?).await?;
+                            }
+                        }
+                        send(&mut socket, serde_json::json!({"type":"trigger_configuration_result","request_id":request_id,"accepted":accepted}).to_string()).await?;
+                    }
+                    ServerMessage::TelescopeEvent { event, expires_at } if version == crate::protocol::TRIGGER_PROTOCOL_VERSION => {
+                        let now_seconds = (now_ms() / 1000) as i64;
+                        if rules.telescope_events && expires_at > now_seconds && expires_at <= now_seconds + 90
+                            && let Some(summary) = telescope_summary(&event)
+                            && let Some(frame) = (shared.source)() {
+                            scheduler.trigger("telescope_event", summary, &frame, Instant::now(), true);
+                        }
+                    }
                     ServerMessage::SnapshotRequest { ref request_id, .. } => {
                         let frame = (shared.source)();
                         if request.is_some() || outbox.is_some() {
@@ -319,20 +358,26 @@ async fn session(
                 }
                 if let Some(f) = frame.as_ref().filter(|f| f.sequence != last_sequence) {
                     last_sequence = f.sequence;
-                    if settings.preferences.scene_changes || settings.preferences.day_night {
+                    if rules.scene_changes || rules.day_night {
                         // Decoding is bounded to a small preview and never holds a camera lock.
-                        let event_kind = detector.observe(f, &settings.preferences, Instant::now()).unwrap_or(None);
-                        if let Some((kind, summary)) = event_kind
-                            && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60)
-                            && now_ms().saturating_sub(f.captured_at_unix_ms) <= 300_000 {
-                            let encoded_frame = f.clone();
-                            if let Ok(jpeg) = tokio::task::spawn_blocking(move || media::jpeg(&encoded_frame, MAX_JPEG_BYTES)).await? {
-                                *outbox = Some(event(f, kind, summary, None, jpeg)?);
-                                *last_new_event = Instant::now();
-                            }
+                        let mut detection = settings.preferences.clone();
+                        detection.scene_changes = rules.scene_changes;
+                        detection.day_night = rules.day_night;
+                        if let Some((kind, summary)) = detector.observe(f, &detection, Instant::now()).unwrap_or(None) {
+                            scheduler.trigger(kind, summary, f, Instant::now(), false);
                         }
                     }
                 } else if frame.is_none() { detector = Detector::default(); last_sequence = 0; }
+                let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms());
+                if let Some((kind, summary)) = due && let Some(f) = frame.as_ref()
+                    && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
+                    let encoded_frame = f.clone();
+                    if let Ok(jpeg) = tokio::task::spawn_blocking(move || media::jpeg(&encoded_frame, MAX_JPEG_BYTES)).await? {
+                        *outbox = Some(event(f, kind, summary, None, jpeg)?);
+                        scheduler.queued(f, Instant::now());
+                        *last_new_event = Instant::now();
+                    }
+                }
                 let current = (shared.source)();
                 if shared.stopped.load(Ordering::Acquire) || *shared.changes.borrow() != epoch {
                     bail!("Local sharing permission changed");
