@@ -181,7 +181,7 @@
                             HorizontalAlignment="Stretch"
                             SelectionChanged="CameraComboBox_SelectionChanged"
                             PlaceholderText="Agent not connected" />
-                        <Button x:Name="RefreshCamerasButton" Content="Refresh cameras" IsEnabled="False" Click="RefreshCamerasButton_Click" />
+                        <Button x:Name="RefreshCamerasButton" Content="Reload camera list" IsEnabled="False" Click="RefreshCamerasButton_Click" />
                         <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
                     </StackPanel>
                 </StackPanel>

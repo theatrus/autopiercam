@@ -79,8 +79,8 @@ runtime faults are retried with a bounded 1/2/5/10/30-second backoff; a healthy
 capture session resets the delay.
 
 The tray menu exposes Status, Open AutoPierCam, Pause/Resume capture, Capture
-now, and Exit. Exit performs an ordered shutdown rather than terminating the
-process abruptly.
+now, and Exit. Exit attempts ordered shutdown, with an independent 30-second
+whole-process fallback if the SDK or cleanup cannot return.
 
 ### WinUI application
 
@@ -320,6 +320,37 @@ no reconcilable crash-gap artifact exists; it fails closed otherwise. Packaged
 Windows builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
+
+Camera inventory is cached per capture attempt. Enumeration runs before opening
+the selected camera, never from acquisition or settling. ZWO SDK 1.41 property
+lookup internally calls its camera-open API; a remote dump showed it spinning in
+a non-advancing loop while querying another connected camera. An SDK timeout
+argument is not a guarantee that every native call returns.
+
+Status snapshots age exposure progress using a monotonic camera-publication clock.
+Viewer requests and storage updates cannot reset it. Missing publication for the
+larger of 30 seconds or the frame deadline, plus 30 seconds grace, reports a fault;
+startup without exposure progress uses 60 seconds. New camera progress recovers
+the derived fault, and long exposures retain their larger deadline.
+
+Restart is asynchronous: signal the existing owner and poll for its completion.
+Do not launch another session until it has actually exited. A stop taking longer
+than 30 seconds reports an actionable fault while leaving the supervisor available
+for Quit. Quit arms an independent watchdog, including for IPC/installer requests;
+after 30 seconds the host exits with code 1 rather than waiting forever. This can
+interrupt unfinished artifacts. The fallback self-terminates with Windows
+`TerminateProcess`, without logging locks or DLL-detach callbacks (which can
+also deadlock; see [Microsoft's exit guidance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess)).
+Never kill only the camera thread or detach it
+and open replacement handles. Automatic SDK-hang recovery still requires a
+separate, restartable SDK-owning process; it is not implemented here.
+
+The preview encoder publishes failure health even on panic, checked during both
+settling and normal acquisition. Other service failures (video, uploads and
+retention) are monitored in acquisition; writer disconnects fail a still enqueue.
+Native SDK calls, filesystem operations and worker drain/join operations can
+still block. The host quit deadline bounds these hangs without pretending they
+can be safely cancelled on an individual thread.
 
 Ordered shutdown:
 
