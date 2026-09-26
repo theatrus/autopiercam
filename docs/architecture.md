@@ -164,6 +164,16 @@ edits** (adopt the newer revision and replace it on the next save) or **Discard
 changes**. Hiding the panel or switching sections keeps edits; the Settings
 button shows a dot while either section has unsaved changes.
 
+Each section has one width-constrained vertical form viewport with scrollbar
+clearance; the camera picker scrolls with the capture fields and discovery help
+lives in a flyout. Long numeric fields stack vertically. At narrow window widths
+Settings replaces the preview workspace instead of overflowing beside a fixed
+minimum-width preview; closing Settings restores the preview. The initial window
+size converts logical dimensions to physical pixels using the display scale and
+stays within the monitor work area. Capture connectivity is based only on the
+agent-status result: a hidden or failed optional Chatstronomy poll never disables
+Capture Save or falsely marks the agent disconnected.
+
 Numbers use bounded `NumberBox` controls with a label and unit in both
 sections, and on/off choices use toggle switches. A Chatstronomy number is read
 from the box's text while it has focus and from its committed value otherwise,

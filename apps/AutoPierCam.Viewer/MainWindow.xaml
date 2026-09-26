@@ -60,9 +60,9 @@
             </StackPanel>
         </Grid>
 
-        <Grid x:Name="WorkspaceGrid" Grid.Row="1" Padding="16,16,16,12" ColumnSpacing="0">
+        <Grid x:Name="WorkspaceGrid" Grid.Row="1" Padding="16,16,16,12" ColumnSpacing="0" SizeChanged="WorkspaceGrid_SizeChanged">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="2*" MinWidth="480" />
+                <ColumnDefinition x:Name="PreviewColumn" Width="*" />
                 <ColumnDefinition x:Name="SettingsColumn" Width="0" />
             </Grid.ColumnDefinitions>
 
@@ -164,7 +164,6 @@
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
                 <StackPanel Spacing="4">
-                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="Settings" />
                     <SelectorBar x:Name="SettingsSectionBar" SelectionChanged="SettingsSectionBar_SelectionChanged">
                         <SelectorBarItem x:Name="CaptureSectionItem" Text="Capture" IsSelected="True" />
                         <SelectorBarItem x:Name="SharingSectionItem" Text="Chatstronomy" />
@@ -182,6 +181,11 @@
                     <StackPanel Spacing="8">
                         <Button x:Name="RefreshButton" Click="RefreshButton_Click" Content="Reload settings"
                                 ToolTipService.ToolTip="Reload settings and camera discovery from the agent. The live preview updates automatically." />
+                    </StackPanel>
+                    <ScrollViewer x:Name="CaptureSettingsScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled" HorizontalScrollMode="Disabled"
+                                  HorizontalContentAlignment="Stretch" Padding="0,4,20,12">
+                    <StackPanel Spacing="16">
                         <StackPanel Spacing="6">
                             <TextBlock Text="Camera" />
                             <ComboBox
@@ -192,11 +196,15 @@
                                 SelectionChanged="CameraComboBox_SelectionChanged"
                                 PlaceholderText="Agent not connected" />
                             <Button x:Name="RefreshCamerasButton" Content="Reload camera list" IsEnabled="False" Click="RefreshCamerasButton_Click" />
-                            <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
+                            <Button Content="Camera discovery details">
+                                <Button.Flyout>
+                                    <Flyout>
+                                        <TextBlock x:Name="CameraHelpText" MaxWidth="340" FontSize="12" TextWrapping="Wrap"
+                                                   Text="Connect to the agent to choose a camera." />
+                                    </Flyout>
+                                </Button.Flyout>
+                            </Button>
                         </StackPanel>
-                    </StackPanel>
-                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                    <StackPanel Spacing="16">
                         <Expander Header="Agent activity and storage" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                         <StackPanel Spacing="12">
                         <Border Padding="12" Style="{StaticResource CardBorderStyle}">
@@ -322,11 +330,7 @@
                         </Border>
                         </StackPanel>
                         </Expander>
-                        <Grid ColumnSpacing="10">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="12">
                             <StackPanel Spacing="6">
                                 <TextBlock Text="Max exposure" />
                                 <NumberBox
@@ -338,7 +342,7 @@
                                     SpinButtonPlacementMode="Compact"
                                     Value="60000" />
                             </StackPanel>
-                            <StackPanel Grid.Column="1" Spacing="6">
+                            <StackPanel Spacing="6">
                                 <TextBlock Text="Max gain" />
                                 <NumberBox
                                     x:Name="MaxGainNumberBox"
@@ -348,7 +352,7 @@
                                     SpinButtonPlacementMode="Compact"
                                     Value="300" />
                             </StackPanel>
-                        </Grid>
+                        </StackPanel>
                         <TextBlock
                             FontSize="12"
                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -380,11 +384,7 @@
                                 SpinButtonPlacementMode="Compact"
                                 Value="10" />
                         </StackPanel>
-                        <Grid ColumnSpacing="10">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="12">
                             <StackPanel Spacing="6">
                                 <TextBlock Text="Managed image limit" />
                                 <NumberBox
@@ -397,7 +397,7 @@
                                     SmallChange="128"
                                     SpinButtonPlacementMode="Compact" />
                             </StackPanel>
-                            <StackPanel Grid.Column="1" Spacing="6">
+                            <StackPanel Spacing="6">
                                 <TextBlock Text="Minimum disk free" />
                                 <NumberBox
                                     x:Name="RetentionMinFreeMiBNumberBox"
@@ -409,7 +409,7 @@
                                     SmallChange="128"
                                     SpinButtonPlacementMode="Compact" />
                             </StackPanel>
-                        </Grid>
+                        </StackPanel>
                         <TextBlock
                             x:Name="RetentionSettingsAvailabilityText"
                             FontSize="12"
@@ -487,7 +487,9 @@
                                 ToolTipService.ToolTip="Reload Chatstronomy settings from the agent. Connection status updates automatically." />
                         <TextBlock x:Name="SharingConnectionText" TextWrapping="Wrap" Text="Not loaded" />
                     </StackPanel>
-                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <ScrollViewer x:Name="SharingSettingsScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled" HorizontalScrollMode="Disabled"
+                                  HorizontalContentAlignment="Stretch" Padding="0,4,20,12">
                         <StackPanel x:Name="SharingFields" Spacing="16">
                             <StackPanel x:Name="SharingPairingGroup" Spacing="10">
                                 <TextBlock FontSize="16" FontWeight="SemiBold" Text="Pair with your Hub" />
@@ -522,22 +524,18 @@
                                         </StackPanel>
                                         <ToggleSwitch x:Name="SharingDayNightToggle" Header="Send on day / night transitions" />
                                         <ToggleSwitch x:Name="SharingTelescopeToggle" Header="Send on slew / sequence events" />
-                                        <Grid ColumnSpacing="10">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
+                                        <StackPanel Spacing="12">
                                             <StackPanel Spacing="6">
                                                 <TextBlock Text="Images per event" />
                                                 <NumberBox x:Name="SharingBurstNumberBox" Header="1–3"
                                                            Minimum="1" Maximum="3" SmallChange="1" SpinButtonPlacementMode="Compact" />
                                             </StackPanel>
-                                            <StackPanel Grid.Column="1" Spacing="6">
+                                            <StackPanel Spacing="6">
                                                 <TextBlock Text="Time between images" />
                                                 <NumberBox x:Name="SharingSpacingNumberBox" Header="Seconds · 60–600"
                                                            Minimum="60" Maximum="600" SmallChange="10" SpinButtonPlacementMode="Compact" />
                                             </StackPanel>
-                                        </Grid>
+                                        </StackPanel>
                                         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                                    Text="Scene changes are not person or threat detection. Telescope events require the same owner and a shared Hub channel. Bursts wait for distinct completed frames; busy events are coalesced. The Hub posts at most one image per minute." />
                                     </StackPanel>

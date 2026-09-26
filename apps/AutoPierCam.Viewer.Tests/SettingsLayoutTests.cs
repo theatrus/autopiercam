@@ -1,4 +1,5 @@
 using System.Xml.Linq;
+using AutoPierCam.Viewer;
 using Xunit;
 
 public sealed class SettingsLayoutTests
@@ -51,10 +52,9 @@ public sealed class SettingsLayoutTests
     }
 
     [Theory]
-    [InlineData("CameraComboBox")]
     [InlineData("SaveButton")]
     [InlineData("ConfigInfoBar")]
-    public void CameraSaveAndFeedbackRemainOutsideScrollingContent(string name)
+    public void SaveAndFeedbackRemainOutsideScrollingContent(string name)
     {
         var markup = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
         XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
@@ -70,6 +70,61 @@ public sealed class SettingsLayoutTests
     }
 
     private static XDocument Markup() => XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+
+    [Theory]
+    [InlineData(1, 1180, 760)]
+    [InlineData(1.5, 1770, 1140)]
+    [InlineData(2, 2360, 1520)]
+    public void DefaultWindowUsesLogicalSizeAtHighDpi(double scale, int width, int height) =>
+        Assert.Equal((width, height), SettingsLayout.InitialWindowSize(scale, 3840, 2160));
+
+    [Fact]
+    public void DefaultWindowStaysWithinSmallMonitorWorkArea() =>
+        Assert.Equal((1228, 691), SettingsLayout.InitialWindowSize(2, 1365, 768));
+
+    [Theory]
+    [InlineData("CaptureSection", "CaptureSettingsScroll", "CameraComboBox")]
+    [InlineData("SharingSection", "SharingSettingsScroll", "SharingIntervalNumberBox")]
+    public void EachSectionHasOneWidthConstrainedScrollRegion(string section, string scroll, string field)
+    {
+        var markup = Markup();
+        var region = Named(markup, scroll);
+        Assert.Same(region, Assert.Single(Named(markup, section).Descendants(), e => e.Name.LocalName == "ScrollViewer"));
+        Assert.Contains(region, Named(markup, field).Ancestors());
+        Assert.Equal("1", (string?)region.Attribute("Grid.Row"));
+        Assert.Equal("Disabled", (string?)region.Attribute("HorizontalScrollMode"));
+        Assert.Equal("Disabled", (string?)region.Attribute("HorizontalScrollBarVisibility"));
+        Assert.Equal("Stretch", (string?)region.Attribute("HorizontalContentAlignment"));
+        Assert.Equal("0,4,20,12", (string?)region.Attribute("Padding"));
+        // Expanded groups do not contain a second explicit scroll viewport.
+        Assert.DoesNotContain(region.Descendants(), e => e.Name.LocalName == "ScrollViewer");
+    }
+
+    [Theory]
+    [InlineData(480)]
+    [InlineData(640)]
+    [InlineData(787)] // default 1180px window at 150% scaling
+    [InlineData(980)]
+    [InlineData(1180)]
+    public void ResponsivePaneFitsAvailableWidth(double width)
+    {
+        var layout = SettingsLayout.ForWidth(width, true);
+        Assert.InRange(layout.PaneWidth + layout.Gap, 0, width - 32);
+        if (layout.PreviewVisible) Assert.True(width - 32 - layout.PaneWidth - layout.Gap >= 480);
+        else Assert.Equal(width - 32, layout.PaneWidth);
+        Assert.Equal(new SettingsLayout(true, 0, 0), SettingsLayout.ForWidth(width, false));
+    }
+
+    [Theory]
+    [InlineData("MaxGainNumberBox")]
+    [InlineData("RetentionMinFreeMiBNumberBox")]
+    [InlineData("SharingSpacingNumberBox")]
+    public void LongNumericFieldsStackInsteadOfClippingInHalfWidthColumns(string name)
+    {
+        var field = Named(Markup(), name);
+        Assert.DoesNotContain(field.Ancestors().TakeWhile(e => e.Name.LocalName != "ScrollViewer")
+            .Select(e => (string?)e.Attribute("Grid.Column")), value => value == "1");
+    }
 
     [Fact]
     public void ChatstronomyIsASettingsSectionNotAToolbarButton()

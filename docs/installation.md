@@ -28,7 +28,9 @@ also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
 If several ASI cameras are connected, choose the desired model and camera ID
 from the Viewer's **Camera** picker, then **Save settings**.
-The picker and save button remain visible while other settings scroll. The save
+The picker scrolls with the form; Save and Discard stay visible below it. Settings
+uses the full workspace in narrow windows and a side panel in wider windows.
+The initial window size respects display scaling. The save
 status shows whether changes are pending, saved or rejected. **Reload settings**
 inside Settings asks before discarding edits; **Save next frame** does not discard
 them. The live preview updates automatically. The internal configuration
