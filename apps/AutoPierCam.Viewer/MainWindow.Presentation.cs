@@ -7,6 +7,16 @@ public sealed partial class MainWindow
 {
     private bool _cameraSettingsPrompted;
     private string _previewDimensions = "";
+    private long? _lastPreviewGain;
+    private string? _lastPreviewMode;
+
+    private void SetCaptureSummary(long? exposureUs, long? gain, string? mode)
+    {
+        string summary = ViewerPresentation.CaptureSummary(exposureUs, gain, mode);
+        CaptureSummaryText.Text = summary;
+        CaptureSummaryText.Visibility = summary.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        ToolTipService.SetToolTip(CaptureSummaryText, summary);
+    }
 
     private void SettingsButton_Click(object sender, RoutedEventArgs args) =>
         SetSettingsVisible(SettingsPane.Visibility != Visibility.Visible);
