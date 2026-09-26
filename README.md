@@ -236,7 +236,7 @@ healthy.
   available.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an
-  off-camera-thread 1280-pixel-edge, JPEG-quality-75 encoder. Up to four
+  off-camera-thread 1920-pixel-edge, JPEG-quality-75 encoder. Up to four
   independent active preview clients can coexist; a fifth retries when a slot
   becomes available. A slow client cannot stall capture or the other clients.
 - Auto-exposure limits use microseconds in AutoPierCam configuration. SDK 1.41

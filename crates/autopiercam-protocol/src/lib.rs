@@ -18,8 +18,8 @@ pub const PREVIEW_PROTOCOL_VERSION: u16 = 1;
 pub const PREVIEW_PIPE_NAME: &str = "autopiercam-preview-v1";
 pub const MAX_PREVIEW_METADATA_SIZE: usize = 4 * 1024;
 pub const MAX_PREVIEW_JPEG_SIZE: usize = 4 * 1024 * 1024;
-pub const PREVIEW_MAX_DIMENSION: u32 = 1_280;
-pub const PREVIEW_MAX_PIXELS: u64 = 1_638_400;
+pub const PREVIEW_MAX_DIMENSION: u32 = 1_920;
+pub const PREVIEW_MAX_PIXELS: u64 = 3_686_400;
 
 pub const METHOD_UPLOADS_LIST: &str = "uploads.list";
 pub const METHOD_UPLOADS_REQUEUE: &str = "uploads.requeue";

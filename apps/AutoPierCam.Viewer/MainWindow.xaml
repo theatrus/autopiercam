@@ -31,10 +31,12 @@
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
                     <FontIcon
+                        x:Name="StatusWarningIcon"
                         FontFamily="Segoe MDL2 Assets"
                         FontSize="12"
                         Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                        Glyph="&#xE783;" />
+                        Glyph="&#xE783;"
+                        Visibility="Collapsed" />
                     <TextBlock
                         x:Name="StatusText"
                         Grid.Column="1"
@@ -62,13 +64,14 @@
                     Content="Capture now"
                     Style="{StaticResource AccentButtonStyle}" />
                 <Button x:Name="PauseButton" Content="Pause recording" IsEnabled="False" Click="PauseButton_Click" />
+                <Button x:Name="SettingsButton" Content="Settings" Click="SettingsButton_Click" />
             </StackPanel>
         </Grid>
 
-        <Grid Grid.Row="1" Padding="24" ColumnSpacing="20">
+        <Grid x:Name="WorkspaceGrid" Grid.Row="1" Padding="24" ColumnSpacing="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="2*" MinWidth="480" />
-                <ColumnDefinition Width="360" />
+                <ColumnDefinition x:Name="SettingsColumn" Width="0" />
             </Grid.ColumnDefinitions>
 
             <Grid RowSpacing="14">
@@ -120,6 +123,19 @@
                                 Foreground="White"
                                 Text="CONNECTING" />
                         </Border>
+                        <Button Content="Details" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="12"
+                                AutomationProperties.Name="Preview details and resolution">
+                            <Button.Flyout>
+                                <Flyout>
+                                    <StackPanel Width="380" Spacing="12">
+                                        <TextBlock Text="Preview details" FontSize="18" FontWeight="SemiBold" />
+                                        <TextBlock x:Name="PreviewDiagnosticsText" Text="Waiting for preview stream" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                                        <TextBlock Text="The preview is reduced to a 1920-pixel long edge (full HD for 16:9 cameras). Saved stills use the capture dimensions (full sensor by default), not the preview size. Security video uses the preview resolution."
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
                         <Border
                             Margin="12"
                             Padding="10,6"
@@ -133,7 +149,8 @@
                                 Foreground="White"
                                 MaxWidth="490"
                                 Text="Waiting for preview stream"
-                                TextWrapping="Wrap" />
+                                TextTrimming="CharacterEllipsis"
+                                TextWrapping="NoWrap" />
                         </Border>
                     </Grid>
                 </Border>
@@ -172,7 +189,7 @@
                 </Grid>
             </Grid>
 
-            <Grid Grid.Column="1" RowSpacing="12">
+            <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="12" Visibility="Collapsed">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
@@ -201,7 +218,7 @@
                         <StackPanel Spacing="4">
                             <TextBlock
                                 FontSize="12"
-                                Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 Text="Agent activity" />
                             <TextBlock
                                 x:Name="FrameCountsText"
@@ -434,14 +451,15 @@
                     <InfoBar
                         x:Name="ConfigInfoBar"
                         IsClosable="False"
-                        IsOpen="True"
+                        IsOpen="False"
+                        IsIconVisible="False"
                         Message="Connect to the local agent to load settings."
                         Severity="Informational" />
                     <Button
                         x:Name="SaveButton"
                         HorizontalAlignment="Stretch"
                         Click="SaveButton_Click"
-                        Content="Save and restart capture"
+                        Content="Save settings"
                         IsEnabled="False"
                         Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>

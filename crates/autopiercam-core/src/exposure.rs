@@ -44,6 +44,23 @@ impl AdaptiveExposure {
         self.mode
     }
 
+    /// Keep day/night history when an operator changes the permitted range.
+    pub fn update_limits(
+        &mut self,
+        min_us: i64,
+        max_us: i64,
+        min_gain: i64,
+        max_gain: i64,
+        target: u8,
+    ) {
+        let next = Self::new(min_us, max_us, min_gain, max_gain, target);
+        self.min_us = next.min_us;
+        self.max_us = next.max_us;
+        self.min_gain = next.min_gain;
+        self.max_gain = next.max_gain;
+        self.target = next.target;
+    }
+
     pub fn observe(&mut self, current: ExposureSetting, stats: LumaStats) -> ExposureSetting {
         // Three frames of evidence plus separated thresholds prevent twilight chatter.
         let opposite = match self.mode {

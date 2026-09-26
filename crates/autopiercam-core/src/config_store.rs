@@ -109,7 +109,9 @@ impl ConfigStore {
             .into());
         }
 
-        atomic_write(&self.path, &canonical)?;
+        if current.config != config {
+            atomic_write(&self.path, &canonical)?;
+        }
         Ok(ConfigSnapshot {
             revision: fnv1a(&canonical),
             config,
@@ -444,6 +446,22 @@ mod tests {
         let edited = store.snapshot().unwrap();
         assert_ne!(edited.revision, initial.revision);
         assert_eq!(edited.config.api.listen, "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn unchanged_save_preserves_file_bytes_and_revision() {
+        let directory = TestDir::new("unchanged");
+        let path = directory.config_path();
+        let store = ConfigStore::open(&path).unwrap();
+        let original = format!(
+            "# Operator comment remains on a no-op save\n{}",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, &original).unwrap();
+        let current = store.snapshot().unwrap();
+        let saved = store.replace(current.revision, current.config).unwrap();
+        assert_eq!(saved.revision, current.revision);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]

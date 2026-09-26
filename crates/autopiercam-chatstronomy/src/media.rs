@@ -12,8 +12,8 @@ fn decode(frame: &Frame) -> Result<image::DynamicImage> {
     }
     let mut reader = ImageReader::with_format(Cursor::new(&frame.jpeg), image::ImageFormat::Jpeg);
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(1280);
-    limits.max_image_height = Some(1280);
+    limits.max_image_width = Some(1920);
+    limits.max_image_height = Some(1920);
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
     Ok(reader.decode()?)

@@ -95,6 +95,7 @@ public sealed partial class MainWindow : Window
                         else
                         {
                             _liveStatusUnavailable = true;
+                            StatusWarningIcon.Visibility = Visibility.Visible;
                             StatusText.Text = "Agent status unavailable · reconnecting";
                             AgentConnectionText.Text = "Rust agent: status unavailable";
                             SetControlsForOperation(false);
@@ -185,8 +186,7 @@ public sealed partial class MainWindow : Window
             _progressObservation = null;
             ClearPreviewImage();
             PreviewStatusText.Text = "CONNECTING";
-            PreviewDetailText.Text =
-                $@"Connecting to \\.\pipe\{_previewClient.PipeName}";
+            SetPreviewDetail("Connecting to preview…", $@"Connecting to \\.\pipe\{_previewClient.PipeName}");
             return;
         }
 
@@ -201,7 +201,7 @@ public sealed partial class MainWindow : Window
             case PreviewStreamPhase.WaitingForFrame:
                 ClearPreviewImage();
                 PreviewStatusText.Text = "WAITING";
-                PreviewDetailText.Text = "Connected; waiting for the newest camera frame";
+                SetPreviewDetail("Waiting for first frame", "Connected; waiting for the newest camera frame");
                 UpdatePreviewPresentation();
                 break;
             case PreviewStreamPhase.Reconnecting:
@@ -211,7 +211,7 @@ public sealed partial class MainWindow : Window
                 string retry = state.RetryDelay is TimeSpan retryDelay
                     ? $" Retrying in {retryDelay.TotalSeconds:0.##} seconds."
                     : string.Empty;
-                PreviewDetailText.Text = $"{Compact(state.Detail ?? "Preview stream disconnected.")}{retry}";
+                SetPreviewDetail("Preview disconnected · retrying…", $"{Compact(state.Detail ?? "Preview stream disconnected.")}{retry}");
                 break;
             case PreviewStreamPhase.Live:
                 // A successfully decoded frame owns the LIVE presentation.
@@ -260,7 +260,7 @@ public sealed partial class MainWindow : Window
             ModeValueText.Text = FormatPreviewMode(frame.Metadata.Mode);
 
             _lastPreviewDetail = FormatPreviewDetail(frame.Metadata);
-            PreviewDetailText.Text = _lastPreviewDetail;
+            _previewDimensions = $"{frame.Metadata.Width}×{frame.Metadata.Height}";
             _previewFrameClock.RecordFrame(
                 frame.Metadata.CapturedAtUnixMs,
                 frame.Metadata.SessionGeneration,
@@ -336,8 +336,8 @@ public sealed partial class MainWindow : Window
                 : frameOverdue ? "WAITING"
                 : exposure?.Settling == true ? "SETTLING"
                 : exposure is not null ? "EXPOSING" : "WAITING";
-            PreviewDetailText.Text = progressDetail ??
-                "Connected; waiting for the newest camera frame";
+            SetPreviewDetail(captureStopped ? "Capture stopped" : "Waiting for first frame",
+                progressDetail ?? "Connected; waiting for the newest camera frame");
             return;
         }
 
@@ -354,20 +354,11 @@ public sealed partial class MainWindow : Window
             : exposure?.Settling == true ? "SETTLING" : "LIVE";
         string? sameSessionDetail = ExposurePresentation.Describe(
             _progressObservation, observationAge, _lastPreviewSessionGeneration);
-        if (stale)
-        {
-            string stoppedDetail = captureStopped && sameSessionDetail is not null
-                ? $" {sameSessionDetail}"
-                : string.Empty;
-            PreviewDetailText.Text =
-                $"Snapshot is {age.TotalSeconds:0} seconds old; waiting for a new preview.{stoppedDetail} · {_lastPreviewDetail}";
-        }
-        else
-        {
-            PreviewDetailText.Text = sameSessionDetail is not null
-                ? $"{sameSessionDetail} · {_lastPreviewDetail}"
-                : _lastPreviewDetail;
-        }
+        string diagnostics = _lastPreviewDetail + "\n" + (sameSessionDetail ?? ExposureProgressText.Text);
+        if (exposure?.Settling == true && sameSession)
+            diagnostics += "\nPreview is active; still recording starts after exposure stabilizes.";
+        if (stale) diagnostics += $"\nLast preview is {age.TotalSeconds:0} seconds old; waiting for a new frame.";
+        SetPreviewDetail(ViewerPresentation.PreviewCaption(_previewDimensions, age, captureStopped, stale), diagnostics);
     }
 
     private void ShowPreviewFrameError(string detail)
@@ -380,7 +371,7 @@ public sealed partial class MainWindow : Window
         _previewFrameError = true;
         PreviewStatusText.Text = "FRAME ERROR";
         PreviewImage.Opacity = 0.45;
-        PreviewDetailText.Text = Compact(detail);
+        SetPreviewDetail("Preview error · see Details", Compact(detail));
     }
 
     private void ClearPreviewImage()
@@ -556,18 +547,25 @@ public sealed partial class MainWindow : Window
         };
         _hasUnsavedSettings = false;
         // Capabilities remain valid across an accepted camera restart.
-        if (_latestAgentStatus is { } priorStatus)
+        if (result.RestartScheduled && _latestAgentStatus is { } priorStatus)
             _latestAgentStatus = priorStatus with { State = "starting", Camera = null, Upload = null, Storage = null };
         ApplyConfiguration(_configurationSnapshot);
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
         _configurationNeedsRefresh = false;
-        ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
-        ClearStorageStatus();
+        if (result.RestartScheduled)
+        {
+            ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
+            ClearStorageStatus();
+        }
         ConfigInfoBar.Title = "Settings saved";
-        ConfigInfoBar.Message = "Capture is restarting with your settings.";
-        ConfigInfoBar.Severity = InfoBarSeverity.Success;
-        StatusText.Text = "Settings saved; capture restart requested.";
+        ConfigInfoBar.Message = result.RestartScheduled
+            ? "Camera or image format changed. Capture is restarting."
+            : "Settings saved. The camera stays running; changes apply on its next control poll.";
+        SetConfigurationFeedback(InfoBarSeverity.Success, true);
+        StatusText.Text = result.RestartScheduled
+            ? "Settings saved; camera restart requested."
+            : "Settings saved; capture continues.";
     }
 
     private async Task ManageOutboxAsync(CancellationToken cancellationToken)
@@ -1118,8 +1116,8 @@ public sealed partial class MainWindow : Window
         _hasUnsavedSettings = false;
         ConfigInfoBar.Title = "Settings loaded";
         ConfigInfoBar.Message =
-            "Choose your settings, then save to apply them and restart capture.";
-        ConfigInfoBar.Severity = InfoBarSeverity.Informational;
+            "Choose your settings, then save to apply them.";
+        SetConfigurationFeedback(InfoBarSeverity.Informational, false);
     }
 
     private AgentConfiguration BuildConfigurationFromInputs(AgentConfiguration original)
@@ -1265,6 +1263,14 @@ public sealed partial class MainWindow : Window
             $"Rust agent: connected · {PipeDisplayName}";
         _latestAgentStatus = status;
         _liveStatusUnavailable = false;
+        StatusWarningIcon.Visibility = ViewerPresentation.HasWarning(status) ? Visibility.Visible : Visibility.Collapsed;
+        ToolTipService.SetToolTip(StatusWarningIcon, status.LastError ?? "Capture or storage needs attention.");
+        if (!_cameraSettingsPrompted && ViewerPresentation.NeedsCameraSelection(status))
+        {
+            _cameraSettingsPrompted = true;
+            SetSettingsVisible(true);
+        }
+        if (status.State is "capturing" or "paused") _cameraSettingsPrompted = false;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
         bool? uploadEnabled = _configurationNeedsRefresh
@@ -1318,7 +1324,8 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Title = "Configuration unavailable";
         ConfigInfoBar.Message =
             "Reconnect and select Refresh before editing or saving settings.";
-        ConfigInfoBar.Severity = InfoBarSeverity.Warning;
+        StatusWarningIcon.Visibility = Visibility.Visible;
+        SetConfigurationFeedback(InfoBarSeverity.Warning, true);
     }
 
     private void ShowUncertain(string detail)
@@ -1339,7 +1346,8 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Title = "Refresh required";
         ConfigInfoBar.Message =
             "The timed-out request may have changed agent state. Refresh before saving configuration.";
-        ConfigInfoBar.Severity = InfoBarSeverity.Warning;
+        StatusWarningIcon.Visibility = Visibility.Visible;
+        SetConfigurationFeedback(InfoBarSeverity.Warning, true);
     }
 
     private void ShowAgentFailure(string detail)
@@ -1369,7 +1377,7 @@ public sealed partial class MainWindow : Window
         StatusText.Text = message;
         ConfigInfoBar.Title = "Settings changed elsewhere";
         ConfigInfoBar.Message = message;
-        ConfigInfoBar.Severity = InfoBarSeverity.Error;
+        SetConfigurationFeedback(InfoBarSeverity.Error, true, openSettings: true);
         AgentLastErrorText.Text = message;
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Refresh to reload upload activity after the revision conflict.");
@@ -1388,7 +1396,7 @@ public sealed partial class MainWindow : Window
         StatusText.Text = Compact(message);
         ConfigInfoBar.Title = "Configuration saved; restart required";
         ConfigInfoBar.Message = Compact(message);
-        ConfigInfoBar.Severity = InfoBarSeverity.Warning;
+        SetConfigurationFeedback(InfoBarSeverity.Warning, true, openSettings: true);
         AgentLastErrorText.Text = Compact(message);
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Refresh after restarting to load upload activity.");
@@ -1405,7 +1413,7 @@ public sealed partial class MainWindow : Window
         StatusText.Text = "Settings were not saved — see the message beside Save.";
         ConfigInfoBar.Title = "Check configuration values";
         ConfigInfoBar.Message = message;
-        ConfigInfoBar.Severity = InfoBarSeverity.Error;
+        SetConfigurationFeedback(InfoBarSeverity.Error, true, openSettings: true);
         // Rejected settings do not disconnect the agent or revoke capabilities.
     }
 
@@ -1554,6 +1562,7 @@ public sealed partial class MainWindow : Window
     {
         bool generalControlsEnabled = !inProgress && !_closed;
         RefreshButton.IsEnabled = generalControlsEnabled;
+        SettingsButton.IsEnabled = generalControlsEnabled;
         CaptureButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         PauseButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable && _latestAgentStatus?.State is "capturing" or "paused";
         PauseButton.Content = _latestAgentStatus?.State == "paused" ? "Resume recording" : "Pause recording";

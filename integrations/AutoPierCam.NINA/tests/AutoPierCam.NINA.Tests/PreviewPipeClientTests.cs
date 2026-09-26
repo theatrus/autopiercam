@@ -14,6 +14,18 @@ public sealed class PreviewPipeClientTests
     ];
 
     [Fact]
+    public async Task AcceptsFullHdPreview()
+    {
+        var metadata = ValidMetadata().Replace("\"width\":640", "\"width\":1920").Replace("\"height\":480", "\"height\":1080");
+        byte[] jpeg = [0xff, 0xd8, 0xff, 0xc0, 0x00, 0x07, 0x08, 0x04, 0x38, 0x07, 0x80, 0xff, 0xd9];
+        await using var stream = BuildRecord(metadata, jpeg);
+        var frame = await new PreviewPipeClient().ReadFrameAsync(stream);
+        Assert.NotNull(frame);
+        Assert.Equal(1920u, frame.Metadata.Width);
+        Assert.Equal(1080u, frame.Metadata.Height);
+    }
+
+    [Fact]
     public async Task ReadsValidProtocolV1Record()
     {
         var client = new PreviewPipeClient();
@@ -94,7 +106,7 @@ public sealed class PreviewPipeClientTests
     }
 
     [Theory]
-    [InlineData("\"width\":640", "\"width\":1281", "edge limit")]
+    [InlineData("\"width\":640", "\"width\":1921", "edge limit")]
     [InlineData("\"mode\":\"night\"", "\"mode\":\"twilight\"", "Unsupported preview mode")]
     [InlineData("\"exposure_us\":12500", "\"exposure_us\":0", "exposure must be positive")]
     [InlineData("\"gain\":120", "\"gain\":-1", "gain must not be negative")]

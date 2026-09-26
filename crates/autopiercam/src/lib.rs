@@ -125,6 +125,7 @@ pub struct AgentControl {
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     capture_generation: Arc<AtomicU64>,
+    reload_pending: Arc<AtomicBool>,
 }
 
 impl AgentControl {
@@ -147,6 +148,11 @@ impl AgentControl {
     /// Queue one still from the next available frame, including while paused.
     pub fn capture_now(&self) {
         self.capture_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Coalesces saves; only the camera-owning thread reads and applies them.
+    pub fn reload_configuration(&self) {
+        self.reload_pending.store(true, Ordering::Release);
     }
 
     pub fn shutdown(&self) {
@@ -1022,59 +1028,10 @@ fn run_agent_inner(
     }
     let config_path = std::path::absolute(config_path)
         .with_context(|| format!("resolving configuration path {}", config_path.display()))?;
-    let config = Config::load(&config_path)?;
-    // Headless recording uses the same bounded preview encoder as the tray.
-    let video_preview =
-        (config.video.enabled && preview.is_none()).then(|| PreviewHub::new().begin_session());
-    let preview = preview.or(video_preview.as_ref());
-    let configured_capture_directory = if config.capture.directory.is_absolute() {
-        config.capture.directory.clone()
-    } else {
-        config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(&config.capture.directory)
-    };
-    let capture_directory =
-        std::path::absolute(&configured_capture_directory).with_context(|| {
-            format!(
-                "resolving capture directory {}",
-                configured_capture_directory.display()
-            )
-        })?;
-    std::fs::create_dir_all(&capture_directory)
-        .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
-    let capture_session_nonce = CaptureSessionNonce::random()?;
-
-    let upload_ledger_path = config_path.with_extension("upload.sqlite3");
-    // UploadStore owns this shared lifecycle lease while uploads are enabled.
-    // Disabled runs still publish captures and may delete them via retention,
-    // so they must independently exclude offline migration/archive for the
-    // complete writer/retention lifetime.
-    let disabled_upload_ledger_lease =
-        acquire_disabled_upload_ledger_lease(&config.upload, &upload_ledger_path)?;
-    let (upload_worker, upload_sink) = match start_upload_worker(
-        &config.upload,
-        &upload_ledger_path,
-        &capture_directory,
-        monitor,
-    )? {
-        Some((worker, sink)) => (Some(worker), Some(sink)),
-        None => (None, None),
-    };
-    let upload_admin_registration = upload_sink
-        .as_ref()
-        .map(|sink| monitor.register_upload_admin(sink.admin()));
-    let (retention_worker, retention_sink) = match start_retention_worker(
-        &config,
-        &upload_ledger_path,
-        &capture_directory,
-        upload_sink.as_ref(),
-        monitor,
-    )? {
-        Some((worker, sink)) => (Some(worker), Some(sink)),
-        None => (None, None),
-    };
+    let mut config = Config::load(&config_path)?;
+    // Keep the same preview session even when recording services are reconfigured.
+    let local_preview = preview.is_none().then(|| PreviewHub::new().begin_session());
+    let preview = preview.or(local_preview.as_ref());
     let info = select_configured_camera(cameras, &config.camera)?;
     if !info.is_color {
         bail!(
@@ -1086,7 +1043,7 @@ fn run_agent_inner(
     let bayer = core_bayer(info.bayer_pattern)?;
     let mut camera = sdk.open(info.clone())?;
     let controls = camera.controls()?;
-    let auto_limits = if config.camera.exposure_control == ExposureControl::Adaptive {
+    let mut auto_limits = if config.camera.exposure_control == ExposureControl::Adaptive {
         configure_adaptive(&mut camera, &controls, &config.camera)?
     } else {
         configure_sdk_auto(
@@ -1139,12 +1096,134 @@ fn run_agent_inner(
         image_type,
     };
     camera.set_roi(roi)?;
+    info!(camera = %info.name, width = roi.width, height = roi.height, bin = roi.bin,
+        "continuous camera session started");
 
-    // Start every remaining fallible helper before the writer. Once the writer
-    // is running, execution always reaches the explicit join sequence below,
-    // keeping the ledger lifecycle lease held until publication has drained.
     let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
+    let mut state = CaptureLoopState::default();
+    state.configure_exposure(&config.camera, auto_limits);
+    camera.start_video()?;
+    let result = (|| {
+        loop {
+            if !run_recording_epoch(
+                sdk,
+                &mut camera,
+                bayer,
+                &mut auto_limits,
+                &mut config,
+                &config_path,
+                max_frames,
+                control,
+                monitor,
+                preview,
+                preview_sink.as_ref(),
+                &mut state,
+            )? || control.is_shutdown()
+            {
+                break;
+            }
+            let next = Config::load(&config_path)?;
+            // Device/layout saves are handled by the supervisor's explicit restart.
+            // Never apply an incompatible raw buffer layout to a running camera.
+            if config.requires_camera_restart(&next) {
+                bail!("camera layout changed; capture must restart");
+            }
+            if config.camera != next.camera {
+                auto_limits = if next.camera.exposure_control == ExposureControl::Adaptive {
+                    configure_adaptive(&mut camera, &controls, &next.camera)?
+                } else {
+                    configure_sdk_auto(
+                        &mut camera,
+                        &controls,
+                        next.camera.max_exposure_us,
+                        next.camera.max_gain,
+                        next.camera.target_brightness,
+                    )?
+                };
+                state.configure_exposure(&next.camera, auto_limits);
+            }
+            if config.capture.interval_ms != next.capture.interval_ms {
+                state.next_capture =
+                    Instant::now() + Duration::from_millis(next.capture.interval_ms);
+            }
+            config = next;
+            info!("settings reloaded without restarting the camera or settling");
+        }
+        Ok(())
+    })();
+    let stop_result = camera.stop_video().map_err(Into::into);
+    let preview_result = preview_encoder
+        .map(PreviewEncoder::stop_and_join)
+        .unwrap_or(Ok(()));
+    result.and(stop_result).and(preview_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_recording_epoch(
+    sdk: &Sdk,
+    camera: &mut Camera,
+    bayer: BayerPattern,
+    auto_limits: &mut AutoLimits,
+    config: &mut Config,
+    config_path: &Path,
+    max_frames: Option<u64>,
+    control: &AgentControl,
+    monitor: &AgentMonitor,
+    preview: Option<&PreviewSession>,
+    preview_sink: Option<&PreviewSink>,
+    state: &mut CaptureLoopState,
+) -> Result<bool> {
+    let configured_capture_directory = if config.capture.directory.is_absolute() {
+        config.capture.directory.clone()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&config.capture.directory)
+    };
+    let capture_directory =
+        std::path::absolute(&configured_capture_directory).with_context(|| {
+            format!(
+                "resolving capture directory {}",
+                configured_capture_directory.display()
+            )
+        })?;
+    std::fs::create_dir_all(&capture_directory)
+        .with_context(|| format!("creating capture directory {}", capture_directory.display()))?;
+    let capture_session_nonce = CaptureSessionNonce::random()?;
+
+    monitor.write().upload = None;
+    monitor.write().storage = None;
+    let upload_ledger_path = config_path.with_extension("upload.sqlite3");
+    // UploadStore owns this shared lifecycle lease while uploads are enabled.
+    // Disabled runs still publish captures and may delete them via retention,
+    // so they must independently exclude offline migration/archive for the
+    // complete writer/retention lifetime.
+    let disabled_upload_ledger_lease =
+        acquire_disabled_upload_ledger_lease(&config.upload, &upload_ledger_path)?;
+    let (upload_worker, upload_sink) = match start_upload_worker(
+        &config.upload,
+        &upload_ledger_path,
+        &capture_directory,
+        monitor,
+    )? {
+        Some((worker, sink)) => (Some(worker), Some(sink)),
+        None => (None, None),
+    };
+    let upload_admin_registration = upload_sink
+        .as_ref()
+        .map(|sink| monitor.register_upload_admin(sink.admin()));
+    let (retention_worker, retention_sink) = match start_retention_worker(
+        config,
+        &upload_ledger_path,
+        &capture_directory,
+        upload_sink.as_ref(),
+        monitor,
+    )? {
+        Some((worker, sink)) => (Some(worker), Some(sink)),
+        None => (None, None),
+    };
     let video_worker = if config.video.enabled {
         Some(video::VideoWorker::start(
             &config.video,
@@ -1179,20 +1258,12 @@ fn run_agent_inner(
         })
         .context("starting still writer")?;
 
-    info!(
-        camera = %info.name,
-        width = roi.width,
-        height = roi.height,
-        bin = roi.bin,
-        directory = %capture_directory.display(),
-        "continuous capture worker started"
-    );
     let capture_result = capture_loop(
         sdk,
-        &mut camera,
+        camera,
         bayer,
         auto_limits,
-        &config,
+        config,
         &capture_directory,
         max_frames,
         control,
@@ -1200,19 +1271,17 @@ fn run_agent_inner(
         &writer_tx,
         upload_health.as_ref(),
         retention_sink.as_ref(),
-        preview_sink.as_ref(),
+        preview_sink,
         preview.map(PreviewSession::generation).unwrap_or(0),
         capture_session_nonce,
         video_worker.as_ref(),
+        config_path,
+        state,
     );
-    monitor.set_state(AgentState::Stopping);
     drop(writer_tx);
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("still-writer thread panicked"));
-    let preview_result = preview_encoder
-        .map(PreviewEncoder::stop_and_join)
-        .unwrap_or(Ok(()));
     let video_result = video_worker
         .map(video::VideoWorker::stop_and_join)
         .unwrap_or(Ok(()));
@@ -1225,13 +1294,11 @@ fn run_agent_inner(
         .unwrap_or(Ok(()));
     drop(disabled_upload_ledger_lease);
     video_result.context("recording video")?;
-    capture_result?;
+    let reload = capture_result?;
     writer_result??;
     retention_result.context("stopping capture retention worker")?;
     upload_result.context("stopping HTTP upload worker")?;
-    preview_result?;
-    info!("continuous capture worker stopped cleanly");
-    Ok(())
+    Ok(reload)
 }
 
 fn acquire_disabled_upload_ledger_lease(
@@ -1253,13 +1320,61 @@ fn acquire_disabled_upload_ledger_lease(
         })
 }
 
+/// Survives recording-service reloads: no new startup gate, duplicate capture
+/// requests, reset interval, or lost adaptive controller history.
+struct CaptureLoopState {
+    settled: bool,
+    adaptive: Option<AdaptiveExposure>,
+    seen_capture_generation: u64,
+    next_capture: Instant,
+    queued: u64,
+}
+
+impl Default for CaptureLoopState {
+    fn default() -> Self {
+        Self {
+            settled: false,
+            adaptive: None,
+            seen_capture_generation: 0,
+            next_capture: Instant::now(),
+            queued: 0,
+        }
+    }
+}
+
+impl CaptureLoopState {
+    fn configure_exposure(&mut self, config: &CameraConfig, limits: AutoLimits) {
+        if config.exposure_control == ExposureControl::Adaptive
+            && let Some(controller) = &mut self.adaptive
+        {
+            controller.update_limits(
+                limits.min_exposure_us,
+                limits.max_exposure_us,
+                limits.min_gain,
+                limits.max_gain,
+                limits.target_brightness as u8,
+            );
+            return;
+        }
+        self.adaptive = (config.exposure_control == ExposureControl::Adaptive).then(|| {
+            AdaptiveExposure::new(
+                limits.min_exposure_us,
+                limits.max_exposure_us,
+                limits.min_gain,
+                limits.max_gain,
+                limits.target_brightness as u8,
+            )
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     sdk: &Sdk,
     camera: &mut Camera,
     bayer: BayerPattern,
-    auto_limits: AutoLimits,
-    config: &Config,
+    auto_limits: &mut AutoLimits,
+    config: &mut Config,
     capture_directory: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1271,58 +1386,73 @@ fn capture_loop(
     preview_session_generation: u64,
     capture_session_nonce: CaptureSessionNonce,
     video: Option<&video::VideoWorker>,
-) -> Result<()> {
-    camera.start_video()?;
+    config_path: &Path,
+    state: &mut CaptureLoopState,
+) -> Result<bool> {
+    let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+    observer.inventory_sdk = Some(sdk);
+    observer.video = video;
+    observer.adaptive = state.adaptive.take();
     let result = (|| {
         let mut progress = CaptureProgress::new(
             camera,
-            auto_limits,
+            *auto_limits,
             preview_session_generation,
             config.camera.settle_frames,
         );
-        let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
-        observer.inventory_sdk = Some(sdk);
-        observer.video = video;
-        if config.camera.exposure_control == ExposureControl::Adaptive {
-            observer.adaptive = Some(AdaptiveExposure::new(
-                auto_limits.min_exposure_us,
-                auto_limits.max_exposure_us,
-                auto_limits.min_gain,
-                auto_limits.max_gain,
-                auto_limits.target_brightness as u8,
-            ));
-        }
+        progress.status.settling = !state.settled;
         progress.publish(&observer);
-        let Some(settling_frame) = wait_for_auto_settle(
-            camera,
-            config.camera.settle_frames,
-            auto_limits,
-            Some(control),
-            &mut progress,
-            &mut observer,
-        )?
-        else {
-            return Ok(());
+        let mut pending_frame = if state.settled {
+            None
+        } else {
+            let Some(frame) = wait_for_auto_settle(
+                camera,
+                config.camera.settle_frames,
+                *auto_limits,
+                Some(control),
+                &mut progress,
+                &mut observer,
+            )?
+            else {
+                return Ok(false);
+            };
+            state.settled = true;
+            Some(frame)
         };
         progress.status.settling = false;
         progress.publish(&observer);
-        // Settling already observed and published this frame. Reuse its owned
-        // sample for the first still without another exposure or double count.
-        let mut pending_frame = Some(settling_frame);
         let mut frame_buffer = Vec::new();
         // Each AgentControl belongs to one camera attempt, so generation zero
         // preserves requests made during startup/auto-exposure settling.
-        let mut seen_capture_generation = 0;
+
         monitor.set_state(if control.is_paused() {
             AgentState::Paused
         } else {
             AgentState::Capturing
         });
-        let interval = Duration::from_millis(config.capture.interval_ms);
-        let mut next_capture = Instant::now();
-        let mut queued = 0_u64;
 
         while !control.is_shutdown() {
+            if control.reload_pending.swap(false, Ordering::AcqRel) {
+                let next = Config::load(config_path)?;
+                if config.requires_camera_restart(&next) || config.requires_recording_reload(&next)
+                {
+                    return Ok(true);
+                }
+                if config.camera != next.camera {
+                    *auto_limits = reconfigure_exposure(camera, &next.camera)?;
+                    state.adaptive = observer.adaptive.take();
+                    state.configure_exposure(&next.camera, *auto_limits);
+                    observer.adaptive = state.adaptive.take();
+                    progress.status.max_exposure_us = auto_limits.max_exposure_us;
+                    progress.refresh(camera, *auto_limits);
+                    progress.publish(&observer);
+                }
+                if config.capture.interval_ms != next.capture.interval_ms {
+                    state.next_capture =
+                        Instant::now() + Duration::from_millis(next.capture.interval_ms);
+                }
+                *config = next;
+            }
             observer.refresh_inventory();
             if video.is_some_and(video::VideoWorker::is_finished) {
                 bail!("video worker stopped unexpectedly");
@@ -1336,7 +1466,7 @@ fn capture_loop(
             let frame = if let Some(frame) = pending_frame.take() {
                 frame
             } else {
-                progress.refresh(camera, auto_limits);
+                progress.refresh(camera, *auto_limits);
                 progress.publish(&observer);
                 if progress.wait.expired(progress.started.elapsed()) {
                     bail!(
@@ -1351,7 +1481,7 @@ fn capture_loop(
                 if control.is_shutdown() {
                     break;
                 }
-                progress.refresh(camera, auto_limits);
+                progress.refresh(camera, *auto_limits);
                 progress.publish(&observer);
                 let meta = match result {
                     Ok(meta) => meta,
@@ -1368,7 +1498,7 @@ fn capture_loop(
                 };
                 let frame = progress.completed_frame(meta, &mut frame_buffer);
                 observer.adapt(camera, &frame)?;
-                progress.refresh(camera, auto_limits);
+                progress.refresh(camera, *auto_limits);
                 observer.frame_received(&frame, false, control.is_paused());
                 progress.publish(&observer);
                 frame
@@ -1378,23 +1508,23 @@ fn capture_loop(
             frame_buffer = frame.data;
             let now = Instant::now();
             let capture_generation = control.capture_generation();
-            let capture_requested = capture_generation != seen_capture_generation;
+            let capture_requested = capture_generation != state.seen_capture_generation;
             if capture_requested {
-                seen_capture_generation = seen_capture_generation.wrapping_add(1);
+                state.seen_capture_generation = state.seen_capture_generation.wrapping_add(1);
             }
             let periodic_capture_due = !control.is_paused()
                 && !retention.is_some_and(RetentionSink::capture_suspended)
-                && now >= next_capture;
+                && now >= state.next_capture;
             if !capture_requested && !periodic_capture_due {
                 continue;
             }
             let mut output =
-                capture_directory.join(capture_filename(capture_session_nonce, queued));
+                capture_directory.join(capture_filename(capture_session_nonce, state.queued));
             if config.camera.raw16 {
                 output.set_extension("png");
             }
             let job = CaptureJob {
-                sequence: queued,
+                sequence: state.queued,
                 width: meta.width,
                 height: meta.height,
                 bayer,
@@ -1405,8 +1535,8 @@ fn capture_loop(
             };
             match writer.try_send(job) {
                 Ok(()) => {
-                    queued += 1;
-                    info!(sequence = queued, exposure_us, "queued still frame");
+                    state.queued += 1;
+                    info!(sequence = state.queued, exposure_us, "queued still frame");
                 }
                 Err(TrySendError::Full(_)) => {
                     warn!("still writer is full; dropping scheduled frame");
@@ -1416,16 +1546,16 @@ fn capture_loop(
                 }
             }
             if periodic_capture_due {
-                next_capture = now + interval;
+                state.next_capture = now + Duration::from_millis(config.capture.interval_ms);
             }
-            if max_frames.is_some_and(|limit| queued >= limit) {
+            if max_frames.is_some_and(|limit| state.queued >= limit) {
                 break;
             }
         }
-        Ok(())
+        Ok(false)
     })();
-    let stop_result = camera.stop_video();
-    result.and(stop_result.map_err(Into::into))
+    state.adaptive = observer.adaptive.take();
+    result
 }
 
 fn wait_for_auto_settle(
@@ -1774,6 +1904,21 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
     Ok(selected)
 }
 
+fn reconfigure_exposure(camera: &mut Camera, config: &CameraConfig) -> Result<AutoLimits> {
+    let controls = camera.controls()?;
+    if config.exposure_control == ExposureControl::Adaptive {
+        configure_adaptive(camera, &controls, config)
+    } else {
+        configure_sdk_auto(
+            camera,
+            &controls,
+            config.max_exposure_us,
+            config.max_gain,
+            config.target_brightness,
+        )
+    }
+}
+
 fn configure_adaptive(
     camera: &mut Camera,
     controls: &[ControlCaps],
@@ -1792,12 +1937,26 @@ fn configure_adaptive(
         .min_exposure_us
         .clamp(exposure.min_value.max(1), max_exposure_us);
     let max_gain = config.max_gain.clamp(gain.min_value, gain.max_value);
-    camera.set_control(
+    set_if_available(
+        camera,
+        controls,
         ControlType::EXPOSURE,
-        100_000_i64.clamp(min_exposure_us, max_exposure_us),
+        camera
+            .control_value(ControlType::EXPOSURE)?
+            .value
+            .clamp(min_exposure_us, max_exposure_us),
         false,
     )?;
-    camera.set_control(ControlType::GAIN, gain.min_value, false)?;
+    set_if_available(
+        camera,
+        controls,
+        ControlType::GAIN,
+        camera
+            .control_value(ControlType::GAIN)?
+            .value
+            .clamp(gain.min_value, max_gain),
+        false,
+    )?;
     set_if_available(camera, controls, ControlType::FLIP, 0, false)?;
     info!(
         min_exposure_us,
@@ -1945,6 +2104,12 @@ fn set_if_available(
         return Ok(());
     }
     let value = requested.clamp(caps.min_value, caps.max_value);
+    if camera
+        .control_value(control_type)
+        .is_ok_and(|current| current.value == value && current.automatic == automatic)
+    {
+        return Ok(());
+    }
     camera
         .set_control(control_type, value, automatic)
         .with_context(|| format!("setting camera control {}", caps.name))
@@ -2138,6 +2303,65 @@ fn camera_json(camera: &CameraInfo) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updating_limits_preserves_settling_cadence_requests_and_night_mode() {
+        let config = CameraConfig {
+            exposure_control: ExposureControl::Adaptive,
+            ..Default::default()
+        };
+        let mut limits = AutoLimits {
+            min_exposure_us: 100,
+            max_exposure_us: 60_000_000,
+            min_gain: 0,
+            max_gain: 300,
+            target_brightness: 100,
+        };
+        let mut state = CaptureLoopState {
+            settled: true,
+            seen_capture_generation: 7,
+            queued: 12,
+            ..Default::default()
+        };
+        state.configure_exposure(&config, limits);
+        for _ in 0..3 {
+            state.adaptive.as_mut().unwrap().observe(
+                ExposureSetting {
+                    exposure_us: 8_765_000,
+                    gain: 300,
+                },
+                autopiercam_core::image::LumaStats {
+                    mean: 100.,
+                    p50: 100,
+                    p90: 100,
+                    clipped_fraction: 0.,
+                },
+            );
+        }
+        assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
+        let cadence = state.next_capture;
+        limits.max_exposure_us = 30_000_000;
+        state.configure_exposure(&config, limits);
+        assert!(state.settled);
+        assert_eq!(state.seen_capture_generation, 7);
+        assert_eq!(state.queued, 12);
+        assert_eq!(state.next_capture, cadence);
+        assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
+    }
+
+    #[test]
+    fn reload_signal_is_coalesced_and_does_not_shutdown_or_unpause() {
+        let control = AgentControl::new();
+        control.pause();
+        control.capture_now();
+        control.reload_configuration();
+        control.reload_configuration();
+        assert!(control.reload_pending.swap(false, Ordering::AcqRel));
+        assert!(!control.reload_pending.swap(false, Ordering::AcqRel));
+        assert!(control.is_paused());
+        assert!(!control.is_shutdown());
+        assert_eq!(control.capture_generation(), 1);
+    }
 
     fn detected_camera(id: i32, name: &str) -> CameraInfo {
         CameraInfo {

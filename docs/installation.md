@@ -27,7 +27,7 @@ pause capture; capture immediately; or stop the application. The Start menu
 also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
 If several ASI cameras are connected, choose the desired model and camera ID
-from the Viewer's **Camera** picker, then **Save and restart capture**.
+from the Viewer's **Camera** picker, then **Save settings**.
 The picker and save button remain visible while other settings scroll. The save
 status shows whether changes are pending, saved or rejected. Refresh asks before
 discarding edits; Capture now does not discard them. The internal configuration

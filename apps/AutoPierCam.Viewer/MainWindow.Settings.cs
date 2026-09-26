@@ -54,9 +54,9 @@ public sealed partial class MainWindow
     {
         ConfigInfoBar.Title = _hasUnsavedSettings ? "Unsaved changes" : "Settings loaded";
         ConfigInfoBar.Message = _hasUnsavedSettings
-            ? "Save applies your settings and restarts capture. The camera stays unchanged until then."
+            ? "Save applies settings without restarting capture. Changing camera or RAW format requires a restart."
             : "Settings match the saved configuration.";
-        ConfigInfoBar.Severity = InfoBarSeverity.Informational;
+        SetConfigurationFeedback(InfoBarSeverity.Informational, _hasUnsavedSettings);
     }
 
     private SettingsFormValues ReadSettingsForm()

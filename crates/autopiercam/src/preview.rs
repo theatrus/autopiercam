@@ -354,6 +354,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_hd_sensor_is_not_reduced_to_720p() {
+        let hub = PreviewHub::new();
+        let session = hub.begin_session();
+        let mut frame = job(100, 0);
+        frame.width = 1920;
+        frame.height = 1080;
+        frame.data = vec![100; 1920 * 1080];
+        encode_and_publish(frame, &session).unwrap();
+        let result = hub.snapshot().frame.unwrap();
+        assert_eq!(
+            (result.metadata.width, result.metadata.height),
+            (1920, 1080)
+        );
+        let decoded = image::load_from_memory(&result.jpeg).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1920, 1080));
+    }
+
+    #[test]
     fn settling_observer_publishes_preview_before_capture_transition() {
         let monitor = crate::AgentMonitor::new();
         let hub = PreviewHub::new();

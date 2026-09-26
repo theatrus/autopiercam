@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub camera: CameraConfig,
@@ -12,6 +12,27 @@ pub struct Config {
 }
 
 impl Config {
+    /// Limits, cadence and JPEG quality can be applied between SDK polls. Other
+    /// recording settings replace the recording services, not the camera.
+    pub fn requires_recording_reload(&self, next: &Self) -> bool {
+        let mut capture = self.capture.clone();
+        capture.interval_ms = next.capture.interval_ms;
+        capture.jpeg_quality = next.capture.jpeg_quality;
+        capture != next.capture || self.upload != next.upload || self.video != next.video
+    }
+
+    /// Only acquisition layout/device changes need a new SDK session.
+    pub fn requires_camera_restart(&self, next: &Self) -> bool {
+        let a = &self.camera;
+        let b = &next.camera;
+        a.camera_id != b.camera_id
+            || a.name_contains != b.name_contains
+            || a.width != b.width
+            || a.height != b.height
+            || a.bin != b.bin
+            || a.raw16 != b.raw16
+    }
+
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -156,7 +177,7 @@ pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> 
     Ok(validate_upload_endpoint(endpoint)?.into())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
     /// Opt-in application control uses the sensor's manual exposure limits.
@@ -214,7 +235,7 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
     pub directory: PathBuf,
@@ -245,7 +266,7 @@ impl Default for CaptureConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UploadConfig {
     pub enabled: bool,
@@ -266,7 +287,7 @@ impl Default for UploadConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,7 +308,7 @@ impl Default for VideoConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     pub listen: String,
@@ -318,6 +339,38 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_policy_only_reopens_for_device_or_image_layout_changes() {
+        let original = Config::default();
+        assert!(!original.requires_camera_restart(&original));
+        assert!(!original.requires_recording_reload(&original));
+        let mut next = original.clone();
+        next.camera.max_exposure_us = 30_000_000;
+        next.camera.max_gain = 200;
+        next.camera.exposure_control = ExposureControl::Adaptive;
+        next.capture.interval_ms = 5000;
+        next.capture.jpeg_quality = 90;
+        assert!(!original.requires_camera_restart(&next));
+        assert!(!original.requires_recording_reload(&next));
+        next.capture.retention_max_bytes = Some(1_000_000);
+        next.upload.endpoint = Some("https://example.test/latest".into());
+        next.upload.enabled = true;
+        assert!(!original.requires_camera_restart(&next));
+        assert!(original.requires_recording_reload(&next));
+        for change in [
+            |c: &mut Config| c.camera.camera_id = Some(1),
+            |c: &mut Config| c.camera.name_contains = Some("ASI662MC".into()),
+            |c: &mut Config| c.camera.raw16 = true,
+            |c: &mut Config| c.camera.width = Some(1920),
+            |c: &mut Config| c.camera.height = Some(1080),
+            |c: &mut Config| c.camera.bin = 2,
+        ] {
+            let mut changed = original.clone();
+            change(&mut changed);
+            assert!(original.requires_camera_restart(&changed));
+        }
+    }
 
     #[test]
     fn video_requires_explicit_executable_and_bounded_sampling() {
