@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.2 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.3 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.2)](https://github.com/theatrus/autopiercam/releases/download/v0.2.2/AutoPierCam-0.2.2-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.2)
+[Download the signed Windows x64 installer (0.2.3)](https://github.com/theatrus/autopiercam/releases/download/v0.2.3/AutoPierCam-0.2.3-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.3)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -64,15 +64,15 @@ The repository now contains a hardware-validated background capture slice:
 - a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
   Camera** panel to the Imaging tab.
 
-Version 0.2.2 fixes saving with disabled retention limits and keeps the camera
-picker and save controls visible while other settings scroll. Select your camera
-and **Save and restart capture** to apply it. The NINA plugin is available in the shared
+Version 0.2.3 fixes prolonged exposure settling, stale capture status, and false
+unsaved-change warnings. Chatstronomy pairing comes first and preserves sharing
+choices, while status refresh preserves pending edits. The NINA plugin is available in the shared
 [theatr.us registry](https://nina-plugins.psf-guard.com/), also served at
 [nina-plugins.pulsarfab.com](https://nina-plugins.pulsarfab.com/).
 
 ## Install on Windows
 
-Version 0.2.2 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
+Version 0.2.3 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
 in the Viewer to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
