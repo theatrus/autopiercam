@@ -97,7 +97,6 @@ public sealed partial class MainWindow : Window
                             _liveStatusUnavailable = true;
                             StatusWarningIcon.Visibility = Visibility.Visible;
                             StatusText.Text = "Agent status unavailable · reconnecting";
-                            AgentConnectionText.Text = "Rust agent: status unavailable";
                             SetControlsForOperation(false);
                         }
                     }
@@ -255,9 +254,8 @@ public sealed partial class MainWindow : Window
             PreviewPlaceholder.Visibility = Visibility.Collapsed;
             PreviewStatusText.Text = "LIVE";
 
-            ExposureValueText.Text = FormatExposure(frame.Metadata.ExposureUs);
-            GainValueText.Text = frame.Metadata.Gain is long gain ? gain.ToString("N0") : "—";
-            ModeValueText.Text = FormatPreviewMode(frame.Metadata.Mode);
+            _lastPreviewGain = frame.Metadata.Gain;
+            _lastPreviewMode = frame.Metadata.Mode;
 
             _lastPreviewDetail = FormatPreviewDetail(frame.Metadata);
             _previewDimensions = $"{frame.Metadata.Width}×{frame.Metadata.Height}";
@@ -322,8 +320,11 @@ public sealed partial class MainWindow : Window
             exposure?.SessionGeneration == _lastPreviewSessionGeneration;
         if (exposure is not null && sameSession)
         {
-            ExposureValueText.Text = FormatExposure(exposure.ExposureUs);
-            GainValueText.Text = exposure.Gain.ToString("N0");
+            SetCaptureSummary(exposure.ExposureUs, exposure.Gain, _lastPreviewMode);
+        }
+        else
+        {
+            SetCaptureSummary(_lastPreviewExposureUs, _lastPreviewGain, _lastPreviewMode);
         }
 
         if (!_hasPreviewFrame)
@@ -369,6 +370,7 @@ public sealed partial class MainWindow : Window
         }
 
         _previewFrameError = true;
+        SetCaptureSummary(null, null, null);
         PreviewStatusText.Text = "FRAME ERROR";
         PreviewImage.Opacity = 0.45;
         SetPreviewDetail("Preview error · see Details", Compact(detail));
@@ -380,9 +382,9 @@ public sealed partial class MainWindow : Window
         PreviewImage.Visibility = Visibility.Collapsed;
         PreviewImage.Opacity = 1;
         PreviewPlaceholder.Visibility = Visibility.Visible;
-        ExposureValueText.Text = "—";
-        GainValueText.Text = "—";
-        ModeValueText.Text = "—";
+        _lastPreviewGain = null;
+        _lastPreviewMode = null;
+        SetCaptureSummary(null, null, null);
         // Keep the frame clock across reconnects: a cached frame is still old
         // when the preview pipe sends it again on a new connection.
         _lastPreviewExposureUs = null;
@@ -1259,8 +1261,6 @@ public sealed partial class MainWindow : Window
         LastArtifactText.Text = string.IsNullOrWhiteSpace(status.LastArtifact)
             ? "Last artifact: none"
             : $"Last artifact: {Compact(status.LastArtifact)}";
-        AgentConnectionText.Text =
-            $"Rust agent: connected · {PipeDisplayName}";
         _latestAgentStatus = status;
         _liveStatusUnavailable = false;
         StatusWarningIcon.Visibility = ViewerPresentation.HasWarning(status) ? Visibility.Visible : Visibility.Collapsed;
@@ -1310,8 +1310,6 @@ public sealed partial class MainWindow : Window
         _configurationNeedsRefresh = true;
         StatusText.Text =
             $"Offline — {Compact(detail)} Start the AutoPierCam agent, then select Refresh.";
-        AgentConnectionText.Text =
-            $"Rust agent: disconnected · {PipeDisplayName}";
         FrameCountsText.Text = "No live agent status available";
         LastArtifactText.Text = "Last artifact: unavailable while offline";
         AgentLastErrorText.Text = "Start or restart the local capture agent and select Refresh.";
@@ -1338,7 +1336,6 @@ public sealed partial class MainWindow : Window
         _configurationNeedsRefresh = true;
         StatusText.Text =
             $"Agent response timed out — {Compact(detail)} Select Refresh before retrying Capture now.";
-        AgentConnectionText.Text = "Rust agent: response timed out";
         AgentLastErrorText.Text =
             "The request may have completed. Refresh status before sending another capture request.";
         AgentLastErrorText.Visibility = Visibility.Visible;
@@ -1358,7 +1355,6 @@ public sealed partial class MainWindow : Window
         }
 
         StatusText.Text = Compact(detail);
-        AgentConnectionText.Text = "Rust agent: connected, request failed";
         AgentLastErrorText.Text = Compact(detail);
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Refresh to reload upload activity after the request error.");
@@ -1721,26 +1717,7 @@ public sealed partial class MainWindow : Window
         return trimmed.Length == 0 ? null : trimmed;
     }
 
-    private static string FormatExposure(long? exposureUs)
-    {
-        return exposureUs switch
-        {
-            null => "—",
-            >= 1_000_000 => $"{exposureUs.Value / 1_000_000.0:0.###} s",
-            >= 1_000 => $"{exposureUs.Value / 1_000.0:0.###} ms",
-            _ => $"{exposureUs.Value:N0} µs",
-        };
-    }
-
-    private static string FormatPreviewMode(string mode)
-    {
-        return mode switch
-        {
-            "day" => "Day",
-            "night" => "Night",
-            _ => "Unknown",
-        };
-    }
+    private static string FormatExposure(long? exposureUs) => ViewerPresentation.FormatExposure(exposureUs);
 
     private static string FormatPreviewDetail(PreviewFrameMetadata metadata)
     {
@@ -1795,8 +1772,6 @@ public sealed partial class MainWindow : Window
             value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return compact.Length <= 500 ? compact : compact[..500] + "…";
     }
-
-    private string PipeDisplayName => @"\\.\pipe\" + _agentClient.PipeName;
 
     private sealed class UserInputException : Exception
     {

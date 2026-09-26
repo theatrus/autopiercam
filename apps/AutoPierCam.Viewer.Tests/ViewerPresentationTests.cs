@@ -3,6 +3,17 @@ using Xunit;
 
 public sealed class ViewerPresentationTests
 {
+    [Theory]
+    [InlineData(2_000_000L, 300L, "unknown", "Exposure 2 s · Gain 300")]
+    [InlineData(500L, 0L, "night", "Exposure 500 µs · Gain 0 · Night")]
+    [InlineData(10_000L, null, "day", "Exposure 10 ms · Day")]
+    [InlineData(null, 25L, null, "Gain 25")]
+    [InlineData(null, null, "unknown", "")]
+    [InlineData(null, null, null, "")]
+    [InlineData(0L, -1L, "offline", "")]
+    public void SummaryIncludesOnlyAvailableReadings(long? exposureUs, long? gain, string? mode, string expected) =>
+        Assert.Equal(expected, ViewerPresentation.CaptureSummary(exposureUs, gain, mode));
+
     [Fact]
     public void ViewerAcceptsFullHdAndRetainsStrictBounds()
     {

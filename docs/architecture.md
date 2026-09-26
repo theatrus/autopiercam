@@ -122,6 +122,11 @@ its button marks an unsaved draft. The preview overlay contains only dimensions
 and frame age, with timing/sequence/error diagnostics under **Details**. Normal
 startup and loaded settings do not display warning icons.
 
+Exposure, gain and known day/night mode share a compact single-line summary
+below the preview. Unavailable readings are omitted, and the summary collapses
+entirely before telemetry arrives. There are no placeholder temperature/mode
+cards or protocol/pipe footer; connection errors remain in the main status area.
+
 ## Frame pipeline and backpressure
 
 The ASI676MC produces about 12.6 MB per full-resolution RAW8 frame and about

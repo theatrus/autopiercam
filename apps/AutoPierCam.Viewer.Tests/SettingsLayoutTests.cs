@@ -3,6 +3,25 @@ using Xunit;
 
 public sealed class SettingsLayoutTests
 {
+    [Fact]
+    public void CompactTelemetryReplacesCardsAndConnectionFooter()
+    {
+        var markup = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        var rootGrid = Assert.Single(markup.Root!.Elements());
+        var rootRows = Assert.Single(rootGrid.Elements(), e => e.Name.LocalName == "Grid.RowDefinitions");
+        Assert.Equal(2, rootRows.Elements().Count());
+        var summary = Assert.Single(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "CaptureSummaryText");
+        Assert.Equal("TextBlock", summary.Name.LocalName);
+        Assert.Equal("12", (string?)summary.Attribute("FontSize"));
+        Assert.Equal("Collapsed", (string?)summary.Attribute("Visibility"));
+        Assert.Equal("NoWrap", (string?)summary.Attribute("TextWrapping"));
+        Assert.DoesNotContain(summary.Ancestors(), e => e.Name.LocalName == "Border");
+        string[] removed = ["ExposureValueText", "GainValueText", "TemperatureValueText", "ModeValueText", "AgentConnectionText"];
+        Assert.DoesNotContain(markup.Descendants(), e => removed.Contains((string?)e.Attribute(xaml + "Name")));
+        Assert.DoesNotContain(markup.Descendants().Attributes("Text"), a => a.Value.Contains("Protocol v1") || a.Value.Contains("Rust agent:"));
+    }
+
     [Theory]
     [InlineData("SettingsPane", "Visibility", "Collapsed")]
     [InlineData("SettingsColumn", "Width", "0")]

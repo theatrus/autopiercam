@@ -9,7 +9,6 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <Grid
@@ -68,13 +67,13 @@
             </StackPanel>
         </Grid>
 
-        <Grid x:Name="WorkspaceGrid" Grid.Row="1" Padding="24" ColumnSpacing="0">
+        <Grid x:Name="WorkspaceGrid" Grid.Row="1" Padding="16,16,16,12" ColumnSpacing="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="2*" MinWidth="480" />
                 <ColumnDefinition x:Name="SettingsColumn" Width="0" />
             </Grid.ColumnDefinitions>
 
-            <Grid RowSpacing="14">
+            <Grid x:Name="PreviewPane" RowSpacing="0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
@@ -155,38 +154,15 @@
                     </Grid>
                 </Border>
 
-                <Grid Grid.Row="1" ColumnSpacing="10">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <Border Padding="14" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="3">
-                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Current exposure" />
-                            <TextBlock x:Name="ExposureValueText" FontSize="17" Text="—" />
-                        </StackPanel>
-                    </Border>
-                    <Border Grid.Column="1" Padding="14" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="3">
-                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Gain" />
-                            <TextBlock x:Name="GainValueText" FontSize="17" Text="—" />
-                        </StackPanel>
-                    </Border>
-                    <Border Grid.Column="2" Padding="14" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="3">
-                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Temperature" />
-                            <TextBlock x:Name="TemperatureValueText" FontSize="17" Text="—" />
-                        </StackPanel>
-                    </Border>
-                    <Border Grid.Column="3" Padding="14" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="3">
-                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Mode" />
-                            <TextBlock x:Name="ModeValueText" FontSize="17" Text="Offline" />
-                        </StackPanel>
-                    </Border>
-                </Grid>
+                <TextBlock
+                    x:Name="CaptureSummaryText"
+                    Grid.Row="1"
+                    Margin="0,6,0,0"
+                    FontSize="12"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    TextWrapping="NoWrap"
+                    TextTrimming="CharacterEllipsis"
+                    Visibility="Collapsed" />
             </Grid>
 
             <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="12" Visibility="Collapsed">
@@ -464,22 +440,6 @@
                         Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>
             </Grid>
-        </Grid>
-
-        <Grid
-            Grid.Row="2"
-            Padding="24,12"
-            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
-            <TextBlock
-                x:Name="AgentConnectionText"
-                FontSize="12"
-                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                Text="Rust agent: disconnected" />
-            <TextBlock Grid.Column="1" FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Protocol v1" />
         </Grid>
     </Grid>
 </Window>
