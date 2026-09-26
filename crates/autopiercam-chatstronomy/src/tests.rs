@@ -493,6 +493,33 @@ async fn scene_change_posts_once_and_queued_retry_is_cancelled_on_disable() {
 }
 
 #[tokio::test]
+async fn elided_ack_drops_the_image_without_retrying() {
+    let fixture = Fixture::paired().await;
+    let mut socket = fixture.connect(false, true).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    for sequence in 2..=4 {
+        *fixture.frames.write().unwrap() = Some(frame(sequence, true));
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+    let event = text(&mut socket).await;
+    assert_eq!(event["event"]["kind"], "scene_change");
+    socket.send(Message::Text(json!({"type":"event_ack","event_id":event["event"]["event_id"],"status":"elided","retry_after_seconds":0}).to_string().into())).await.unwrap();
+    // Terminal: the same event is never resent.
+    if let Ok(Some(Ok(Message::Text(next)))) =
+        timeout(Duration::from_millis(300), socket.next()).await
+    {
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_ne!(next["event"]["event_id"], event["event"]["event_id"]);
+    }
+    let status = fixture.service.client().status();
+    assert_eq!(
+        status.connection,
+        "Connected; image skipped (the Hub posts at most one per minute)"
+    );
+    assert!(status.last_delivery_unix_ms.is_none());
+}
+
+#[tokio::test]
 async fn revoked_authentication_stops_automatic_reconnection() {
     let fixture = Fixture::paired().await;
     let client = fixture.service.client();

@@ -172,6 +172,11 @@ Automatic events are independent opt-ins:
 
 These are observations, not classifications of people, animals, meteors,
 intrusions, weather or threats. There is a 60-second new-event cooldown.
+The Hub also posts at most one image per camera per minute. It acknowledges an
+image that arrives too soon as `elided`; AutoPierCam drops it without retrying,
+shows "image skipped" in its status, and does not advance the scene reference,
+so a lasting change is sent once the minute has passed. The Hub then posts a
+notice with the number of skipped images.
 Only one immutable automatic image and one bounded burst plan are retained in
 memory; new triggers are coalesced while that burst is active. A retry or lost acknowledgment resends the exact
 event UUID and payload after at least 60 seconds. Events expire after five

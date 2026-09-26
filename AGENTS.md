@@ -8,6 +8,8 @@
   stable releases on a schedule. Dispatch it after publishing for prompt delivery.
   Verify the released version and checksum on both public `manifests.json` endpoints:
   `https://nina-plugins.psf-guard.com/` and `https://nina-plugins.pulsarfab.com/`.
+- Follow [docs/release.md](docs/release.md) to cut a release, including the
+  plugin contract test's `new Version(...)` assertion.
 - Do not replace published release assets or suppress checksum/signature failures.
 - Camera enumeration and SDK operations belong to the capture thread. IPC and
   Viewer code must not open another camera handle. Never silently select a camera
