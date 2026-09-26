@@ -238,10 +238,10 @@ internal sealed class AgentPipeClient : IAsyncDisposable
             .ConfigureAwait(false);
         AgentConfigurationReplaceResult replaceResult =
             DeserializeResult<AgentConfigurationReplaceResult>(result, "config.replace");
-        if (!replaceResult.Saved || !replaceResult.RestartScheduled)
+        if (!replaceResult.Saved)
         {
             throw new AgentProtocolException(
-                "config.replace returned success without confirming both the save and scheduled restart.");
+                "config.replace returned success without confirming the save.");
         }
 
         return replaceResult;
@@ -938,7 +938,7 @@ internal sealed record AgentStatus
     public ExposureProgressStatus? Progress { get; init; }
 
     internal string DisplayState => State switch {
-        "starting" when Progress?.Exposure is { SettlingFrames: > 0 } => "Acquiring preview · stabilizing exposure (recording pending)",
+        "starting" when Progress?.Exposure is { SettlingFrames: > 0 } => "Stabilizing exposure",
         "starting" when Progress?.Exposure is not null => "Waiting for first exposure",
         "starting" => "Starting camera",
         "capturing" => "Capturing",

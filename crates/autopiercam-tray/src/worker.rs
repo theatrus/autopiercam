@@ -36,6 +36,7 @@ pub(crate) enum TrayCommand {
     SetPaused(bool),
     CaptureNow,
     Restart,
+    ReloadConfiguration,
     Shutdown,
 }
 
@@ -81,7 +82,10 @@ impl WorkerClient {
         if let TrayCommand::SetPaused(paused) = command {
             self.signals.sharing_paused.store(paused, Ordering::Release);
         }
-        if command != TrayCommand::CaptureNow {
+        if !matches!(
+            command,
+            TrayCommand::CaptureNow | TrayCommand::ReloadConfiguration
+        ) {
             let sequence = self
                 .preview
                 .snapshot()
@@ -99,7 +103,10 @@ impl WorkerClient {
                 return Ok(());
             }
             TrayCommand::Shutdown => self.signals.stopping.store(true, Ordering::Release),
-            TrayCommand::SetPaused(_) | TrayCommand::CaptureNow | TrayCommand::Restart => {}
+            TrayCommand::SetPaused(_)
+            | TrayCommand::CaptureNow
+            | TrayCommand::Restart
+            | TrayCommand::ReloadConfiguration => {}
         }
         if commands.send(command).is_err() {
             if command == TrayCommand::Restart {
@@ -389,6 +396,11 @@ where
                 camera.capture_now();
             }
         }
+        TrayCommand::ReloadConfiguration => {
+            if let Some(camera) = session {
+                camera.control.reload_configuration();
+            }
+        }
         TrayCommand::CaptureNow | TrayCommand::Restart | TrayCommand::Shutdown => {}
     }
 
@@ -650,6 +662,7 @@ impl SupervisorIntent {
                 }
                 LifecycleRequest::None
             }
+            TrayCommand::ReloadConfiguration => LifecycleRequest::None,
             TrayCommand::Restart => LifecycleRequest::Restart,
             TrayCommand::Shutdown => LifecycleRequest::Shutdown,
         }
@@ -715,6 +728,20 @@ fn run_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_reload_preserves_pause_and_pending_captures_without_lifecycle_change() {
+        let mut intent = SupervisorIntent::new(true);
+        intent.accept(TrayCommand::CaptureNow, false);
+        for ready in [true, false] {
+            assert_eq!(
+                intent.accept(TrayCommand::ReloadConfiguration, ready),
+                LifecycleRequest::None
+            );
+            assert!(intent.paused);
+        }
+        assert_eq!(intent.take_pending_captures(10), 1);
+    }
 
     #[test]
     fn retry_backoff_is_bounded_and_resets_after_capture() {

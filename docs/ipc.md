@@ -170,10 +170,23 @@ be omitted when disabled for compatibility with older agents. The Viewer edits
 them only when `storage.retention` is advertised and otherwise preserves any
 loaded non-null values unchanged. The agent validates the document and expected
 revision, syncs a unique temporary file, atomically replaces the TOML file, and
-schedules a controlled camera restart. Success is precise about those two
-completed/accepted steps:
+schedules application on the camera-owning thread. Camera selection, ROI/binning
+and RAW format changes schedule a controlled restart. Other settings do not:
+exposure limits, gain, cadence and JPEG quality update in place; recording-service
+changes drain and replace those services while preserving the open camera,
+preview session, paused state and completed startup settling. Success confirms
+persistence and acceptance, not that the asynchronous application has finished:
 
     { "revision": 42, "saved": true, "restart_scheduled": true }
+
+For a live reload (including an unchanged save), `restart_scheduled` is `false`.
+Clients must not treat that as failure. Unchanged saves do not rewrite the file
+or reconfigure hardware/services. Invalid runtime settings still surface through
+normal agent fault status.
+
+Exposure/cadence changes apply at a capture-thread poll after startup settling.
+Service changes may briefly delay delivery while writers/encoders drain, but do
+not close the camera or repeat settling. A save response is not an apply receipt.
 
 The revision is derived from canonical configuration content, so a no-op save
 does not represent a new software/configuration version. It is an opaque 64-bit
@@ -262,13 +275,19 @@ markers. The complete metadata object is:
 
 `exposure_us` and `gain` are required but may be null when reliable telemetry
 is unavailable. `mode` is `unknown`, `day`, or `night`; the current SDK-auto
-controller reports `unknown`. Width and height must each be at most 1280 and
-their product must not exceed 1,638,400 pixels.
+controller reports `unknown`. Width and height must each be at most 1920 and
+their product must not exceed 3,686,400 pixels.
+
+This raises the former 1280-pixel bound without adding a legacy preview stream.
+Use the updated Viewer/NINA plugin with this agent; older readers reject HD
+frames. Small sensors are not upscaled, and full-resolution stills are unchanged.
+Chatstronomy accepts the HD source but continues resizing to its bounded network
+image budget (at most a 1280-pixel edge).
 
 The producer samples no more often than every 500 milliseconds, including while
 scheduled still capture is paused. A one-slot queue replaces pending work with
 the newest RAW8 frame and counts discarded candidates. A dedicated thread
-debayers and aspect-preserving downscales the image to a 1280-pixel edge, then
+debayers and aspect-preserving downscales the image to a 1920-pixel edge, then
 encodes JPEG at quality 75. Session generation changes for each camera attempt,
 sequence increases across the tray process, and `dropped_frames` is cumulative
 for the active preview session. Ending or restarting a camera session clears

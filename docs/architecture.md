@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.3. Yann
+The product name is AutoPierCam and the current release line is 0.2.4. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
@@ -107,7 +107,20 @@ when the connected agent advertises retention support. Planned additions include
 
 Configuration writes include the revision the UI read. The agent validates and
 atomically persists a replacement only when that revision still matches, then
-schedules a controlled camera restart. Revision conflicts force a refresh.
+schedules application on the camera thread. Only device selection and image
+layout changes reopen the camera. Exposure limits, gain, cadence and JPEG
+quality update in place. Upload/video/retention changes drain and replace the
+recording services without closing the SDK stream or clearing startup settling.
+Service draining can briefly delay preview delivery; ordinary exposure/cadence
+saves do not drain services. The preview session, pause state, pending capture
+requests and adaptive day/night history survive reloads. No-op saves do not
+rewrite the file or touch hardware. Revision conflicts force a refresh.
+
+The Viewer opens with settings hidden behind **Settings**. Camera-selection
+faults reveal the picker automatically. Collapsing the panel preserves edits;
+its button marks an unsaved draft. The preview overlay contains only dimensions
+and frame age, with timing/sequence/error diagnostics under **Details**. Normal
+startup and loaded settings do not display warning icons.
 
 ## Frame pipeline and backpressure
 
@@ -121,7 +134,7 @@ continuously. Consumers have independent policies:
 - Exposure statistics: latest frame wins; work on a sparse raw sample.
 - Preview: a capacity-one latest-only queue samples at most every 500 ms,
   including while scheduled stills are paused; a separate thread debayers,
-  aspect-preserving downscales to a 1280-pixel edge, and encodes JPEG at quality
+  aspect-preserving downscales to a 1920-pixel edge, and encodes JPEG at quality
   75. Replaced work increments the session's dropped-frame counter.
 - Stills: bounded scheduled queue; a missed deadline is observable.
 - Video: sample at configured output fps before conversion/encoding.
@@ -277,7 +290,7 @@ outbound-only `autopiercam-preview-v1` pipe with the same current-user DACL,
 remote-client rejection, and first-instance ownership. Each latest-only record
 contains a bounded JSON metadata length and body (4 KiB maximum), followed by a
 bounded JPEG length and body (4 MiB maximum). Dimensions are limited to a
-1280-pixel edge and 1,638,400 pixels. A two-second write timeout evicts a stalled
+1920-pixel edge and 3,686,400 pixels. A two-second write timeout evicts a stalled
 consumer without delaying control responses. Camera-attempt generation,
 process-wide sequence, and dropped-frame metadata describe resets, ordering,
 and producer loss; clearing an established session stream causes a bounded

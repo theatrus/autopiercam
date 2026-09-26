@@ -763,6 +763,27 @@ fn detector_suppresses_exposure_ramps_and_requires_stable_mode_and_distinct_fram
 }
 
 #[test]
+fn sharing_accepts_full_hd_input_and_still_bounds_network_images() {
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 75)
+        .encode(
+            &vec![100; 1920 * 1080 * 3],
+            1920,
+            1080,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    let input = Frame {
+        jpeg: bytes.into(),
+        ..frame(1, false)
+    };
+    let encoded = crate::media::jpeg(&input, 524288).unwrap();
+    assert!(encoded.len() <= 524288);
+    let decoded = image::load_from_memory(&encoded).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (1280, 720));
+}
+
+#[test]
 fn jpeg_encoder_respects_remote_cap_and_rejects_malformed_input() {
     let valid = frame(1, true);
     let encoded = crate::media::jpeg(&valid, 1500).unwrap();

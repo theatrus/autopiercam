@@ -605,17 +605,25 @@ fn config_replace_response(
         }
     };
 
-    match config_store.replace(
-        replacement.expected_revision,
-        replacement.config.into_inner(),
-    ) {
-        Ok(snapshot) => match commands.send_command(TrayCommand::Restart) {
+    let next = replacement.config.into_inner();
+    let current = match config_store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::failure(request_id, config_store_error(error)),
+    };
+    let restart = current.config.requires_camera_restart(&next);
+    let command = if restart {
+        TrayCommand::Restart
+    } else {
+        TrayCommand::ReloadConfiguration
+    };
+    match config_store.replace(replacement.expected_revision, next) {
+        Ok(snapshot) => match commands.send_command(command) {
             Ok(()) => serialize_success(
                 request_id,
                 ConfigSaved {
                     revision: snapshot.revision,
                     saved: true,
-                    restart_scheduled: true,
+                    restart_scheduled: restart,
                 },
                 "configuration result",
             ),
@@ -1251,6 +1259,41 @@ mod tests {
             None
         );
         assert_eq!(commands.snapshot(), [TrayCommand::Restart]);
+    }
+
+    #[test]
+    fn ordinary_and_unchanged_saves_reload_without_camera_restart() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let commands = TestCommands::default();
+        let monitor = AgentMonitor::new();
+        for changed in [true, false] {
+            let current = store.snapshot().unwrap();
+            let mut next = current.config;
+            if changed {
+                next.camera.max_exposure_us = 30_000_000;
+                next.capture.interval_ms = 5000;
+            }
+            let response = dispatch(
+                Request::new("live-save", Method::ConfigReplace).with_payload(
+                    serde_json::to_value(ConfigReplace {
+                        expected_revision: current.revision,
+                        config: next,
+                    })
+                    .unwrap(),
+                ),
+                &commands,
+                &monitor,
+                &store,
+            );
+            let saved: ConfigSaved = serde_json::from_value(response.result.unwrap()).unwrap();
+            assert!(saved.saved);
+            assert!(!saved.restart_scheduled);
+            if !changed {
+                assert_eq!(saved.revision, current.revision);
+            }
+        }
+        assert_eq!(commands.snapshot(), [TrayCommand::ReloadConfiguration; 2]);
     }
 
     #[test]

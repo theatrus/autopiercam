@@ -7,6 +7,18 @@ using Xunit;
 
 public sealed class AgentPipeClientTests
 {
+    [Fact]
+    public async Task SaveAcceptsLiveReloadWithoutRestart()
+    {
+        var configuration = JsonSerializer.Deserialize<AgentConfiguration>(
+            await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        await WithResponse("config.replace", new { revision = 1UL, saved = true, restart_scheduled = false },
+            async client => {
+                var result = await client.ReplaceConfigurationAsync(1, configuration);
+                Assert.True(result.Saved);
+                Assert.False(result.RestartScheduled);
+            });
+    }
     private static async Task WithResponse(string method, object result, Func<AgentPipeClient, Task> assertion, Action<JsonElement>? inspectRequest = null)
     {
         string name = $"apc-test-{Guid.NewGuid():N}";
@@ -56,7 +68,7 @@ public sealed class AgentPipeClientTests
                 Assert.Equal(3UL, status.FramesSaved);
                 Assert.Equal(8765000, status.Progress.Exposure!.ExposureUs);
                 Assert.Equal(settling, status.Progress.Exposure.Settling);
-                if (settling) Assert.StartsWith("Acquiring preview", status.DisplayState);
+                if (settling) Assert.Equal("Stabilizing exposure", status.DisplayState);
                 else if (state == "capturing") Assert.Equal("Capturing", status.DisplayState);
                 else if (state == "paused") Assert.StartsWith("Recording paused", status.DisplayState);
             });

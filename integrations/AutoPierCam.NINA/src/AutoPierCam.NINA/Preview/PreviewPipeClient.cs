@@ -12,8 +12,8 @@ internal sealed class PreviewPipeClient
     internal const ushort ProtocolVersion = 1;
     internal const int MaxMetadataBytes = 4 * 1024;
     internal const int MaxJpegBytes = 4 * 1024 * 1024;
-    internal const uint MaxDimension = 1_280;
-    internal const ulong MaxPixels = 1_638_400;
+    internal const uint MaxDimension = 1_920;
+    internal const ulong MaxPixels = 3_686_400;
 
     private static readonly TimeSpan[] ReconnectDelays =
     [
