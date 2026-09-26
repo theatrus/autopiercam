@@ -6,6 +6,19 @@ using Xunit;
 public sealed class SettingsFormValuesTests
 {
     [Fact]
+    public void GainDefaultsAreCleanAndGainEditsCanBeReverted()
+    {
+        var baseline = SettingsFormValues.FromConfiguration(Config);
+        Assert.Equal(baseline, SettingsFormValues.FromConfiguration(Config with {
+            Camera = Config.Camera with { MinGain = 0, PreferShortExposures = false }
+        }));
+        var gain = baseline with { MinGain = SettingsFormValues.Number(200) };
+        Assert.NotEqual(baseline, gain);
+        Assert.Equal(baseline, gain with { MinGain = SettingsFormValues.Number(0) });
+        Assert.NotEqual(baseline, baseline with { PreferShortExposures = true });
+    }
+
+    [Fact]
     public void PreviewRateDefaultsAreCleanAndOnlyRealChangesAreDirty()
     {
         var baseline = SettingsFormValues.FromConfiguration(Config);

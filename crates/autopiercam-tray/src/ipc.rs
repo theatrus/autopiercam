@@ -1184,6 +1184,7 @@ mod tests {
                 "sharing.get",
                 "cameras.list",
                 "camera.adaptive_exposure",
+                "camera.gain_range",
                 "camera.raw16",
                 "capture.preview_rate",
                 "video.ffmpeg"
@@ -1273,6 +1274,9 @@ mod tests {
             let mut next = current.config;
             if changed {
                 next.camera.max_exposure_us = 30_000_000;
+                next.camera.exposure_control = autopiercam_core::config::ExposureControl::Adaptive;
+                next.camera.min_gain = 200;
+                next.camera.prefer_short_exposures = true;
                 next.capture.interval_ms = 5000;
                 next.capture.preview_max_fps = 5;
             }
@@ -1292,6 +1296,15 @@ mod tests {
             assert!(saved.saved);
             assert!(!saved.restart_scheduled);
             assert_eq!(store.snapshot().unwrap().config.capture.preview_max_fps, 5);
+            assert_eq!(store.snapshot().unwrap().config.camera.min_gain, 200);
+            assert!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .config
+                    .camera
+                    .prefer_short_exposures
+            );
             if !changed {
                 assert_eq!(saved.revision, current.revision);
             }

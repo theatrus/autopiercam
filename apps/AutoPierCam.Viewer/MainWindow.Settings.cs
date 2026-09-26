@@ -14,7 +14,7 @@ public sealed partial class MainWindow
 
     private void TrackSettingsEdits()
     {
-        foreach (NumberBox input in new[] { MaxExposureNumberBox, MaxGainNumberBox, StillIntervalNumberBox,
+        foreach (NumberBox input in new[] { MaxExposureNumberBox, MaxGainNumberBox, MinGainNumberBox, StillIntervalNumberBox,
             RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox })
         {
             input.ValueChanged += (_, _) => MarkSettingsEdited();
@@ -25,7 +25,7 @@ public sealed partial class MainWindow
         }
         foreach (TextBox input in new[] { CameraNameFilterTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
-        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle })
+        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
 
     }
@@ -92,6 +92,7 @@ public sealed partial class MainWindow
         }
         return new() {
             MaxExposure = Number(MaxExposureNumberBox), MaxGain = Number(MaxGainNumberBox),
+            MinGain = Number(MinGainNumberBox), PreferShortExposures = PreferShortExposuresToggle.IsOn,
             Interval = Number(StillIntervalNumberBox), RetentionMax = Number(RetentionMaxMiBNumberBox),
             PreviewRate = Number(PreviewMaxFpsNumberBox),
             RetentionFree = Number(RetentionMinFreeMiBNumberBox),

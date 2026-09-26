@@ -60,9 +60,21 @@ impl Config {
                 "camera.max_exposure_us must be >= camera.min_exposure_us",
             ));
         }
-        if self.camera.max_gain < 0 || !(1..=250).contains(&self.camera.target_brightness) {
+        if self.camera.min_gain < 0 || self.camera.max_gain < self.camera.min_gain {
             return Err(ConfigError::Validation(
-                "camera gain must be non-negative and target_brightness in 1..=250",
+                "camera gain limits must satisfy 0 <= min_gain <= max_gain",
+            ));
+        }
+        if self.camera.exposure_control != ExposureControl::Adaptive
+            && (self.camera.min_gain > 0 || self.camera.prefer_short_exposures)
+        {
+            return Err(ConfigError::Validation(
+                "minimum gain and shorter-exposure preference require camera.exposure_control = adaptive",
+            ));
+        }
+        if !(1..=250).contains(&self.camera.target_brightness) {
+            return Err(ConfigError::Validation(
+                "camera.target_brightness must be in 1..=250",
             ));
         }
         if !(1..=100).contains(&self.capture.jpeg_quality) {
@@ -199,7 +211,13 @@ pub struct CameraConfig {
     pub bin: i32,
     pub min_exposure_us: i64,
     pub max_exposure_us: i64,
+    /// Application-controlled gain floor; SDK auto has no minimum-gain control.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub min_gain: i64,
     pub max_gain: i64,
+    /// Raise gain before lengthening exposure, trading noise for cadence.
+    #[serde(skip_serializing_if = "is_false")]
+    pub prefer_short_exposures: bool,
     pub target_brightness: i64,
     pub settle_frames: u32,
 }
@@ -216,7 +234,9 @@ impl Default for CameraConfig {
             bin: 1,
             min_exposure_us: 100,
             max_exposure_us: 60_000_000,
+            min_gain: 0,
             max_gain: 300,
+            prefer_short_exposures: false,
             target_brightness: 100,
             settle_frames: 6,
         }
@@ -239,6 +259,10 @@ impl ExposureControl {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -353,6 +377,41 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gain_controls_are_opt_in_validated_and_live_reloadable() {
+        let old: Config = toml::from_str("").unwrap();
+        assert_eq!(old.camera.min_gain, 0);
+        assert!(!old.camera.prefer_short_exposures);
+        let serialized = toml::to_string(&old).unwrap();
+        assert!(!serialized.contains("min_gain"));
+        assert!(!serialized.contains("prefer_short_exposures"));
+        let mut next = old.clone();
+        next.camera.exposure_control = ExposureControl::Adaptive;
+        next.camera.min_gain = 200;
+        next.camera.prefer_short_exposures = true;
+        for max in [200, 300] {
+            next.camera.max_gain = max;
+            next.validate().unwrap();
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&next).unwrap()).unwrap(),
+                next
+            );
+            assert!(!old.requires_camera_restart(&next));
+            assert!(!old.requires_recording_reload(&next));
+        }
+        for min in [-1, 301] {
+            next.camera.min_gain = min;
+            assert!(next.validate().is_err());
+        }
+        next.camera.min_gain = 200;
+        next.camera.exposure_control = ExposureControl::Sdk;
+        assert!(next.validate().is_err());
+        next.camera.min_gain = 0;
+        assert!(next.validate().is_err());
+        next.camera.prefer_short_exposures = false;
+        next.validate().unwrap();
+    }
 
     #[test]
     fn preview_rate_defaults_round_trips_and_reloads_without_camera_or_recorder_restart() {
