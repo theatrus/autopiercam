@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.4. Yann
+The product name is AutoPierCam and the current release line is 0.2.5. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
