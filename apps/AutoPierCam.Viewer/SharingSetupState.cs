@@ -70,6 +70,15 @@ internal sealed class SharingSetupState(SharingStatus status)
         return value;
     }
 
+    // A NumberBox's committed value. Blank (NaN), fractional or out-of-range
+    // values fail with the same message as typed text.
+    internal static ushort WholeNumber(double value, ushort minimum, ushort maximum, string label)
+    {
+        if (double.IsNaN(value) || value != Math.Floor(value) || value < minimum || value > maximum)
+            throw new InvalidOperationException($"{label}: enter a whole number from {minimum} to {maximum}.");
+        return (ushort)value;
+    }
+
     internal static string PairingCode(string value)
     {
         string token = value.Trim();

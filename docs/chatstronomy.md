@@ -16,22 +16,24 @@ does not deploy the Hub.
 
 ## Setup
 
-1. In the Hub's **Observatory devices** page, create a pier camera and generate
-   a one-use pairing code. Select its Discord destination channels. Register the
-   server under Discord delivery first; adding destinations requires server
-   management permission and a live bot/channel check.
-2. In the AutoPierCam Viewer, choose **Chatstronomy**, enter the Hub HTTPS origin
-   (for example `https://hub.example.org`) in **1. Pair with your Hub** at the top,
-   paste the code, and choose **Pair camera**. Pairing preserves your source
+1. In the Hub's **Observatory devices** page, add a pier camera, attach it to a
+   server, pick its channels in that server's **Discord delivery** card, and
+   choose **Pair camera…** for a one-use pairing code. Register the server under
+   Discord delivery first; attaching requires server management permission and
+   channels need a live bot/channel check.
+2. In the AutoPierCam Viewer, open **Settings** and choose the **Chatstronomy**
+   section. Enter the Hub HTTPS origin (for example `https://hub.example.org`)
+   under **Pair with your Hub**, paste the code, and choose **Pair camera**. Pairing preserves your source
    choices and limits, but keeps the master sharing switch off. Options can be
    configured and saved before pairing. A rejected code does not clear them.
-3. In **2. Choose what to share**, select snapshots and a periodic interval;
+3. In **Choose what to share**, select snapshots and a periodic interval;
    expand **Scene and telescope events** or **Chat control** for other options.
    Turn on **Enable image sharing** and choose **Save and enable sharing**.
-   Save/status controls stay visible while the settings scroll. Later edits use
-   **Save settings**, without restarting capture.
-4. Use **Refresh status** to update connection/delivery information without
-   discarding edits. **Connection details / change Hub** shows the device ID,
+   The footer's feedback, **Discard changes** and Save stay visible while the
+   settings scroll, as in the Capture section. Later edits use **Save settings**,
+   without restarting capture.
+4. Connection and delivery status update automatically while the section is
+   open, without discarding edits. **Connection details / change Hub** shows the device ID,
    installation ID, and latest confirmed delivery. The Hub's **Snapshot now**
    button sends the completed preview to that device's selected channels.
 
@@ -40,7 +42,7 @@ region in this version. Never enable sharing if the full preview contains
 something you do not want in those channels. The camera's credential does not
 authorize telescope commands, and the Hub cannot enable local permissions.
 
-**Stop sharing** disconnects and discards pending images without losing other
+**Stop sharing now** disconnects and discards pending images without losing other
 unsaved edits. **Forget pairing**, under **Connection details / change Hub**,
 requires confirmation and clears permissions and the Windows credential. Revoke
 the device credential in the Hub as well: the device protocol has no remote
@@ -51,10 +53,12 @@ or pairing fails after consuming a code, generate a new code; pairing is never
 automatically retried. Credentials never appear in command-line arguments,
 ordinary camera configuration, sharing settings, status responses, or logs.
 
-Unsaved changes are marked explicitly; save or **Discard changes** before closing.
-If settings changed elsewhere (including chat), refresh preserves your draft and
-asks you to either discard it or **Keep my edits** before saving a replacement.
-An unconfirmed agent status blocks pairing/saves until a successful refresh.
+Unsaved changes stay when you hide Settings or switch sections; the Settings
+button shows a dot until you save or choose **Discard changes**. **Reload
+settings** asks before discarding edits. If settings changed elsewhere
+(including chat), the status refresh keeps your draft and the footer asks you to
+either discard it or **Keep my edits** before saving a replacement. An
+unconfirmed agent status blocks pairing/saves until a successful reload.
 
 ## Triggered sharing and chat configuration
 
@@ -65,8 +69,10 @@ waits a full interval; reconnects reset the interval and discard unfinished burs
 instead of replaying a backlog. The device-wide 60-second cooldown still applies.
 
 Enable **Allow the camera owner to configure triggers from chat** locally to use
-`/piercam triggers` in a channel receiving that camera. Supply the camera's exact
-Hub name, interval, scene/day-night/telescope switches, burst count and spacing.
+`/chatstronomy piercam triggers` in a channel receiving that camera. Supply the
+interval, scene/day-night/telescope switches, burst count and spacing. The
+command uses your camera routed to that channel; if several are, add
+`camera:<exact Hub name>`.
 For example, set interval to 10 minutes, telescope events on, count 3, spacing 60.
 Chat may only narrow local permissions: it cannot enable a locally disabled
 source, send more frequently than the local interval, shorten spacing, increase
@@ -75,12 +81,12 @@ first choose a nonzero local interval. Chat can set it to 0 and later restore it
 within that local limit. Only the camera owner may invoke these commands; server
 manager privileges alone do not grant access. DMs and unrelated channels fail.
 
-Chat overrides are atomically saved on the camera. **Refresh status** shows the
+Chat overrides are atomically saved on the camera. **Connection details** shows the
 active rules as well as local permission limits. Any local **Save settings**
 clears overrides. A stale Viewer save fails with a revision conflict instead of
 overwriting a newer chat update. Pairing preserves trigger permissions but keeps
 sharing off; forgetting clears permissions. Both reset chat overrides.
-`/piercam snapshot camera:<name>` uses the existing separate local snapshot gate
+`/chatstronomy piercam snapshot` uses the existing separate local snapshot gate
 and posts to all of the camera's configured destinations, not just the command
 channel. Triggered images likewise use all configured camera destinations.
 
