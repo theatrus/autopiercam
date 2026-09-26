@@ -33,13 +33,15 @@ public sealed partial class MainWindow
 
         var enabled = new ToggleSwitch { Header = "Enable image sharing" };
         var snapshots = new ToggleSwitch { Header = "Allow Snapshot now requests" };
-        var interval = new NumberBox { Header = "Send an image every (minutes; 0 = off)", Minimum = 0, Maximum = 1440, SmallChange = 1 };
+        var interval = new TextBox { Header = "Send an image every (minutes; 0 = off)" };
         var scenes = new ToggleSwitch { Header = "Send when the scene changes" };
         var dayNight = new ToggleSwitch { Header = "Send on day / night transitions" };
         var telescopeEvents = new ToggleSwitch { Header = "Send on slew / sequence events" };
-        var threshold = new NumberBox { Header = "Changed area threshold (%)", Minimum = 5, Maximum = 80, SmallChange = 5 };
-        var burst = new NumberBox { Header = "Images per scene / telescope event (maximum)", Minimum = 1, Maximum = 3, SmallChange = 1 };
-        var spacing = new NumberBox { Header = "Seconds between event images (minimum)", Minimum = 60, Maximum = 600, SmallChange = 30 };
+        // Text is the single source of truth, including before collapsed content
+        // is templated. NumberBox.Value can be populated while Text is still empty.
+        var threshold = new TextBox { Header = "Changed area threshold (%; 5–80)" };
+        var burst = new TextBox { Header = "Images per scene / telescope event (1–3)" };
+        var spacing = new TextBox { Header = "Seconds between event images (60–600)" };
         var chatConfiguration = new ToggleSwitch { Header = "Allow the camera owner to adjust triggers in chat" };
         var events = new Expander {
             Header = "Scene and telescope events", HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -87,21 +89,15 @@ public sealed partial class MainWindow
             CloseButtonText = "Close", DefaultButton = ContentDialogButton.Close
         };
         bool busy = false, loading = false, invalidDraft = false, statusUnknown = false;
-        string? inputError = null;
         bool HasEdits() => setup.IsDirty || invalidDraft;
-        static ushort Number(NumberBox box)
-        {
-            if (!double.TryParse(box.Text, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out double value)
-                || !double.IsFinite(value) || value != Math.Truncate(value) || value < box.Minimum || value > box.Maximum)
-                throw new InvalidOperationException($"{box.Header}: enter a whole number from {box.Minimum} to {box.Maximum}.");
-            return checked((ushort)value);
-        }
+        static ushort Number(TextBox box, ushort minimum, ushort maximum) =>
+            SharingSetupState.WholeNumber(box.Text, minimum, maximum, box.Header.ToString()!);
         SharingPreferences Inputs() => new() {
             HubOrigin = origin.Text.Trim(), Enabled = enabled.IsOn,
             Snapshots = snapshots.IsOn, SceneChanges = scenes.IsOn, DayNight = dayNight.IsOn,
-            SceneThresholdPercent = checked((byte)Number(threshold)), IntervalMinutes = Number(interval),
+            SceneThresholdPercent = checked((byte)Number(threshold, 5, 80)), IntervalMinutes = Number(interval, 0, 1440),
             TelescopeEvents = telescopeEvents.IsOn, ChatConfiguration = chatConfiguration.IsOn,
-            BurstCount = checked((byte)Number(burst)), SpacingSeconds = Number(spacing)
+            BurstCount = checked((byte)Number(burst, 1, 3)), SpacingSeconds = Number(spacing, 60, 600)
         };
         void Render()
         {
@@ -143,22 +139,21 @@ public sealed partial class MainWindow
             snapshots.IsOn = p.Snapshots;
             scenes.IsOn = p.SceneChanges;
             dayNight.IsOn = p.DayNight;
-            threshold.Value = p.SceneThresholdPercent;
-            interval.Value = p.IntervalMinutes;
+            threshold.Text = p.SceneThresholdPercent.ToString(CultureInfo.CurrentCulture);
+            interval.Text = p.IntervalMinutes.ToString(CultureInfo.CurrentCulture);
             telescopeEvents.IsOn = p.TelescopeEvents;
-            burst.Value = p.BurstCount;
-            spacing.Value = p.SpacingSeconds;
+            burst.Text = p.BurstCount.ToString(CultureInfo.CurrentCulture);
+            spacing.Text = p.SpacingSeconds.ToString(CultureInfo.CurrentCulture);
             chatConfiguration.IsOn = p.ChatConfiguration;
             invalidDraft = false;
-            inputError = null;
             loading = false;
             Render();
         }
         void Changed()
         {
             if (loading || busy) return;
-            try { setup.Draft = Inputs(); invalidDraft = false; inputError = null; }
-            catch (InvalidOperationException error) { invalidDraft = true; inputError = error.Message; }
+            try { setup.Draft = Inputs(); invalidDraft = false; }
+            catch (InvalidOperationException) { invalidDraft = true; }
             Render();
         }
         async Task Refresh()
@@ -189,10 +184,7 @@ public sealed partial class MainWindow
         foreach (var toggle in new[] { enabled, snapshots, scenes, dayNight, telescopeEvents, chatConfiguration })
             toggle.Toggled += (_, _) => Changed();
         foreach (var number in new[] { threshold, interval, burst, spacing })
-        {
-            number.ValueChanged += (_, _) => Changed();
-            number.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => Changed());
-        }
+            number.TextChanged += (_, _) => Changed();
         code.PasswordChanged += (_, _) => Render();
         forgetConsent.Checked += (_, _) => Render();
         forgetConsent.Unchecked += (_, _) => Render();
@@ -224,8 +216,9 @@ public sealed partial class MainWindow
             args.Cancel = true;
             var deferral = args.GetDeferral();
             try { await Operate(async () => {
-                if (invalidDraft) throw new InvalidOperationException(inputError);
+                // Always validate the current text, never a cached load-time error.
                 setup.Draft = Inputs();
+                invalidDraft = false;
                 setup.Accept(await _agentClient.ConfigureSharingAsync(setup.ExpectedRevision, setup.ForSave(), cancellationToken));
                 Populate();
                 feedback.Text = setup.Status.Preferences.Enabled ? "Settings saved. Connecting to the Hub; refresh to check delivery." : "Settings saved. Sharing is off.";

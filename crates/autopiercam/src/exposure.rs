@@ -6,6 +6,50 @@
 use std::time::Duration;
 
 use super::AutoLimits;
+use autopiercam_protocol::PreviewMode;
+
+/// Lighting mode inferred from completed exposures, including SDK auto mode.
+/// This is a camera lighting hint, not an astronomical sunrise calculation.
+#[derive(Default)]
+pub(crate) struct ExposureMode {
+    mode: Option<PreviewMode>,
+    candidate: Option<(PreviewMode, Duration, u32)>,
+}
+
+impl ExposureMode {
+    pub(crate) fn observe(&mut self, exposure_us: i64, now: Duration) -> PreviewMode {
+        if exposure_us <= 0 {
+            self.candidate = None;
+            return self.mode.unwrap_or(PreviewMode::Unknown);
+        }
+        let Some(mode) = self.mode else {
+            let mode = if exposure_us >= 500_000 {
+                PreviewMode::Night
+            } else {
+                PreviewMode::Day
+            };
+            self.mode = Some(mode);
+            return mode;
+        };
+        let next = match mode {
+            PreviewMode::Day if exposure_us >= 1_000_000 => PreviewMode::Night,
+            PreviewMode::Night if exposure_us <= 250_000 => PreviewMode::Day,
+            _ => {
+                self.candidate = None;
+                return mode;
+            }
+        };
+        let (_, since, samples) = self.candidate.get_or_insert((next, now, 0));
+        *samples = samples.saturating_add(1);
+        if *samples >= 3 && now.saturating_sub(*since) >= Duration::from_secs(30) {
+            self.mode = Some(next);
+            self.candidate = None;
+            next
+        } else {
+            mode
+        }
+    }
+}
 
 pub(crate) fn poll_timeout_ms(exposure_us: i64) -> i32 {
     (exposure_us.max(1) / 1_000 + 500).clamp(500, 2_000) as i32
@@ -162,6 +206,70 @@ impl Settling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdk_mode_uses_exposure_and_sustained_time_not_wall_clock() {
+        let mut mode = ExposureMode::default();
+        assert_eq!(mode.observe(0, Duration::ZERO), PreviewMode::Unknown);
+        assert_eq!(mode.observe(8_765_000, Duration::ZERO), PreviewMode::Night);
+        for seconds in [1, 2, 30] {
+            assert_eq!(
+                mode.observe(10_000, Duration::from_secs(seconds)),
+                PreviewMode::Night
+            );
+        }
+        assert_eq!(
+            mode.observe(10_000, Duration::from_secs(31)),
+            PreviewMode::Day
+        );
+        for seconds in [40, 41, 69] {
+            assert_eq!(
+                mode.observe(2_000_000, Duration::from_secs(seconds)),
+                PreviewMode::Day
+            );
+        }
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(70)),
+            PreviewMode::Night
+        );
+        for seconds in 71..100 {
+            assert_eq!(
+                mode.observe(500_000, Duration::from_secs(seconds)),
+                PreviewMode::Night
+            );
+        }
+    }
+
+    #[test]
+    fn mode_flashes_and_invalid_samples_do_not_accumulate_transition_time() {
+        let mut mode = ExposureMode::default();
+        assert_eq!(mode.observe(10_000, Duration::ZERO), PreviewMode::Day);
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(1)),
+            PreviewMode::Day
+        );
+        assert_eq!(mode.observe(0, Duration::from_secs(40)), PreviewMode::Day);
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(41)),
+            PreviewMode::Day
+        );
+        assert_eq!(
+            mode.observe(500_000, Duration::from_secs(42)),
+            PreviewMode::Day
+        );
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(100)),
+            PreviewMode::Day
+        );
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(200)),
+            PreviewMode::Day
+        );
+        assert_eq!(
+            mode.observe(2_000_000, Duration::from_secs(300)),
+            PreviewMode::Night
+        );
+    }
 
     fn limits(max_exposure_us: i64) -> AutoLimits {
         AutoLimits {

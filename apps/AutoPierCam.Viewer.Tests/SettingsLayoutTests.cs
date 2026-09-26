@@ -4,6 +4,19 @@ using Xunit;
 public sealed class SettingsLayoutTests
 {
     [Fact]
+    public void ReloadIsInSettingsAndManualStillIsNotALiveRefresh()
+    {
+        var markup = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        var reload = Assert.Single(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "RefreshButton");
+        Assert.Equal("Reload settings", (string?)reload.Attribute("Content"));
+        Assert.Contains(reload.Ancestors(), e => (string?)e.Attribute(xaml + "Name") == "SettingsPane");
+        Assert.DoesNotContain(reload.Ancestors(), e => e.Name.LocalName == "ScrollViewer");
+        var capture = Assert.Single(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "CaptureButton");
+        Assert.Equal("Save next frame", (string?)capture.Attribute("Content"));
+    }
+
+    [Fact]
     public void CompactTelemetryReplacesCardsAndConnectionFooter()
     {
         var markup = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));

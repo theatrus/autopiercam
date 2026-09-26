@@ -402,6 +402,7 @@ mod tests {
         assert_eq!(preview.metadata.session_generation, session.generation());
         assert_eq!(preview.metadata.exposure_us, Some(60_000_000));
         assert_eq!(preview.metadata.gain, Some(400));
+        assert_eq!(preview.metadata.mode, PreviewMode::Night);
         assert_eq!(preview.metadata.captured_at_unix_ms, 1000);
         assert_eq!(
             monitor.snapshot().state,

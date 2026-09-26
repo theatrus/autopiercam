@@ -457,7 +457,7 @@ public sealed partial class MainWindow : Window
             var confirm = new ContentDialog {
                 XamlRoot = Content.XamlRoot,
                 Title = "Discard unsaved settings?",
-                Content = "Refresh reloads settings from the agent. Your unsaved changes will be lost.",
+                Content = "Reloading settings from the agent will discard your unsaved changes.",
                 PrimaryButtonText = "Discard and refresh",
                 CloseButtonText = "Keep editing",
                 DefaultButton = ContentDialogButton.Close,
@@ -471,7 +471,7 @@ public sealed partial class MainWindow : Window
 
     private async void CaptureButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiOperationAsync("Requesting an immediate capture…", CaptureAndRefreshAsync);
+        await RunUiOperationAsync("Requesting a still from the next completed frame…", CaptureAndRefreshAsync);
     }
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
@@ -501,7 +501,7 @@ public sealed partial class MainWindow : Window
     {
         await _agentClient.CaptureNowAsync(cancellationToken);
         ApplyStatus(await _agentClient.GetStatusAsync(cancellationToken));
-        StatusText.Text = "Capture requested. Unsaved settings were not changed.";
+        StatusText.Text = "Still requested; waiting for the next completed frame. Unsaved settings were not changed.";
     }
 
     private async void PauseButton_Click(object sender, RoutedEventArgs args)
@@ -527,11 +527,11 @@ public sealed partial class MainWindow : Window
     {
         AgentConfigurationSnapshot snapshot = _configurationSnapshot ??
             throw new UserInputException(
-                "No configuration is loaded. Select Refresh before saving.");
+                "No configuration is loaded. Select Reload settings before saving.");
         if (_configurationNeedsRefresh)
         {
             throw new UserInputException(
-                "The configuration may be stale. Select Refresh before saving.");
+                "The configuration may be stale. Select Reload settings before saving.");
         }
 
         AgentConfiguration updatedConfiguration =
@@ -1053,7 +1053,7 @@ public sealed partial class MainWindow : Window
         {
             _configurationNeedsRefresh = true;
             ShowAgentFailure(
-                $"Protocol v1 error: {exception.Message} Restart the agent and viewer, then try Refresh.");
+                $"Protocol v1 error: {exception.Message} Restart the agent and viewer, then try Reload settings in Settings.");
         }
         catch (UserInputException exception)
         {
@@ -1309,10 +1309,10 @@ public sealed partial class MainWindow : Window
 
         _configurationNeedsRefresh = true;
         StatusText.Text =
-            $"Offline — {Compact(detail)} Start the AutoPierCam agent, then select Refresh.";
+            $"Offline — {Compact(detail)} Start the AutoPierCam agent, then select Reload settings in Settings.";
         FrameCountsText.Text = "No live agent status available";
         LastArtifactText.Text = "Last artifact: unavailable while offline";
-        AgentLastErrorText.Text = "Start or restart the local capture agent and select Refresh.";
+        AgentLastErrorText.Text = "Start or restart the local capture agent and select Reload settings.";
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Reconnect and refresh to load upload activity.");
         _cameraInventoryLoaded = false;
@@ -1321,7 +1321,7 @@ public sealed partial class MainWindow : Window
         CameraComboBox.PlaceholderText = "Agent offline";
         ConfigInfoBar.Title = "Configuration unavailable";
         ConfigInfoBar.Message =
-            "Reconnect and select Refresh before editing or saving settings.";
+            "Reconnect and select Reload settings before editing or saving settings.";
         StatusWarningIcon.Visibility = Visibility.Visible;
         SetConfigurationFeedback(InfoBarSeverity.Warning, true);
     }
@@ -1335,12 +1335,12 @@ public sealed partial class MainWindow : Window
 
         _configurationNeedsRefresh = true;
         StatusText.Text =
-            $"Agent response timed out — {Compact(detail)} Select Refresh before retrying Capture now.";
+            $"Agent response timed out — {Compact(detail)} Select Reload settings in Settings before retrying Save next frame.";
         AgentLastErrorText.Text =
             "The request may have completed. Refresh status before sending another capture request.";
         AgentLastErrorText.Visibility = Visibility.Visible;
         ClearUploadActivity("Unavailable", "Refresh to confirm current upload activity.");
-        ConfigInfoBar.Title = "Refresh required";
+        ConfigInfoBar.Title = "Reload settings required";
         ConfigInfoBar.Message =
             "The timed-out request may have changed agent state. Refresh before saving configuration.";
         StatusWarningIcon.Visibility = Visibility.Visible;
@@ -1369,7 +1369,7 @@ public sealed partial class MainWindow : Window
 
         _configurationNeedsRefresh = true;
         string message =
-            "Settings were changed elsewhere. Refresh to load them before saving your changes.";
+            "Settings were changed elsewhere. Select Reload settings before saving your changes.";
         StatusText.Text = message;
         ConfigInfoBar.Title = "Settings changed elsewhere";
         ConfigInfoBar.Message = message;
@@ -1388,7 +1388,7 @@ public sealed partial class MainWindow : Window
 
         _configurationNeedsRefresh = true;
         string message =
-            $"The settings file was saved, but the capture worker had already stopped. {FormatAgentError(exception)} Restart the agent and select Refresh.";
+            $"The settings file was saved, but the capture worker had already stopped. {FormatAgentError(exception)} Restart the agent and select Reload settings.";
         StatusText.Text = Compact(message);
         ConfigInfoBar.Title = "Configuration saved; restart required";
         ConfigInfoBar.Message = Compact(message);
@@ -1513,7 +1513,7 @@ public sealed partial class MainWindow : Window
 
         string? warning = string.IsNullOrWhiteSpace(storage.LastError)
             ? storage.CaptureSuspended
-                ? "Scheduled still persistence is paused; Capture now remains available."
+                ? "Scheduled still persistence is paused; Save next frame remains available."
                 : null
             : Compact(storage.LastError);
         StorageErrorText.Text = warning ?? string.Empty;

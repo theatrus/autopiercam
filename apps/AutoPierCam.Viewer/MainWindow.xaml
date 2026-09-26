@@ -54,13 +54,10 @@
                     Click="SharingButton_Click"
                     Content="Chatstronomy" />
                 <Button
-                    x:Name="RefreshButton"
-                    Click="RefreshButton_Click"
-                    Content="Refresh" />
-                <Button
                     x:Name="CaptureButton"
                     Click="CaptureButton_Click"
-                    Content="Capture now"
+                    Content="Save next frame"
+                    ToolTipService.ToolTip="Save an extra full-resolution still when the current exposure completes. This does not send an image to chat."
                     Style="{StaticResource AccentButtonStyle}" />
                 <Button x:Name="PauseButton" Content="Pause recording" IsEnabled="False" Click="PauseButton_Click" />
                 <Button x:Name="SettingsButton" Content="Settings" Click="SettingsButton_Click" />
@@ -173,6 +170,8 @@
                 </Grid.RowDefinitions>
                 <StackPanel Spacing="8">
                     <TextBlock FontSize="20" FontWeight="SemiBold" Text="Capture settings" />
+                    <Button x:Name="RefreshButton" Click="RefreshButton_Click" Content="Reload settings"
+                            ToolTipService.ToolTip="Reload settings and camera discovery from the agent. The live preview updates automatically." />
                     <StackPanel Spacing="6">
                         <TextBlock Text="Camera" />
                         <ComboBox

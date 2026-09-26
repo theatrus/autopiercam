@@ -90,7 +90,7 @@ enforce a byte target.
 
 While pressure is blocked, scheduled still persistence is suspended so it does
 not continually add data that cannot be reclaimed. Camera draining and preview
-continue, and Capture now remains an explicit operator override. A later
+continue, and Save next frame remains an explicit operator override. A later
 successful sweep clears the suspension automatically. An unexpected retention
 worker stop faults the active camera attempt so the supervisor can restart it
 instead of continuing without the configured guard.

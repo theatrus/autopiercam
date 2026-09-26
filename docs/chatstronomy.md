@@ -154,11 +154,21 @@ Automatic events are independent opt-ins:
 
 - **Scene changes:** a 32×24 grayscale grid normalized for overall brightness;
   at least the selected percentage of cells must change materially in three
-  distinct frames. Startup, session changes, mode transitions, very dark
-  frames and exposure changes over 20% or gain changes over 10 reset/suppress
-  the detector. The full preview is the analysis region.
+  consecutive distinct frames. A cell changes when its normalized value differs
+  by more than 0.3. The reference is the startup image until the first delivered
+  scene-change report, then the image attached to the last scene-change report
+  acknowledged as delivered by the Hub. Ordinary frames, coalesced detections,
+  retries, rejected reports and periodic/manual/telescope images do not move it.
+  This captures slow cumulative drift instead of comparing only adjacent frames.
+  Very dark frames, mode transitions, exposure changes over 20% and gain changes
+  over 10 pause detection without erasing the reference. Scene detection works
+  even when mode metadata is unknown. The full preview is the analysis region.
+  The reference survives network reconnects, but capture session changes,
+  pause, trigger-rule/consent changes and process restarts seed a new reference.
 - **Day/night transitions:** use capture-mode metadata with a 30-second dwell,
-  not JPEG brightness alone.
+  not JPEG brightness alone. SDK auto capture now infers lighting mode from
+  completed exposures too (see [exposure policy](exposure.md)); no adaptive
+  exposure opt-in is required.
 
 These are observations, not classifications of people, animals, meteors,
 intrusions, weather or threats. There is a 60-second new-event cooldown.
