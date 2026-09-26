@@ -17,7 +17,6 @@ public sealed partial class MainWindow : Window
 
     private readonly AgentPipeClient _agentClient = new();
     private readonly PreviewPipeClient _previewClient = new();
-    private readonly ExposureProgressClient _progressClient = new();
     private readonly PreviewFrameClock _previewFrameClock = new();
     private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherQueueTimer _previewFreshnessTimer;
@@ -36,6 +35,8 @@ public sealed partial class MainWindow : Window
     private bool _configurationNeedsRefresh = true;
     private bool _initialRefreshStarted;
     private bool _operationInProgress;
+    private int _operationGeneration;
+    private bool _liveStatusUnavailable = true;
     private bool _closed;
 
     public MainWindow()
@@ -70,44 +71,44 @@ public sealed partial class MainWindow : Window
 
     private async Task RunExposureProgressLoopAsync(CancellationToken cancellationToken)
     {
+        // A separate, short-deadline status client must not queue behind saves
+        // or pairing. Poll status only, never config.get or camera enumeration.
+        await using var client = new AgentPipeClient(connectTimeout: TimeSpan.FromSeconds(2), requestTimeout: TimeSpan.FromSeconds(2));
         try
         {
-            // This read-only client has its own short request deadline. It never
-            // refreshes configuration or touches a user's unsaved setting edits.
-            await _progressClient.RunAsync(
-                    (observation, token) => RunOnDispatcherAsync(
-                        () =>
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                int generation = Volatile.Read(ref _operationGeneration);
+                AgentStatus? status = null;
+                try { status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false); }
+                catch (AgentClientException) { /* A later poll can recover. */ }
+                long received = System.Diagnostics.Stopwatch.GetTimestamp();
+                await RunOnDispatcherAsync(() => {
+                    // Never let a response begun before a save/command undo its
+                    // newer UI state. Keep progress fresh during modal dialogs.
+                    if (generation != Volatile.Read(ref _operationGeneration)) return Task.CompletedTask;
+                    _progressObservation = status?.Progress is { } progress
+                        ? new ExposureProgressObservation(progress, received) : null;
+                    if (!_operationInProgress)
+                    {
+                        if (status is not null) ApplyStatus(status);
+                        else
                         {
-                            _progressObservation = observation;
-                            UpdatePreviewPresentation();
-                            return Task.CompletedTask;
-                        },
-                        token),
-                    cancellationToken)
-                .ConfigureAwait(false);
+                            _liveStatusUnavailable = true;
+                            StatusText.Text = "Agent status unavailable · reconnecting";
+                            AgentConnectionText.Text = "Rust agent: status unavailable";
+                            SetControlsForOperation(false);
+                        }
+                    }
+                    UpdatePreviewPresentation();
+                    return Task.CompletedTask;
+                }, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Closing the window cancels both the request and the polling delay.
-        }
-        catch (Exception) when (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunOnDispatcherAsync(
-                        () =>
-                        {
-                            _progressObservation = null;
-                            UpdatePreviewPresentation();
-                            return Task.CompletedTask;
-                        },
-                        CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
-            catch
-            {
-                // The dispatcher may already be shutting down with the window.
-            }
         }
     }
 
@@ -1012,6 +1013,7 @@ public sealed partial class MainWindow : Window
         }
 
         _operationInProgress = true;
+        Interlocked.Increment(ref _operationGeneration);
         SetControlsForOperation(inProgress: true);
         StatusText.Text = workingMessage;
 
@@ -1064,6 +1066,7 @@ public sealed partial class MainWindow : Window
         finally
         {
             _operationInProgress = false;
+            Interlocked.Increment(ref _operationGeneration);
             if (!_closed)
             {
                 SetControlsForOperation(inProgress: false);
@@ -1109,6 +1112,7 @@ public sealed partial class MainWindow : Window
         FfmpegPathTextBox.Text = configuration.Video.FfmpegPath ?? string.Empty;
 
         _configurationSnapshot = snapshot;
+        _settingsBaseline = SettingsFormValues.FromConfiguration(configuration);
         _configurationNeedsRefresh = false;
         ApplyUploadActivity(_latestAgentStatus?.Upload, configuration.Upload.Enabled);
         _hasUnsavedSettings = false;
@@ -1246,7 +1250,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        string state = Compact(status.State);
+        string state = Compact(status.DisplayState);
         string cameraSummary = status.Camera is null
             ? "no camera"
             : $"{Compact(status.Camera.Name)} (id {status.Camera.Id})";
@@ -1260,6 +1264,7 @@ public sealed partial class MainWindow : Window
         AgentConnectionText.Text =
             $"Rust agent: connected · {PipeDisplayName}";
         _latestAgentStatus = status;
+        _liveStatusUnavailable = false;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
         bool? uploadEnabled = _configurationNeedsRefresh
@@ -1280,6 +1285,7 @@ public sealed partial class MainWindow : Window
             AgentLastErrorText.Text = $"Last error: {Compact(status.LastError)}";
             AgentLastErrorText.Visibility = Visibility.Visible;
         }
+        SetControlsForOperation(_operationInProgress);
     }
 
     private void ShowOffline(string detail)
@@ -1548,10 +1554,10 @@ public sealed partial class MainWindow : Window
     {
         bool generalControlsEnabled = !inProgress && !_closed;
         RefreshButton.IsEnabled = generalControlsEnabled;
-        CaptureButton.IsEnabled = generalControlsEnabled;
-        PauseButton.IsEnabled = generalControlsEnabled && _latestAgentStatus?.State is "capturing" or "paused";
+        CaptureButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
+        PauseButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable && _latestAgentStatus?.State is "capturing" or "paused";
         PauseButton.Content = _latestAgentStatus?.State == "paused" ? "Resume recording" : "Pause recording";
-        SharingButton.IsEnabled = generalControlsEnabled && _latestAgentStatus?.HasCapability("sharing.get") == true;
+        SharingButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable && _latestAgentStatus?.HasCapability("sharing.get") == true;
 
         bool configurationControlsEnabled =
             generalControlsEnabled &&
@@ -1568,7 +1574,7 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
         FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
-        SaveButton.IsEnabled = configurationControlsEnabled && _hasUnsavedSettings;
+        SaveButton.IsEnabled = configurationControlsEnabled && !_liveStatusUnavailable && _hasUnsavedSettings;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
 
