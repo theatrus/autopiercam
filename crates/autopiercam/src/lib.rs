@@ -1488,13 +1488,8 @@ fn wait_for_auto_settle(
         // not an assertion that exposure/gain are exact for these sensor bytes.
         let stats = frame_stats(meta, &frame_buffer)?;
         let frame = progress.completed_frame(meta, &mut frame_buffer);
-        let settled = settling.observe_frame(
-            progress.started.elapsed(),
-            frame.exposure_us,
-            frame.gain,
-            stats.p90,
-            stats.clipped_fraction,
-        );
+        let settled =
+            settling.observe_frame(progress.started.elapsed(), frame.exposure_us, frame.gain);
         progress.status.settling_frames = settling.received();
         let adjusted = observer.adapt(camera, &frame)?;
         progress.refresh(camera, limits);
@@ -2267,13 +2262,7 @@ mod tests {
                 target_brightness: 100,
             },
         );
-        settling.observe_frame(
-            Duration::from_secs(600),
-            frame.exposure_us,
-            frame.gain,
-            4,
-            0.0,
-        );
+        settling.observe_frame(Duration::from_secs(600), frame.exposure_us, frame.gain);
         // The final SDK read times out after touching its destination buffer.
         scratch.resize(16, 255);
         assert_eq!(

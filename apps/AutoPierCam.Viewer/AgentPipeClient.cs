@@ -3,6 +3,7 @@ using System.IO.Pipes;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using AutoPierCam.Preview;
 
 namespace AutoPierCam.Viewer;
 
@@ -120,7 +121,7 @@ internal sealed class AgentPipeClient : IAsyncDisposable
 
         status.Storage?.Validate();
 
-        return status;
+        return status with { Progress = ExposureProgressStatus.ParseStatus(result) };
     }
 
     internal async Task<UploadListResult> ListUploadsAsync(
@@ -931,6 +932,20 @@ internal sealed record AgentApiConfiguration
 
 internal sealed record AgentStatus
 {
+    // Parse optional progress with the same compatibility rules as NINA, while
+    // keeping the complete status for the Viewer's live header and counters.
+    [JsonIgnore]
+    public ExposureProgressStatus? Progress { get; init; }
+
+    internal string DisplayState => State switch {
+        "starting" when Progress?.Exposure is { SettlingFrames: > 0 } => "Acquiring preview · stabilizing exposure (recording pending)",
+        "starting" when Progress?.Exposure is not null => "Waiting for first exposure",
+        "starting" => "Starting camera",
+        "capturing" => "Capturing",
+        "paused" => "Recording paused · live preview",
+        _ => State
+    };
+
     [JsonPropertyName("state")]
     [JsonRequired]
     public string State { get; init; } = string.Empty;

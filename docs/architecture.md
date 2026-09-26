@@ -144,7 +144,9 @@ exposure, maximum gain, and target-brightness controls discovered at runtime.
 The default maximum is 60 seconds; explicit saved limits are unchanged. The
 agent reads back the effective SDK ceiling and publishes it with monotonic
 per-frame progress through `status.get`. Startup settling budgets the requested
-minimum frame count plus four convergence frames at that ceiling. Completed
+minimum frame count plus four convergence frames at that ceiling. Early completion
+requires stable exposure/gain over a four-sample anchored window, not stable scene
+luminance or a clipping threshold. Completed
 frames feed preview while settling, and the final settling frame becomes the
 first still without waiting for another exposure. Short SDK polls retain
 responsive cancellation; a separate exposure-aware no-frame deadline faults a

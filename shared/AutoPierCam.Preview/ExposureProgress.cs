@@ -230,7 +230,9 @@ internal static class ExposurePresentation
 
         double elapsedSeconds = progress.WaitElapsedMs / 1_000d + observationAge.TotalSeconds;
         string stage = progress.Settling
-            ? $"Settling: {progress.SettlingFrames:N0}/{progress.SettlingMinFrames:N0} minimum frames"
+            ? progress.SettlingFrames < progress.SettlingMinFrames
+                ? $"Stabilizing exposure: {progress.SettlingFrames:N0} frames received (minimum {progress.SettlingMinFrames:N0})"
+                : $"Stabilizing exposure: {progress.SettlingFrames:N0} frames received; waiting for stable exposure and gain"
             : "Exposing";
         string timing = $"waiting {Math.Floor(elapsedSeconds):N0} s for a frame; exposure about {FormatExposure(progress.ExposureUs)}";
         return elapsedSeconds >= progress.FrameTimeoutMs / 1_000d

@@ -77,9 +77,8 @@ pub(crate) enum WaitDecision {
 }
 
 pub(crate) struct Settling {
-    limits: AutoLimits,
     deadline: Duration,
-    previous: Option<(i64, i64, u8)>,
+    stable_anchor: Option<(i64, i64)>,
     stable_samples: u32,
     received: u32,
     minimum_frames: u32,
@@ -97,9 +96,8 @@ impl Settling {
         .saturating_add(Duration::from_secs(5))
         .max(Duration::from_secs(5));
         Self {
-            limits,
             deadline,
-            previous: None,
+            stable_anchor: None,
             stable_samples: 0,
             received: 0,
             minimum_frames,
@@ -134,29 +132,18 @@ impl Settling {
         }
     }
 
-    pub(crate) fn observe_frame(
-        &mut self,
-        now: Duration,
-        exposure_us: i64,
-        gain: i64,
-        p90: u8,
-        clipped_fraction: f32,
-    ) -> bool {
+    pub(crate) fn observe_frame(&mut self, now: Duration, exposure_us: i64, gain: i64) -> bool {
         self.received = self.received.saturating_add(1);
         let exposure_tolerance = (exposure_us.unsigned_abs() / 20).max(32);
-        let stable = self
-            .previous
-            .is_some_and(|(old_exposure, old_gain, old_p90)| {
-                old_exposure.abs_diff(exposure_us) <= exposure_tolerance
-                    && old_gain.abs_diff(gain) <= 3
-                    && old_p90.abs_diff(p90) <= 3
-            });
+        let stable = self.stable_anchor.is_some_and(|(old_exposure, old_gain)| {
+            old_exposure.abs_diff(exposure_us) <= exposure_tolerance && old_gain.abs_diff(gain) <= 3
+        });
         self.stable_samples = if stable {
             self.stable_samples.saturating_add(1)
         } else {
+            self.stable_anchor = Some((exposure_us, gain));
             0
         };
-        self.previous = Some((exposure_us, gain, p90));
         let dynamic_minimum = Duration::from_micros(
             exposure_us
                 .unsigned_abs()
@@ -164,20 +151,11 @@ impl Settling {
                 .saturating_add(100_000),
         )
         .max(Duration::from_secs(5));
-        let dark_threshold = (self.limits.target_brightness / 4).clamp(8, 64) as u8;
-        let luma_acceptable = p90 >= dark_threshold && clipped_fraction <= 0.05;
-        let at_dark_limit = exposure_us >= self.limits.max_exposure_us.saturating_mul(95) / 100
-            && gain >= self.limits.max_gain.saturating_sub(3);
-        let at_bright_limit = exposure_us
-            <= self
-                .limits
-                .min_exposure_us
-                .saturating_add((self.limits.min_exposure_us / 20).max(32))
-            && gain <= self.limits.min_gain.saturating_add(3);
-        self.received >= self.minimum_frames
-            && self.stable_samples >= 3
-            && now >= dynamic_minimum
-            && (luma_acceptable || at_dark_limit || at_bright_limit)
+        // Settling means the controls have converged, not that the scene is
+        // stationary or free of clipped pixels. Clouds/lights can change image
+        // statistics indefinitely. The adaptive controller still vetoes exit
+        // when it requests an adjustment; SDK mode is fenced by this window.
+        self.received >= self.minimum_frames && self.stable_samples >= 3 && now >= dynamic_minimum
     }
 }
 
@@ -196,6 +174,47 @@ mod tests {
     }
 
     #[test]
+    fn stable_controls_below_ceiling_settle_without_scene_brightness_gates() {
+        // Regression: an 8.765s stream at gain 300 used to remain in startup
+        // for ten minutes with a 60s ceiling and moving/clipped scenery.
+        let mut settling = Settling::new(6, limits(60_000_000));
+        for frame in 1..=6 {
+            assert_eq!(
+                settling.observe_frame(Duration::from_millis(frame * 8765), 8_765_000, 300),
+                frame == 6
+            );
+        }
+    }
+
+    #[test]
+    fn slow_sdk_ramp_is_measured_against_the_stable_window_not_adjacent_frames() {
+        let mut settling = Settling::new(6, limits(60_000_000));
+        for frame in 1..=20 {
+            // Each step is below 5%, but the four-frame window is not stable.
+            let exposure = (8_000_000f64 * 1.04f64.powi(frame)) as i64;
+            assert!(!settling.observe_frame(Duration::from_secs(frame as u64 * 20), exposure, 300));
+        }
+    }
+
+    #[test]
+    fn gain_changes_reset_the_stable_window() {
+        let mut settling = Settling::new(6, limits(60_000_000));
+        for frame in 1..=10 {
+            assert!(!settling.observe_frame(
+                Duration::from_secs(frame * 9),
+                8_765_000,
+                frame as i64 * 10
+            ));
+        }
+        for frame in 1..=3 {
+            assert_eq!(
+                settling.observe_frame(Duration::from_secs(90 + frame * 9), 8_765_000, 100),
+                frame == 3
+            );
+        }
+    }
+
+    #[test]
     fn six_thirty_or_sixty_second_frames_fit_and_settle() {
         for seconds in [30, 60] {
             let exposure_us = seconds * 1_000_000;
@@ -205,10 +224,7 @@ mod tests {
                 let now = Duration::from_secs(frame * seconds as u64);
                 assert_eq!(settling.decision(&wait, now, false), WaitDecision::Continue);
                 wait.frame_received(now);
-                assert_eq!(
-                    settling.observe_frame(now, exposure_us, 400, 4, 0.0),
-                    frame == 6
-                );
+                assert_eq!(settling.observe_frame(now, exposure_us, 400), frame == 6);
             }
             assert_eq!(settling.received(), 6);
         }
@@ -222,7 +238,7 @@ mod tests {
             let now = Duration::from_secs(frame * 60);
             assert_eq!(settling.decision(&wait, now, false), WaitDecision::Continue);
             wait.frame_received(now);
-            settling.observe_frame(now, 60_000_000, 200, (frame % 2 * 255) as u8, 1.0);
+            settling.observe_frame(now, 60_000_000, (frame % 2) as i64 * 100);
         }
         assert_eq!(
             settling.decision(&wait, Duration::from_secs(1445), false),
@@ -256,7 +272,7 @@ mod tests {
             WaitDecision::Stalled
         );
         wait.frame_received(Duration::from_secs(60));
-        settling.observe_frame(Duration::from_secs(60), 60_000_000, 200, 10, 0.0);
+        settling.observe_frame(Duration::from_secs(60), 60_000_000, 200);
         assert_eq!(
             settling.decision(&wait, Duration::from_secs(185), false),
             WaitDecision::Stalled
@@ -268,7 +284,7 @@ mod tests {
         let mut settling = Settling::new(6, limits(60_000_000));
         let mut wait = FrameWait::new(60_000_000);
         wait.frame_received(Duration::from_secs(600));
-        settling.observe_frame(Duration::from_secs(600), 60_000_000, 200, 10, 0.0);
+        settling.observe_frame(Duration::from_secs(600), 60_000_000, 200);
         for seconds in [0, 30, 60, 605, 725] {
             assert_eq!(
                 settling.decision(&wait, Duration::from_secs(seconds), true),
@@ -286,15 +302,12 @@ mod tests {
         let mut now = Duration::ZERO;
         for frame in 0..4 {
             now += Duration::from_secs(60);
-            assert!(!settling.observe_frame(now, 60_000_000, 400, 4, 0.0));
+            assert!(!settling.observe_frame(now, 60_000_000, 400));
             assert_eq!(settling.received(), frame + 1);
         }
         for frame in 0..4 {
             now += Duration::from_secs(1);
-            assert_eq!(
-                settling.observe_frame(now, 10_000, 10, 100, 0.0),
-                frame == 3
-            );
+            assert_eq!(settling.observe_frame(now, 10_000, 10), frame == 3);
         }
     }
 }

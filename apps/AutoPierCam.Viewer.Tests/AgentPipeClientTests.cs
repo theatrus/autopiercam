@@ -36,6 +36,45 @@ public sealed class AgentPipeClientTests
     }
 
     [Fact]
+    public async Task FullStatusReadsCarryLiveStateCountsAndExposureFromTheSameResponse()
+    {
+        foreach (string state in new[] { "starting", "capturing", "paused", "faulted", "starting", "capturing" })
+        {
+            bool settling = state == "starting";
+            await WithResponse("status.get", new {
+                state, frames_captured = 60, frames_saved = 3,
+                camera = new { id = 0, name = "ZWO ASI662MC" },
+                capabilities = new[] { "exposure.progress" },
+                exposure = new { session_generation = 9, settling, exposure_us = 8765000,
+                    gain = 300, max_exposure_us = 60000000, settling_frames = 60,
+                    settling_min_frames = 6, wait_elapsed_ms = 0, frame_timeout_ms = 22530 }
+            }, async client => {
+                var status = await client.GetStatusAsync();
+                Assert.Equal(state, status.State);
+                Assert.Equal(state, status.Progress!.State);
+                Assert.Equal(60UL, status.FramesCaptured);
+                Assert.Equal(3UL, status.FramesSaved);
+                Assert.Equal(8765000, status.Progress.Exposure!.ExposureUs);
+                Assert.Equal(settling, status.Progress.Exposure.Settling);
+                if (settling) Assert.StartsWith("Acquiring preview", status.DisplayState);
+                else if (state == "capturing") Assert.Equal("Capturing", status.DisplayState);
+                else if (state == "paused") Assert.StartsWith("Recording paused", status.DisplayState);
+            });
+        }
+    }
+
+    [Fact]
+    public async Task FullStatusSupportsOldAgentsWithoutOptionalExposure()
+    {
+        await WithResponse("status.get", new { state = "capturing", frames_captured = 12, frames_saved = 2 }, async client => {
+            var status = await client.GetStatusAsync();
+            Assert.Equal("Capturing", status.DisplayState);
+            Assert.NotNull(status.Progress);
+            Assert.Null(status.Progress.Exposure);
+        });
+    }
+
+    [Fact]
     public async Task SharingConfigureAndPairKeepChoicesAndSendExactRevision()
     {
         var preferences = new SharingPreferences {

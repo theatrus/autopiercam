@@ -65,17 +65,31 @@ See [security recording](video.md) for optional MP4 segments.
 The SDK adapts exposure and gain from completed frames. Dark startup can take
 several minutes: with six minimum frames and a 60-second ceiling, the overall
 settling budget is 605 seconds (ten exposures plus five seconds of allowance).
-It can finish sooner when exposure, gain, and luminance stabilize. A healthy
+It finishes sooner after the minimum frames and a four-sample stable exposure/gain
+window (within 5% exposure and three gain units of the window's initial sample).
+Slow cumulative ramps reset that window. Moving clouds, scene luminance, and
+clipped pixels do not prevent completion once the controls are stable. The
+adaptive controller still prevents completion on a frame where it adjusts controls.
+A healthy
 stream that does not converge before that budget uses its latest complete
 frame. It does not reuse a buffer modified by a failed SDK read.
 
 Preview starts with the first completed frame, even during settling. The
-Viewer and N.I.N.A. panel show settling counts or estimated exposing progress
+Viewer and N.I.N.A. panel show received-frame counts or estimated exposing progress
 between frames. Once settling completes, its last frame can be saved as the
 first still immediately, without waiting for another full exposure. The still
 interval is a sampling interval, not a shorter shutter time: a five-second
 still interval with 60-second exposure cannot produce a new still every five
 seconds.
+
+The Viewer labels startup frames as **Acquiring preview · stabilizing exposure**,
+with recording pending, rather than implying that no capture has started. Full
+status (including the header, counters, and pause controls) refreshes every two
+seconds independently of the settings form. Live polls do not reload configuration
+or discard edits; a response started before a command cannot overwrite its newer
+UI state. Unsaved-change detection compares normalized editable values against
+the loaded configuration, so control initialization/formatting is not an edit,
+and reverting an edit clears the warning.
 
 Each SDK read waits at most two seconds before checking cancellation. A
 separate no-frame deadline is twice the longest relevant observed exposure
