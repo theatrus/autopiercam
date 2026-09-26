@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
@@ -12,128 +13,248 @@ public sealed partial class MainWindow
 
     private async Task ShowSharingAsync(CancellationToken cancellationToken)
     {
-        SharingStatus status = await _agentClient.GetSharingAsync(cancellationToken);
-        var panel = new StackPanel { Spacing = 12, Width = 460 };
-        var notice = new TextBlock {
-            Text = "Share the full pier-camera preview to the Discord channels selected on your Hub device. Pairing alone shares nothing. Snapshot now uses the latest completed frame (up to 120 seconds old) and never changes exposure.",
-            TextWrapping = TextWrapping.Wrap
-        };
+        var setup = new SharingSetupState(await _agentClient.GetSharingAsync(cancellationToken));
+        static TextBlock Note(string text) => new() { Text = text, TextWrapping = TextWrapping.Wrap };
+        static TextBlock Heading(string text) => new() { Text = text, FontSize = 18 };
+        static StackPanel Group(params UIElement[] elements)
+        {
+            var panel = new StackPanel { Spacing = 10 };
+            foreach (var element in elements) panel.Children.Add(element);
+            return panel;
+        }
+        var connection = Note("");
         var origin = new TextBox { Header = "Hub HTTPS origin", PlaceholderText = "https://your-chatstronomy-hub" };
-        var connection = new TextBlock { TextWrapping = TextWrapping.Wrap };
-        var enabled = new ToggleSwitch { Header = "Connect and permit image sharing" };
-        var snapshots = new ToggleSwitch { Header = "Allow Hub Snapshot now requests" };
-        var scenes = new ToggleSwitch { Header = "Post persistent scene changes (entire preview)" };
-        var dayNight = new ToggleSwitch { Header = "Post stable day/night transitions" };
+        var code = new PasswordBox { Header = "One-use device pairing code", PlaceholderText = "Paste code from the Hub" };
+        var pair = new Button { Content = "Pair camera" };
+        var pairingFields = Group(
+            Note("In the Hub, open Observatory devices, add a pier camera, select its destination channels, and generate a pairing code."),
+            origin, code, pair, Note("Pairing keeps your settings below. It does not start sharing."));
+        var header = Group(Heading("1. Pair with your Hub"), connection, pairingFields);
+
+        var enabled = new ToggleSwitch { Header = "Enable image sharing" };
+        var snapshots = new ToggleSwitch { Header = "Allow Snapshot now requests" };
+        var interval = new NumberBox { Header = "Send an image every (minutes; 0 = off)", Minimum = 0, Maximum = 1440, SmallChange = 1 };
+        var scenes = new ToggleSwitch { Header = "Send when the scene changes" };
+        var dayNight = new ToggleSwitch { Header = "Send on day / night transitions" };
+        var telescopeEvents = new ToggleSwitch { Header = "Send on slew / sequence events" };
         var threshold = new NumberBox { Header = "Changed area threshold (%)", Minimum = 5, Maximum = 80, SmallChange = 5 };
-        var interval = new NumberBox { Header = "Periodic images: minutes (0 = disabled)", Minimum = 0, Maximum = 1440, SmallChange = 1 };
-        var telescopeEvents = new ToggleSwitch { Header = "Allow slew / sequence event images" };
         var burst = new NumberBox { Header = "Images per scene / telescope event (maximum)", Minimum = 1, Maximum = 3, SmallChange = 1 };
         var spacing = new NumberBox { Header = "Seconds between event images (minimum)", Minimum = 60, Maximum = 600, SmallChange = 30 };
-        var chatConfiguration = new ToggleSwitch { Header = "Allow the camera owner to configure triggers from chat" };
-        var triggerNotice = new TextBlock {
-            Text = "Chat can disable allowed triggers, slow periodic sends, or reduce bursts—but cannot enable a locally disabled source or exceed these limits. Save permissions resets chat overrides. Telescope triggers require the same owner and a shared Hub channel. Each burst waits for distinct completed frames; busy events are coalesced, not queued.",
-            TextWrapping = TextWrapping.Wrap
+        var chatConfiguration = new ToggleSwitch { Header = "Allow the camera owner to adjust triggers in chat" };
+        var events = new Expander {
+            Header = "Scene and telescope events", HorizontalAlignment = HorizontalAlignment.Stretch,
+            Content = Group(scenes, threshold, dayNight, telescopeEvents, burst, spacing,
+                Note("Scene changes are not person or threat detection. Telescope events require the same owner and a shared Hub channel. Bursts wait for distinct completed frames; busy events are coalesced."))
         };
-        var code = new PasswordBox { Header = "One-use device pairing code", PlaceholderText = "Code from Observatory devices in the Hub" };
-        var pair = new Button { Content = "Pair camera (sharing stays off)" };
-        var forget = new Button { Content = "Stop and forget local pairing" };
-        var reload = new Button { Content = "Refresh status / reload settings" };
-        var feedback = new TextBlock { TextWrapping = TextWrapping.Wrap };
-        var warning = new TextBlock {
-            Text = "Events are conservative scene observations, not person/animal or threat detection. Retries can duplicate a post after a Hub crash. Turning sharing off discards queued images but cannot recall messages already posted. Forgetting removes the local credential; revoke it in the Hub as well.",
-            TextWrapping = TextWrapping.Wrap
+        var chat = new Expander {
+            Header = "Chat control", HorizontalAlignment = HorizontalAlignment.Stretch,
+            Content = Group(chatConfiguration, Note("Chat can turn permitted triggers off, slow sends, or reduce bursts. It cannot enable a source you disabled or exceed your limits. Saving settings resets chat overrides."))
         };
-        foreach (var element in new FrameworkElement[] { notice, connection, origin, enabled, snapshots, scenes, dayNight, threshold, interval, telescopeEvents, burst, spacing, chatConfiguration, triggerNotice, code, pair, forget, reload, feedback, warning })
-            panel.Children.Add(element);
+        var details = Note("");
+        var forgetConsent = new CheckBox { Content = "Remove pairing and clear sharing permissions" };
+        var forget = new Button { Content = "Forget pairing" };
+        var management = new Expander {
+            Header = "Connection details / change Hub", HorizontalAlignment = HorizontalAlignment.Stretch,
+            Content = Group(details, Note("To change Hub, stop and forget this pairing first. This clears saved permissions. Revoke the credential in the Hub too."), forgetConsent, forget)
+        };
+        var settings = Group(Heading("2. Choose what to share"),
+            Note("The full preview goes to the channels selected in the Hub. Snapshot now uses the latest completed frame (up to 120 seconds old); it does not change exposure."),
+            enabled, snapshots, interval, events, chat, management,
+            Note("Stop sharing disconnects and discards queued images. Messages already posted cannot be recalled. Retries may duplicate a post after a Hub crash."));
+        var feedback = Note("");
+        var edits = Note("");
+        var reload = new Button { Content = "Refresh status" };
+        var discard = new Button { Content = "Discard changes" };
+        var keep = new Button { Content = "Keep my edits" };
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        actions.Children.Add(reload);
+        actions.Children.Add(discard);
+        actions.Children.Add(keep);
+        var footer = Group(edits, feedback, actions);
+        var body = new Grid { Width = 460, MaxHeight = 620, RowSpacing = 12 };
+        body.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        body.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        body.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var scroll = new ScrollViewer { Content = settings, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        Grid.SetRow(scroll, 1);
+        Grid.SetRow(footer, 2);
+        body.Children.Add(header);
+        body.Children.Add(scroll);
+        body.Children.Add(footer);
         var dialog = new ContentDialog {
-            XamlRoot = Content.XamlRoot, Title = "Chatstronomy image sharing",
-            Content = new ScrollViewer { Content = panel, MaxHeight = 600 },
-            PrimaryButtonText = "Save permissions", SecondaryButtonText = "Stop sharing",
+            XamlRoot = Content.XamlRoot, Title = "Chatstronomy image sharing", Content = body,
+            PrimaryButtonText = "Save settings", SecondaryButtonText = "Stop sharing",
             CloseButtonText = "Close", DefaultButton = ContentDialogButton.Close
         };
-        bool busy = false;
-        void Apply()
+        bool busy = false, loading = false, invalidDraft = false, statusUnknown = false;
+        string? inputError = null;
+        bool HasEdits() => setup.IsDirty || invalidDraft;
+        static ushort Number(NumberBox box)
         {
-            origin.Text = status.Preferences.HubOrigin;
-            origin.IsEnabled = status.DeviceId is null && !busy;
-            enabled.IsOn = status.Preferences.Enabled;
-            snapshots.IsOn = status.Preferences.Snapshots;
-            scenes.IsOn = status.Preferences.SceneChanges;
-            dayNight.IsOn = status.Preferences.DayNight;
-            threshold.Value = status.Preferences.SceneThresholdPercent;
-            interval.Value = status.Preferences.IntervalMinutes;
-            telescopeEvents.IsOn = status.Preferences.TelescopeEvents;
-            burst.Value = status.Preferences.BurstCount;
-            spacing.Value = status.Preferences.SpacingSeconds;
-            chatConfiguration.IsOn = status.Preferences.ChatConfiguration;
-            connection.Text = $"{status.Connection} · Device: {status.DeviceId?.ToString() ?? "not paired"}\nInstallation: {status.InstallationId}" +
-                (status.LastDeliveryUnixMs is ulong ms ? $"\nLast delivery: {DateTimeOffset.FromUnixTimeMilliseconds((long)ms).ToLocalTime():g}" : "");
-            if (status.ActiveTriggers is { } active)
-                connection.Text += $"\nActive: periodic {(active.IntervalMinutes == 0 ? "off" : $"{active.IntervalMinutes} min")}; scene {active.SceneChanges}; day/night {active.DayNight}; telescope {active.TelescopeEvents}; burst {active.BurstCount}, {active.SpacingSeconds}s spacing";
+            if (!double.TryParse(box.Text, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out double value)
+                || !double.IsFinite(value) || value != Math.Truncate(value) || value < box.Minimum || value > box.Maximum)
+                throw new InvalidOperationException($"{box.Header}: enter a whole number from {box.Minimum} to {box.Maximum}.");
+            return checked((ushort)value);
         }
-        SharingPreferences Inputs(bool permit) => new() {
-            HubOrigin = origin.Text.Trim(), Enabled = permit && enabled.IsOn,
+        SharingPreferences Inputs() => new() {
+            HubOrigin = origin.Text.Trim(), Enabled = enabled.IsOn,
             Snapshots = snapshots.IsOn, SceneChanges = scenes.IsOn, DayNight = dayNight.IsOn,
-            SceneThresholdPercent = double.IsFinite(threshold.Value) ? checked((byte)threshold.Value) : (byte)20,
-            IntervalMinutes = double.IsFinite(interval.Value) ? checked((ushort)interval.Value) : (ushort)0,
+            SceneThresholdPercent = checked((byte)Number(threshold)), IntervalMinutes = Number(interval),
             TelescopeEvents = telescopeEvents.IsOn, ChatConfiguration = chatConfiguration.IsOn,
-            BurstCount = double.IsFinite(burst.Value) ? checked((byte)burst.Value) : (byte)1,
-            SpacingSeconds = double.IsFinite(spacing.Value) ? checked((ushort)spacing.Value) : (ushort)60
+            BurstCount = checked((byte)Number(burst)), SpacingSeconds = Number(spacing)
         };
-        async Task Operate(Func<Task> action)
+        void Render()
+        {
+            bool paired = setup.Status.DeviceId is not null;
+            pairingFields.Visibility = paired ? Visibility.Collapsed : Visibility.Visible;
+            connection.Text = paired
+                ? $"Paired · {(setup.Status.Preferences.Enabled ? setup.Status.Connection : "Sharing off")}" : "Not paired · No images are shared";
+            foreach (var control in new Control[] { origin, code, snapshots, interval, scenes, dayNight, telescopeEvents, threshold, burst, spacing, chatConfiguration, events, chat, management })
+                control.IsEnabled = !busy;
+            enabled.IsEnabled = paired && !busy && !statusUnknown;
+            pair.IsEnabled = !busy && !statusUnknown && !setup.NeedsReview && !string.IsNullOrWhiteSpace(origin.Text) && !string.IsNullOrWhiteSpace(code.Password);
+            forgetConsent.IsEnabled = paired && !busy;
+            forget.IsEnabled = paired && !busy && !statusUnknown && forgetConsent.IsChecked == true;
+            reload.IsEnabled = !busy;
+            discard.IsEnabled = !busy && (HasEdits() || setup.NeedsReview);
+            keep.Visibility = setup.NeedsReview ? Visibility.Visible : Visibility.Collapsed;
+            keep.IsEnabled = !busy && !statusUnknown;
+            dialog.IsPrimaryButtonEnabled = !busy && !statusUnknown && !setup.NeedsReview && (HasEdits() || setup.HasChatOverrides);
+            dialog.PrimaryButtonText = enabled.IsOn && !setup.Status.Preferences.Enabled ? "Save and enable sharing" : "Save settings";
+            dialog.IsSecondaryButtonEnabled = !busy && (setup.Status.Preferences.Enabled || statusUnknown);
+            edits.Text = statusUnknown ? "Agent status could not be confirmed. Refresh before saving or pairing."
+                : setup.NeedsReview ? "Settings changed in the agent or chat. Discard your edits to load them, or keep your edits to replace them on the next save."
+                : HasEdits() ? "Unsaved changes · Save below to apply."
+                : setup.HasChatOverrides ? "Chat overrides are active. Save settings to restore your local trigger choices."
+                : paired ? "Settings saved · Sharing starts only when enabled and saved." : "Pair above, then enable sharing and save below.";
+            var state = setup.Status;
+            details.Text = $"Hub: {state.Preferences.HubOrigin}\nDevice: {state.DeviceId?.ToString() ?? "not paired"}\nInstallation: {state.InstallationId}\nConnection: {state.Connection}";
+            if (state.LastDeliveryUnixMs is ulong ms && ms <= 253402300799999)
+                details.Text += $"\nLast delivery: {DateTimeOffset.FromUnixTimeMilliseconds((long)ms).ToLocalTime():g}";
+            if (state.ActiveTriggers is { } active)
+                details.Text += $"\n{(state.Preferences.Enabled ? "Active" : "Configured")} triggers: every {active.IntervalMinutes} min (0 = off); scene {(active.SceneChanges ? "on" : "off")}; day/night {(active.DayNight ? "on" : "off")}; telescope {(active.TelescopeEvents ? "on" : "off")}; {active.BurstCount} images, {active.SpacingSeconds}s apart";
+        }
+        void Populate()
+        {
+            loading = true;
+            var p = setup.Draft;
+            origin.Text = p.HubOrigin;
+            enabled.IsOn = p.Enabled;
+            snapshots.IsOn = p.Snapshots;
+            scenes.IsOn = p.SceneChanges;
+            dayNight.IsOn = p.DayNight;
+            threshold.Value = p.SceneThresholdPercent;
+            interval.Value = p.IntervalMinutes;
+            telescopeEvents.IsOn = p.TelescopeEvents;
+            burst.Value = p.BurstCount;
+            spacing.Value = p.SpacingSeconds;
+            chatConfiguration.IsOn = p.ChatConfiguration;
+            invalidDraft = false;
+            inputError = null;
+            loading = false;
+            Render();
+        }
+        void Changed()
+        {
+            if (loading || busy) return;
+            try { setup.Draft = Inputs(); invalidDraft = false; inputError = null; }
+            catch (InvalidOperationException error) { invalidDraft = true; inputError = error.Message; }
+            Render();
+        }
+        async Task Refresh()
+        {
+            bool preserve = invalidDraft;
+            setup.Refresh(await _agentClient.GetSharingAsync(cancellationToken), preserve);
+            statusUnknown = false;
+            if (!preserve) Populate();
+        }
+        async Task Operate(Func<Task> action, bool pairing = false)
         {
             if (busy) return;
             busy = true;
-            pair.IsEnabled = forget.IsEnabled = reload.IsEnabled = false;
-            dialog.IsPrimaryButtonEnabled = dialog.IsSecondaryButtonEnabled = false;
+            Render();
             feedback.Text = "";
             try { await action(); }
-            catch (OperationCanceledException) {
-                feedback.Text = "Operation cancelled. Refresh to confirm whether it completed.";
-            }
             catch (Exception error) {
-                feedback.Text = error.Message + " Refresh before retrying. A pairing code may have been consumed.";
+                feedback.Text = error is OperationCanceledException ? "Operation cancelled." : error.Message;
+                // Pairing can persist a revision even if the HTTP request fails.
+                // Reconcile it without discarding the operator's draft or retrying the code.
+                try { await Refresh(); }
+                catch { statusUnknown = true; }
+                if (pairing) feedback.Text += " A code may have been consumed; get a new code from the Hub before retrying.";
             }
-            finally {
-                busy = false;
-                pair.IsEnabled = forget.IsEnabled = reload.IsEnabled = true;
-                dialog.IsPrimaryButtonEnabled = dialog.IsSecondaryButtonEnabled = true;
-                origin.IsEnabled = status.DeviceId is null;
-            }
+            finally { busy = false; Render(); }
         }
-        pair.Click += async (_, _) => await Operate(async () => {
-            string token = code.Password; code.Password = "";
-            status = await _agentClient.ConfigureSharingAsync(status.Revision, Inputs(false), cancellationToken);
-            Apply();
-            status = await _agentClient.PairSharingAsync(status.Revision, token, cancellationToken);
-            Apply(); feedback.Text = "Paired. Choose the permissions above and save to enable sharing.";
-        });
-        forget.Click += async (_, _) => await Operate(async () => {
+        origin.TextChanged += (_, _) => Changed();
+        foreach (var toggle in new[] { enabled, snapshots, scenes, dayNight, telescopeEvents, chatConfiguration })
+            toggle.Toggled += (_, _) => Changed();
+        foreach (var number in new[] { threshold, interval, burst, spacing })
+        {
+            number.ValueChanged += (_, _) => Changed();
+            number.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => Changed());
+        }
+        code.PasswordChanged += (_, _) => Render();
+        forgetConsent.Checked += (_, _) => Render();
+        forgetConsent.Unchecked += (_, _) => Render();
+        pair.Click += async (_, _) => {
+            string token;
+            try { token = SharingSetupState.PairingCode(code.Password); setup.Draft = Inputs(); }
+            catch (InvalidOperationException error) { feedback.Text = error.Message; return; }
             code.Password = "";
-            status = await _agentClient.ForgetSharingAsync(status.Revision, cancellationToken);
-            Apply(); feedback.Text = "Local pairing removed. Revoke the device credential in the Hub too.";
+            await Operate(async () => {
+                setup.Accept(await _agentClient.ConfigureSharingAsync(setup.ExpectedRevision, setup.Draft with { Enabled = false }, cancellationToken));
+                Populate();
+                setup.Accept(await _agentClient.PairSharingAsync(setup.ExpectedRevision, token, cancellationToken));
+                Populate();
+                feedback.Text = "Paired. Your choices are saved. Turn on Enable image sharing and save when ready.";
+            }, pairing: true);
+            if (setup.Status.DeviceId is not null) enabled.Focus(FocusState.Programmatic);
+        };
+        forget.Click += async (_, _) => await Operate(async () => {
+            setup.Accept(await _agentClient.ForgetSharingAsync(setup.Status.Revision, cancellationToken));
+            code.Password = "";
+            forgetConsent.IsChecked = false;
+            Populate();
+            feedback.Text = "Pairing and permissions cleared. Revoke the device credential in the Hub too.";
         });
-        reload.Click += async (_, _) => await Operate(async () => {
-            status = await _agentClient.GetSharingAsync(cancellationToken); Apply();
-        });
+        reload.Click += async (_, _) => await Operate(Refresh);
+        discard.Click += (_, _) => { setup.Discard(); Populate(); feedback.Text = "Unsaved changes discarded."; };
+        keep.Click += (_, _) => { setup.KeepEdits(); Render(); feedback.Text = "Your edits are kept. Saving will replace the agent settings and reset chat overrides."; };
         dialog.PrimaryButtonClick += async (_, args) => {
             args.Cancel = true;
             var deferral = args.GetDeferral();
             try { await Operate(async () => {
-                status = await _agentClient.ConfigureSharingAsync(status.Revision, Inputs(true), cancellationToken);
-                Apply(); feedback.Text = "Permissions saved. Refresh to check the connection.";
+                if (invalidDraft) throw new InvalidOperationException(inputError);
+                setup.Draft = Inputs();
+                setup.Accept(await _agentClient.ConfigureSharingAsync(setup.ExpectedRevision, setup.ForSave(), cancellationToken));
+                Populate();
+                feedback.Text = setup.Status.Preferences.Enabled ? "Settings saved. Connecting to the Hub; refresh to check delivery." : "Settings saved. Sharing is off.";
             }); } finally { deferral.Complete(); }
         };
         dialog.SecondaryButtonClick += async (_, args) => {
             args.Cancel = true;
             var deferral = args.GetDeferral();
             try { await Operate(async () => {
-                status = await _agentClient.ConfigureSharingAsync(status.Revision, status.Preferences with { Enabled = false }, cancellationToken);
-                Apply(); feedback.Text = "Sharing stopped; queued images discarded.";
+                // Stop immediately using saved permissions, not the pending draft.
+                var latest = await _agentClient.GetSharingAsync(cancellationToken);
+                setup.Stopped(latest, await _agentClient.ConfigureSharingAsync(latest.Revision, latest.Preferences with { Enabled = false }, cancellationToken), invalidDraft);
+                statusUnknown = false;
+                if (!invalidDraft) Populate();
+                else {
+                    loading = true;
+                    enabled.IsOn = false;
+                    loading = false;
+                }
+                feedback.Text = "Sharing stopped; queued images discarded. Your other edits are still here.";
             }); } finally { deferral.Complete(); }
         };
-        dialog.Closing += (_, args) => { if (busy) args.Cancel = true; };
-        Apply();
+        dialog.Closing += (_, args) => {
+            if (busy || HasEdits()) {
+                args.Cancel = true;
+                if (!busy) feedback.Text = "Save or discard your changes before closing.";
+            }
+        };
+        Populate();
         await dialog.ShowAsync();
         code.Password = "";
     }

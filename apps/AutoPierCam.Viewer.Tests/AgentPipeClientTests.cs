@@ -36,6 +36,37 @@ public sealed class AgentPipeClientTests
     }
 
     [Fact]
+    public async Task SharingConfigureAndPairKeepChoicesAndSendExactRevision()
+    {
+        var preferences = new SharingPreferences {
+            HubOrigin = "https://hub.example.test", Snapshots = true, SceneChanges = true,
+            DayNight = true, SceneThresholdPercent = 35, IntervalMinutes = 15,
+            TelescopeEvents = true, ChatConfiguration = true, BurstCount = 3, SpacingSeconds = 120
+        };
+        var saved = new SharingStatus { Revision = 12, Preferences = preferences };
+        await WithResponse("sharing.configure", saved, async client => {
+            var response = await client.ConfigureSharingAsync(11, preferences);
+            Assert.Equal(preferences, response.Preferences);
+            Assert.False(response.Preferences.Enabled);
+            Assert.Equal(12UL, response.Revision);
+        }, request => {
+            var payload = request.GetProperty("payload");
+            Assert.Equal(11UL, payload.GetProperty("expected_revision").GetUInt64());
+            Assert.Equal(preferences, payload.GetProperty("preferences").Deserialize<SharingPreferences>());
+        });
+        await WithResponse("sharing.pair", saved with { Revision = 14, DeviceId = 42 }, async client => {
+            var response = await client.PairSharingAsync(12, "csdp_synthetic_test");
+            Assert.Equal(preferences, response.Preferences);
+            Assert.False(response.Preferences.Enabled);
+            Assert.Equal(42, response.DeviceId);
+        }, request => {
+            var payload = request.GetProperty("payload");
+            Assert.Equal(12UL, payload.GetProperty("expected_revision").GetUInt64());
+            Assert.Equal("csdp_synthetic_test", payload.GetProperty("pairing_token").GetString());
+        });
+    }
+
+    [Fact]
     public async Task DefaultConfigurationRoundTripsThroughRealClientWithExplicitNullLimits()
     {
         var fixture = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;

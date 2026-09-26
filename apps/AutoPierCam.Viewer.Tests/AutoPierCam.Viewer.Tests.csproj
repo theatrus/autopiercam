@@ -12,6 +12,7 @@
     <Compile Include="../AutoPierCam.Viewer/CameraSelection.cs" Link="CameraSelection.cs" />
     <Compile Include="../AutoPierCam.Viewer/AgentPipeClient.cs" Link="AgentPipeClient.cs" />
     <Compile Include="../AutoPierCam.Viewer/SharingModels.cs" Link="SharingModels.cs" />
+    <Compile Include="../AutoPierCam.Viewer/SharingSetupState.cs" Link="SharingSetupState.cs" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.1" PrivateAssets="all" />

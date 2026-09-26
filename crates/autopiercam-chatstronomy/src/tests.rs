@@ -112,6 +112,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn paired() -> Self {
+        Self::paired_with(Preferences::default()).await
+    }
+
+    async fn paired_with(preferences: Preferences) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -131,7 +135,7 @@ impl Fixture {
                 client.status().revision,
                 Preferences {
                     hub_origin: origin,
-                    ..Preferences::default()
+                    ..preferences.clone()
                 },
             )
             .unwrap();
@@ -148,7 +152,14 @@ impl Fixture {
         let status = pairing.await.unwrap().unwrap();
         assert_eq!(body["installation_id"], status.installation_id);
         assert!(!status.preferences.enabled);
-        assert!(!status.preferences.snapshots);
+        assert_eq!(
+            status.preferences,
+            Preferences {
+                hub_origin: status.preferences.hub_origin.clone(),
+                enabled: false,
+                ..preferences
+            }
+        );
         assert!(
             !std::fs::read_to_string(directory.path().join("agent.chatstronomy.json"))
                 .unwrap()
@@ -200,6 +211,45 @@ impl Fixture {
         }
         socket
     }
+}
+
+#[tokio::test]
+async fn pairing_preserves_choices_but_never_starts_sharing() {
+    let fixture = Fixture::paired_with(Preferences {
+        enabled: true,
+        snapshots: true,
+        scene_changes: true,
+        day_night: true,
+        scene_threshold_percent: 35,
+        interval_minutes: 15,
+        telescope_events: true,
+        chat_configuration: true,
+        burst_count: 3,
+        spacing_seconds: 120,
+        ..Preferences::default()
+    })
+    .await;
+    let client = fixture.service.client();
+    let status = client.status();
+    let stored: Settings = serde_json::from_slice(
+        &std::fs::read(fixture._directory.path().join("agent.chatstronomy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.preferences, status.preferences);
+    assert!(stored.remote_rules.is_none());
+    assert!(
+        timeout(Duration::from_millis(300), fixture.listener.accept())
+            .await
+            .is_err(),
+        "pairing must not connect or send frames until explicitly enabled"
+    );
+    let error = client
+        .pair(status.revision, Secret::new("csdp_second".into()))
+        .unwrap_err();
+    assert!(error.to_string().contains("already paired"));
+    assert_eq!(client.status().revision, status.revision);
+    assert_eq!(client.status().preferences, status.preferences);
+    assert_eq!(fixture.vault.0.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -546,10 +596,17 @@ async fn rejected_pairing_does_not_persist_credentials_or_retry() {
             1,
             Preferences {
                 hub_origin: format!("http://{}", listener.local_addr().unwrap()),
+                snapshots: true,
+                scene_changes: true,
+                interval_minutes: 12,
+                telescope_events: true,
+                chat_configuration: true,
+                burst_count: 2,
                 ..Preferences::default()
             },
         )
         .unwrap();
+    let expected_preferences = status.preferences.clone();
     let pairing = tokio::task::spawn_blocking(move || {
         client.pair(status.revision, Secret::new("csdp_expired".into()))
     });
@@ -557,6 +614,8 @@ async fn rejected_pairing_does_not_persist_credentials_or_retry() {
     let error = pairing.await.unwrap().unwrap_err().to_string();
     assert!(!error.contains("csdp_expired"));
     assert!(vault.0.lock().unwrap().is_empty());
+    assert_eq!(service.client().status().preferences, expected_preferences);
+    assert!(service.client().status().device_id.is_none());
     assert!(
         timeout(Duration::from_millis(300), listener.accept())
             .await

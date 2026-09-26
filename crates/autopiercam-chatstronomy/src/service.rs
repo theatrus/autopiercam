@@ -356,16 +356,17 @@ impl SharingClient {
             if settings.revision != expected_revision {
                 bail!("Sharing settings changed; refresh before pairing");
             }
+            if settings.device_id.is_some() {
+                bail!(
+                    "This camera is already paired; forget the current pairing before pairing again"
+                );
+            }
             if settings.preferences.hub_origin.is_empty() {
                 bail!("Save the Hub origin first");
             }
             settings.preferences.enabled = false;
-            settings.preferences.snapshots = false;
-            settings.preferences.scene_changes = false;
-            settings.preferences.day_night = false;
-            settings.preferences.interval_minutes = 0;
-            settings.preferences.telescope_events = false;
-            settings.preferences.chat_configuration = false;
+            // Keep the operator's source choices and limits. The master switch
+            // stays off until a separate, explicit local settings save.
             settings.remote_rules = None;
             settings.revision += 1;
             self.commit(settings.clone())?;
