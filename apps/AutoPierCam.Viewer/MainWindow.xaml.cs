@@ -557,6 +557,7 @@ public sealed partial class MainWindow : Window
         // Capabilities remain valid across an accepted camera restart.
         if (_latestAgentStatus is { } priorStatus)
             _latestAgentStatus = priorStatus with { State = "starting", Camera = null, Upload = null, Storage = null };
+        ApplyConfiguration(_configurationSnapshot);
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
         _configurationNeedsRefresh = false;

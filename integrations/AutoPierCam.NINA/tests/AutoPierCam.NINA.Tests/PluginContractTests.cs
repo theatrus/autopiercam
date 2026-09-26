@@ -26,7 +26,7 @@ public sealed class PluginContractTests
         Assert.Equal(
             "AutoPierCam",
             assembly.GetCustomAttribute<AssemblyTitleAttribute>()?.Title);
-        Assert.Equal(new Version(0, 2, 1, 0), assembly.GetName().Version);
+        Assert.Equal(new Version(0, 2, 2, 0), assembly.GetName().Version);
         Assert.Contains(
             assembly.GetCustomAttributes<AssemblyMetadataAttribute>(),
             item => item.Key == "MinimumApplicationVersion" && item.Value == "3.2.0.9001");
