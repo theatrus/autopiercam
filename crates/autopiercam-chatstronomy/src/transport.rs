@@ -351,7 +351,13 @@ async fn session(
                                     item.delivered(detector);
                                     *shared.last_delivery.lock().unwrap() = Some(now_ms()); status(shared, "Connected; image delivered");
                                 }
-                                else { status(shared, match ack.as_str() { "no_destinations" => "Connected; select destination channels in the Hub", _ => "Connected; Hub declined the image" }); }
+                                // `elided`: the Hub posts one image per minute and swallowed this one.
+                                // Keep the scene reference so a lasting change is sent after the window.
+                                else { status(shared, match ack.as_str() {
+                                    "no_destinations" => "Connected; select destination channels in the Hub",
+                                    "elided" => "Connected; image skipped (the Hub posts at most one per minute)",
+                                    _ => "Connected; Hub declined the image",
+                                }); }
                                 *slot = None;
                                 if request.as_ref().is_some() && snapshot_outbox.is_none() { request = None; }
                             }
