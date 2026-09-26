@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.7 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.8 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.7)](https://github.com/theatrus/autopiercam/releases/download/v0.2.7/AutoPierCam-0.2.7-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.7)
+[Download the signed Windows x64 installer (0.2.8)](https://github.com/theatrus/autopiercam/releases/download/v0.2.8/AutoPierCam-0.2.8-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.8)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -64,6 +64,10 @@ The repository now contains a hardware-validated background capture slice:
 - a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
   Camera** panel to the Imaging tab.
 
+Version 0.2.8 fixes Save being incorrectly disabled when Chatstronomy settings
+are hidden. Settings now has a width-constrained scrolling form with fixed
+Save/Discard actions, a responsive pane, and DPI-aware initial window sizing.
+
 Version 0.2.7 removes live SDK camera rescans, detects stuck acquisition, bounds
 operator-requested shutdown, and adds configurable preview/acquisition pacing
 (1–30 fps, default 2). Capture and Chatstronomy now share a consistent Settings
@@ -83,7 +87,7 @@ repeat settling; camera and RAW-format changes still restart. The updated NINA p
 
 ## Install on Windows
 
-Version 0.2.7 includes opt-in Chatstronomy image sharing: open **Settings** in
+Version 0.2.8 includes opt-in Chatstronomy image sharing: open **Settings** in
 the Viewer and choose the **Chatstronomy** section to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
