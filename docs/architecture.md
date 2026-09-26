@@ -321,6 +321,10 @@ Windows builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
 
+Future camera backend direction: [Regain Direct USB migration](regain-backend.md).
+ASI662MC support is a prerequisite; the current ASI676MC direct exposure ceiling
+also needs consideration before replacing AutoPierCam's long-night capture path.
+
 Camera inventory is cached per capture attempt. Enumeration runs before opening
 the selected camera, never from acquisition or settling. ZWO SDK 1.41 property
 lookup internally calls its camera-open API; a remote dump showed it spinning in
