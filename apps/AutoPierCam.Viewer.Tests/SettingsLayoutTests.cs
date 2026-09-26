@@ -84,6 +84,8 @@ public sealed class SettingsLayoutTests
 
     [Theory]
     [InlineData("CaptureSection", "CaptureSettingsScroll", "CameraComboBox")]
+    [InlineData("CaptureSection", "CaptureSettingsScroll", "MinGainNumberBox")]
+    [InlineData("CaptureSection", "CaptureSettingsScroll", "PreferShortExposuresToggle")]
     [InlineData("SharingSection", "SharingSettingsScroll", "SharingIntervalNumberBox")]
     public void EachSectionHasOneWidthConstrainedScrollRegion(string section, string scroll, string field)
     {

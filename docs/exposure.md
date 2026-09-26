@@ -62,14 +62,55 @@ max_gain = 300
 raw16 = true
 ```
 
-The controller targets the sampled raw p90 brightness, prioritizes exposure
-before increasing gain, shortens clipped frames aggressively, and uses a
+The controller targets the sampled raw p90 brightness, by default prioritizes
+exposure before increasing gain, shortens clipped frames aggressively, and uses a
 brightness deadband plus three-frame day/night hysteresis. It stops and restarts
 SDK video on control changes to discard queued frames with old settings.
 Limits are clamped to the attached camera's manual capabilities; a high maximum
 does not force a long exposure. The Viewer allows up to 2,000 seconds, subject
 to the camera limit. Actual dark-to-daylight optical behavior still needs field
 validation; the controller's transitions are covered by deterministic tests.
+
+## Gain range and shorter exposures
+
+In **Settings → Capture**, enable **Application-controlled day/night exposure**,
+set **Minimum gain** to `200`, **Max gain** to `300`, and turn on **Prefer shorter
+exposures**. Save applies these settings on the camera thread without reopening
+the camera or restarting the settling gate. An already-running long exposure may
+still need to complete before changes take effect.
+
+```toml
+[camera]
+exposure_control = "adaptive"
+min_gain = 200
+max_gain = 300
+prefer_short_exposures = true
+max_exposure_us = 60000000
+```
+
+The gain-first policy raises gain in bounded steps before lengthening dark
+exposures. It also gradually rebalances an already converged exposure toward
+higher gain and shorter time, using subsequent frames rather than assuming a
+sensor-specific gain scale. Bright frames shorten exposure first; at the minimum
+exposure, gain can decrease, but never below your floor. This trades higher noise
+for potentially quicker frames. Set minimum and maximum both to `200` for fixed
+gain with automatic exposure. If even the shortest supported exposure clips at
+your chosen floor, lower the floor; the controller will not silently violate it.
+
+The bundled SDK exposes an automatic **maximum** gain but no automatic minimum.
+Nonzero minimum gain or the gain-first preference therefore require application
+control; SDK-mode configurations using them are rejected with an explanation.
+To return to SDK auto, set minimum to `0` and turn off the preference first.
+Existing configurations retain their previous behavior (minimum `0`, preference
+off). Values are bounded by hardware capabilities; an unattainable minimum fails
+explicitly instead of silently using a lower gain. The effective limits are logged.
+
+**Maximum exposure** is still the shutter-time ceiling. **Maximum preview frame
+rate** only caps delivery; it cannot make a long exposure finish sooner. Use both
+limits if timely frames matter, accepting that a very dark scene may then remain
+underexposed. A black SDK-auto frame alone does not prove a gain problem; collect
+agent logs and actual exposure/gain readbacks if it recurs. These gain controls
+do not claim to fix an SDK or driver acquisition failure.
 
 **RAW16 capture** is independently selectable. It saves lossless, debayered
 16-bit RGB PNGs and retains the SDK samples without assuming an ADC bit shift.

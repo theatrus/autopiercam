@@ -7,6 +7,46 @@ using Xunit;
 
 public sealed class AgentPipeClientTests
 {
+    [Fact]
+    public async Task GainControlsRoundTripWithoutRestart()
+    {
+        var original = JsonSerializer.Deserialize<AgentConfiguration>(
+            await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        Assert.Null(original.Camera.MinGain);
+        Assert.Null(original.Camera.PreferShortExposures);
+        var config = original with { Camera = original.Camera with {
+            ExposureControl = "adaptive", MinGain = 200, MaxGain = 300, PreferShortExposures = true
+        } };
+        config.Validate("test");
+        var restored = JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!;
+        Assert.Equal(config.Camera, restored.Camera);
+        await WithResponse("config.replace", new { revision = 1UL, saved = true, restart_scheduled = false },
+            async client => Assert.False((await client.ReplaceConfigurationAsync(1, config)).RestartScheduled),
+            request => {
+                var camera = request.GetProperty("payload").GetProperty("config").GetProperty("camera");
+                Assert.Equal(200, camera.GetProperty("min_gain").GetInt64());
+                Assert.True(camera.GetProperty("prefer_short_exposures").GetBoolean());
+            });
+    }
+
+    [Theory]
+    [InlineData(-1, 300, "adaptive", false, false)]
+    [InlineData(301, 300, "adaptive", true, false)]
+    [InlineData(200, 300, null, false, false)]
+    [InlineData(0, 300, null, true, false)]
+    [InlineData(200, 200, "adaptive", true, true)]
+    [InlineData(0, 300, null, false, true)]
+    public void GainRangeAndPolicyRequireValidBoundsAndApplicationControl(long min, long max, string? mode, bool prefer, bool valid)
+    {
+        var config = JsonSerializer.Deserialize<AgentConfiguration>(
+            File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        config = config with { Camera = config.Camera with {
+            MinGain = min, MaxGain = max, ExposureControl = mode, PreferShortExposures = prefer
+        } };
+        if (valid) config.Validate("test");
+        else Assert.Throws<AgentProtocolException>(() => config.Validate("test"));
+    }
+
     [Theory]
     [InlineData(1u)]
     [InlineData(2u)]

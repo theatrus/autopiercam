@@ -21,6 +21,7 @@ pub struct AdaptiveExposure {
     target: f64,
     mode: LightMode,
     votes: u8,
+    prefer_short_exposures: bool,
 }
 
 impl AdaptiveExposure {
@@ -37,11 +38,17 @@ impl AdaptiveExposure {
             target: f64::from(target),
             mode: LightMode::Day,
             votes: 0,
+            prefer_short_exposures: false,
         }
     }
 
     pub fn mode(&self) -> LightMode {
         self.mode
+    }
+
+    /// Preserve controller history while changing the operator's noise/cadence tradeoff.
+    pub fn set_prefer_short_exposures(&mut self, prefer: bool) {
+        self.prefer_short_exposures = prefer;
     }
 
     /// Keep day/night history when an operator changes the permitted range.
@@ -87,8 +94,22 @@ impl AdaptiveExposure {
         } else {
             (self.target / measured).clamp(0.0625, 4.0)
         };
-        if clipped || !(0.90..=1.10).contains(&ratio) {
-            if ratio < 1.0 && current.exposure_us <= 250_000 && current.gain > self.min_gain {
+        // Also rebalance a previously converged long exposure when gain-first
+        // is enabled live. Use subsequent image feedback to shorten it rather
+        // than assuming a camera-specific gain-to-brightness conversion.
+        if self.prefer_short_exposures
+            && !clipped
+            && ratio >= 0.90
+            && current.gain < self.max_gain
+            && (ratio > 1.10 || current.exposure_us > self.min_us)
+        {
+            next.gain = current.gain.saturating_add(20).min(self.max_gain);
+        } else if clipped || !(0.90..=1.10).contains(&ratio) {
+            if !self.prefer_short_exposures
+                && ratio < 1.0
+                && current.exposure_us <= 250_000
+                && current.gain > self.min_gain
+            {
                 next.gain = current.gain.saturating_sub(30).max(self.min_gain);
             } else {
                 next.exposure_us = ((current.exposure_us as f64 * ratio).round() as i64)
@@ -115,6 +136,90 @@ mod tests {
             p50: p90,
             p90,
             clipped_fraction: clipped,
+        }
+    }
+    #[test]
+    fn gain_first_raises_gain_before_exposure_and_rebalances_a_stable_long_frame() {
+        let mut c = AdaptiveExposure::new(100, 60_000_000, 200, 300, 100);
+        c.set_prefer_short_exposures(true);
+        let mut setting = ExposureSetting {
+            exposure_us: 1_000_000,
+            gain: 200,
+        };
+        let stable = c.observe(setting, stats(100, 0.0));
+        assert_eq!(stable.gain, 220);
+        assert_eq!(stable.exposure_us, setting.exposure_us);
+        for expected in [220, 240, 260, 280, 300] {
+            setting = c.observe(setting, stats(10, 0.0));
+            assert_eq!(setting.gain, expected);
+            assert_eq!(setting.exposure_us, 1_000_000);
+        }
+        setting = c.observe(setting, stats(10, 0.0));
+        assert_eq!(setting.gain, 300);
+        assert_eq!(setting.exposure_us, 4_000_000);
+        let bright = c.observe(setting, stats(255, 0.8));
+        assert_eq!(bright.gain, 300);
+        assert_eq!(bright.exposure_us, 1_000_000);
+    }
+
+    #[test]
+    fn floor_and_fixed_gain_survive_day_night_and_clipped_frames() {
+        for ceiling in [200, 300] {
+            for prefer in [false, true] {
+                let mut c = AdaptiveExposure::new(100, 60_000_000, 200, ceiling, 100);
+                c.set_prefer_short_exposures(prefer);
+                let mut setting = ExposureSetting {
+                    exposure_us: 60_000_000,
+                    gain: ceiling,
+                };
+                for (p90, clipped) in [(255, 0.8), (0, 0.0), (100, 0.0)] {
+                    for _ in 0..60 {
+                        setting = c.observe(setting, stats(p90, clipped));
+                        assert!((200..=ceiling).contains(&setting.gain));
+                        assert!((100..=60_000_000).contains(&setting.exposure_us));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gain_first_uses_gain_floor_when_minimum_exposure_is_still_too_bright() {
+        let mut c = AdaptiveExposure::new(100, 60_000_000, 200, 300, 100);
+        c.set_prefer_short_exposures(true);
+        let mut setting = ExposureSetting {
+            exposure_us: 100,
+            gain: 300,
+        };
+        for _ in 0..10 {
+            setting = c.observe(setting, stats(255, 0.8));
+        }
+        assert_eq!(
+            setting,
+            ExposureSetting {
+                exposure_us: 100,
+                gain: 200
+            }
+        );
+        assert_eq!(c.observe(setting, stats(100, 0.0)), setting);
+    }
+
+    #[test]
+    fn updated_gain_floor_is_enforced_even_inside_brightness_deadband() {
+        let mut c = AdaptiveExposure::new(100, 60_000_000, 0, 300, 100);
+        c.update_limits(100, 60_000_000, 200, 250, 100);
+        for (gain, expected) in [(48, 200), (300, 250)] {
+            assert_eq!(
+                c.observe(
+                    ExposureSetting {
+                        exposure_us: 1000,
+                        gain
+                    },
+                    stats(100, 0.0)
+                )
+                .gain,
+                expected
+            );
         }
     }
     #[test]

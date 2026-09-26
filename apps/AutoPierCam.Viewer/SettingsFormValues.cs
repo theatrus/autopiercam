@@ -8,6 +8,8 @@ internal sealed record SettingsFormValues
 {
     internal string MaxExposure { get; init; } = "";
     internal string MaxGain { get; init; } = "";
+    internal string MinGain { get; init; } = "";
+    internal bool PreferShortExposures { get; init; }
     internal string Interval { get; init; } = "";
     internal string PreviewRate { get; init; } = "";
     internal string RetentionMax { get; init; } = "";
@@ -32,6 +34,7 @@ internal sealed record SettingsFormValues
 
     internal static SettingsFormValues FromConfiguration(AgentConfiguration config) => new() {
         MaxExposure = Number(config.Camera.MaxExposureUs / 1000d), MaxGain = Number(config.Camera.MaxGain),
+        MinGain = Number(config.Camera.MinGain ?? 0), PreferShortExposures = config.Camera.PreferShortExposures == true,
         Interval = Number(config.Capture.IntervalMs / 1000d),
         PreviewRate = Number(config.Capture.PreviewMaxFps ?? 2),
         RetentionMax = Number(config.Capture.RetentionMaxBytes is ulong max ? max / (1024d * 1024d) : double.NaN),

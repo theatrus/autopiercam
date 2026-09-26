@@ -342,6 +342,7 @@ impl AgentMonitor {
             "sharing.get".to_owned(),
             "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
+            "camera.gain_range".to_owned(),
             "camera.raw16".to_owned(),
             "capture.preview_rate".to_owned(),
             "video.ffmpeg".to_owned(),
@@ -1450,16 +1451,19 @@ impl CaptureLoopState {
                 limits.max_gain,
                 limits.target_brightness as u8,
             );
+            controller.set_prefer_short_exposures(config.prefer_short_exposures);
             return;
         }
         self.adaptive = (config.exposure_control == ExposureControl::Adaptive).then(|| {
-            AdaptiveExposure::new(
+            let mut controller = AdaptiveExposure::new(
                 limits.min_exposure_us,
                 limits.max_exposure_us,
                 limits.min_gain,
                 limits.max_gain,
                 limits.target_brightness as u8,
-            )
+            );
+            controller.set_prefer_short_exposures(config.prefer_short_exposures);
+            controller
         });
     }
 }
@@ -2069,7 +2073,7 @@ fn configure_adaptive(
     let min_exposure_us = config
         .min_exposure_us
         .clamp(exposure.min_value.max(1), max_exposure_us);
-    let max_gain = config.max_gain.clamp(gain.min_value, gain.max_value);
+    let (min_gain, max_gain) = adaptive_gain_limits(config, gain)?;
     set_if_available(
         camera,
         controls,
@@ -2087,23 +2091,37 @@ fn configure_adaptive(
         camera
             .control_value(ControlType::GAIN)?
             .value
-            .clamp(gain.min_value, max_gain),
+            .clamp(min_gain, max_gain),
         false,
     )?;
     set_if_available(camera, controls, ControlType::FLIP, 0, false)?;
     info!(
         min_exposure_us,
         max_exposure_us,
+        min_gain,
         max_gain,
+        prefer_short_exposures = config.prefer_short_exposures,
         "configured application-controlled exposure within manual camera limits"
     );
     Ok(AutoLimits {
         min_exposure_us,
         max_exposure_us,
-        min_gain: gain.min_value,
+        min_gain,
         max_gain,
         target_brightness: config.target_brightness,
     })
+}
+
+fn adaptive_gain_limits(config: &CameraConfig, caps: &ControlCaps) -> Result<(i64, i64)> {
+    let min = config.min_gain.max(caps.min_value);
+    let max = config.max_gain.clamp(caps.min_value, caps.max_value);
+    if min > max {
+        bail!(
+            "requested minimum gain {} exceeds this camera's effective maximum gain {max}",
+            config.min_gain
+        );
+    }
+    Ok((min, max))
 }
 
 fn configure_sdk_auto(
@@ -2438,8 +2456,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adaptive_gain_limits_honor_floor_and_reject_unachievable_minimum() {
+        let caps = ControlCaps {
+            name: "Gain".into(),
+            description: String::new(),
+            min_value: 10,
+            max_value: 600,
+            default_value: 48,
+            writable: true,
+            auto_supported: true,
+            control_type: ControlType::GAIN,
+        };
+        let mut config = CameraConfig::default();
+        assert_eq!(adaptive_gain_limits(&config, &caps).unwrap(), (10, 300));
+        config.min_gain = 200;
+        assert_eq!(adaptive_gain_limits(&config, &caps).unwrap(), (200, 300));
+        config.max_gain = 200;
+        assert_eq!(adaptive_gain_limits(&config, &caps).unwrap(), (200, 200));
+        config.max_gain = 700;
+        assert_eq!(adaptive_gain_limits(&config, &caps).unwrap(), (200, 600));
+        config.min_gain = 650;
+        assert!(adaptive_gain_limits(&config, &caps).is_err());
+    }
+
+    #[test]
     fn updating_limits_preserves_settling_cadence_requests_and_night_mode() {
-        let config = CameraConfig {
+        let mut config = CameraConfig {
             exposure_control: ExposureControl::Adaptive,
             ..Default::default()
         };
@@ -2474,12 +2516,29 @@ mod tests {
         assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
         let cadence = state.next_capture;
         limits.max_exposure_us = 30_000_000;
+        limits.min_gain = 200;
+        config.min_gain = 200;
+        config.prefer_short_exposures = true;
         state.configure_exposure(&config, limits);
         assert!(state.settled);
         assert_eq!(state.seen_capture_generation, 7);
         assert_eq!(state.queued, 12);
         assert_eq!(state.next_capture, cadence);
         assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
+        let next = state.adaptive.as_mut().unwrap().observe(
+            ExposureSetting {
+                exposure_us: 8_765_000,
+                gain: 200,
+            },
+            autopiercam_core::image::LumaStats {
+                mean: 100.,
+                p50: 100,
+                p90: 100,
+                clipped_fraction: 0.,
+            },
+        );
+        assert_eq!(next.gain, 220); // new preference reaches the live controller
+        assert_eq!(next.exposure_us, 8_765_000);
     }
 
     #[test]
@@ -2836,6 +2895,7 @@ mod tests {
                 "sharing.get".to_owned(),
                 "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
+                "camera.gain_range".to_owned(),
                 "camera.raw16".to_owned(),
                 "capture.preview_rate".to_owned(),
                 "video.ffmpeg".to_owned()

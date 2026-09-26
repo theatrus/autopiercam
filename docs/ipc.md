@@ -200,6 +200,16 @@ default may be omitted from canonical JSON. Viewer preserves an existing value
 without offering edits when that capability is absent. Preview publication is
 capped independently of scheduled stills and explicit capture requests.
 
+The `camera.gain_range` capability advertises `camera.min_gain` (integer,
+default 0) and `camera.prefer_short_exposures` (boolean, default false).
+Defaults may be omitted from canonical JSON; clients preserve loaded values
+without enabling edits if the capability is absent. Validation requires
+`0 <= min_gain <= max_gain`. A nonzero floor or enabled preference requires
+`exposure_control = "adaptive"`, because SDK auto has no minimum-gain control.
+Equal minimum/maximum gives fixed gain. The camera owner intersects the range
+with hardware limits and faults if the requested floor cannot be honored.
+These controls update in place and preserve settling and controller history.
+
 Exposure/cadence/frame-rate changes apply at a capture-thread poll after startup settling.
 Service changes may briefly delay delivery while writers/encoders drain, but do
 not close the camera or repeat settling. A save response is not an apply receipt.

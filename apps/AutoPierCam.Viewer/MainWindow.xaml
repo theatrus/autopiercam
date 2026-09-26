@@ -360,6 +360,17 @@
                             TextWrapping="Wrap" />
                         <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
                                       IsEnabled="False" Toggled="ExposureControl_Changed" />
+                        <StackPanel Spacing="8">
+                            <NumberBox x:Name="MinGainNumberBox" Header="Minimum gain · application control only"
+                                       Minimum="0" Maximum="600" Value="0" SmallChange="10"
+                                       SpinButtonPlacementMode="Compact" IsEnabled="False" />
+                            <ToggleSwitch x:Name="PreferShortExposuresToggle" Header="Prefer shorter exposures"
+                                          IsEnabled="False" />
+                            <TextBlock x:Name="GainControlHelpText" FontSize="12" TextWrapping="Wrap"
+                                       Text="Application control is required for a gain floor. SDK auto can lower gain below your preference." />
+                            <TextBlock FontSize="12" TextWrapping="Wrap"
+                                       Text="For a floor of 200, set minimum gain to 200 and maximum to 300; set both to 200 for fixed gain. Shorter exposures raises gain first, trading noise for cadence. Maximum exposure still limits shutter time; preview rate is a cap, not a guaranteed frame rate." />
+                        </StackPanel>
                         <ToggleSwitch x:Name="Raw16Toggle" Header="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
                         <TextBlock Text="Application control can exceed the SDK's 60-second auto limit, within the camera's manual range. RAW16 uses more storage."
                                    FontSize="12" TextWrapping="Wrap" />

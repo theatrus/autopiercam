@@ -1105,9 +1105,12 @@ public sealed partial class MainWindow : Window
         double stillIntervalSeconds = configuration.Capture.IntervalMs / 1000.0;
         MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureToggle.IsOn ? 2_000_000 : 60_000, maxExposureMs);
         MaxGainNumberBox.Maximum = Math.Max(600, configuration.Camera.MaxGain);
+        MinGainNumberBox.Maximum = Math.Max(600, configuration.Camera.MinGain ?? 0);
         StillIntervalNumberBox.Maximum = Math.Max(86_400, stillIntervalSeconds);
         MaxExposureNumberBox.Value = maxExposureMs;
         MaxGainNumberBox.Value = configuration.Camera.MaxGain;
+        MinGainNumberBox.Value = configuration.Camera.MinGain ?? 0;
+        PreferShortExposuresToggle.IsOn = configuration.Camera.PreferShortExposures == true;
         StillIntervalNumberBox.Value = stillIntervalSeconds;
         PreviewMaxFpsNumberBox.Value = configuration.Capture.PreviewMaxFps ?? 2;
         RetentionMaxMiBNumberBox.Value = configuration.Capture.RetentionMaxBytes is ulong maxBytes
@@ -1150,6 +1153,14 @@ public sealed partial class MainWindow : Window
             1000,
             "Max exposure");
         long maxGain = ReadScaledInt64(MaxGainNumberBox.Value, 1, "Max gain");
+        bool gainEditingSupported = _latestAgentStatus?.HasCapability("camera.gain_range") == true;
+        long? minGain = gainEditingSupported
+            ? ReadScaledInt64(MinGainNumberBox.Value, 1, "Minimum gain") : original.Camera.MinGain;
+        bool? preferShort = gainEditingSupported ? PreferShortExposuresToggle.IsOn : original.Camera.PreferShortExposures;
+        if ((minGain ?? 0) < 0 || (minGain ?? 0) > maxGain)
+            throw new UserInputException("Minimum gain must be between zero and Max gain.");
+        if (!AdaptiveExposureToggle.IsOn && ((minGain ?? 0) > 0 || preferShort == true))
+            throw new UserInputException("Enable application-controlled exposure to use minimum gain or shorter exposures. To use SDK auto, set minimum gain to 0 and turn off Prefer shorter exposures first.");
         ulong intervalMs = ReadScaledUInt64(
             StillIntervalNumberBox.Value,
             1000,
@@ -1229,6 +1240,8 @@ public sealed partial class MainWindow : Window
             {
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
+                MinGain = minGain,
+                PreferShortExposures = preferShort,
                 ExposureControl = _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true
                     ? AdaptiveExposureToggle.IsOn ? "adaptive" : null : original.Camera.ExposureControl,
                 Raw16 = _latestAgentStatus?.HasCapability("camera.raw16") == true
@@ -1593,6 +1606,7 @@ public sealed partial class MainWindow : Window
             !_configurationNeedsRefresh;
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
+        UpdateGainControlAvailability(configurationControlsEnabled);
         AdaptiveExposureToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
         Raw16Toggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
         CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled &&
@@ -1623,6 +1637,21 @@ public sealed partial class MainWindow : Window
             MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureToggle.IsOn ? 2_000_000 : 60_000,
                 double.IsNaN(MaxExposureNumberBox.Value) ? 0 : MaxExposureNumberBox.Value);
         }
+        if (MinGainNumberBox is not null)
+            UpdateGainControlAvailability(!_operationInProgress && !_closed && _configurationSnapshot is not null && !_configurationNeedsRefresh);
+    }
+
+    private void UpdateGainControlAvailability(bool editable)
+    {
+        bool supported = _latestAgentStatus?.HasCapability("camera.gain_range") == true;
+        // Keep values editable even in SDK mode so switching back does not
+        // silently discard them; Save explains that nondefaults require adaptive.
+        MinGainNumberBox.IsEnabled = PreferShortExposuresToggle.IsEnabled = editable && supported;
+        GainControlHelpText.Text = !supported
+            ? "Update the capture agent to configure minimum gain and shorter exposures."
+            : AdaptiveExposureToggle.IsOn
+                ? "Gain stays within your range and the camera's supported limits. Changes apply without reopening the camera."
+                : "Application control is required for a gain floor or shorter-exposure preference. SDK auto can lower gain below your preference.";
     }
 
     private void UpdateOutboxControlAvailability()

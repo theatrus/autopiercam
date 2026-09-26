@@ -731,11 +731,14 @@ internal sealed record AgentConfiguration
 
         if (Camera.MinExposureUs < 0 ||
             Camera.MaxExposureUs <= 0 ||
-            Camera.MaxGain < 0)
+            (Camera.MinGain ?? 0) < 0 || Camera.MaxGain < (Camera.MinGain ?? 0))
         {
             throw new AgentProtocolException(
-                $"{method} returned negative camera limits or a non-positive maximum exposure.");
+                $"{method} returned invalid camera exposure or gain bounds.");
         }
+
+        if (Camera.ExposureControl != "adaptive" && ((Camera.MinGain ?? 0) > 0 || Camera.PreferShortExposures == true))
+            throw new AgentProtocolException($"{method} returned gain controls that require application-controlled exposure.");
 
         if (Capture.IntervalMs == 0 ||
             Capture.PreviewMaxFps is < 1 or > 30 ||
@@ -835,6 +838,14 @@ internal sealed record AgentCameraConfiguration
     [JsonPropertyName("max_exposure_us")]
     [JsonRequired]
     public long MaxExposureUs { get; init; }
+
+    [JsonPropertyName("min_gain")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? MinGain { get; init; }
+
+    [JsonPropertyName("prefer_short_exposures")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? PreferShortExposures { get; init; }
 
     [JsonPropertyName("max_gain")]
     [JsonRequired]
