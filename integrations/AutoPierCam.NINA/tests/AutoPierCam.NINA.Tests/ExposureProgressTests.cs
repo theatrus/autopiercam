@@ -142,11 +142,23 @@ public sealed class ExposureProgressTests
     public void StartupDescriptionReportsSettlingWithoutInventingCountdown()
     {
         string? text = ExposurePresentation.Describe(Observation(), TimeSpan.FromSeconds(1));
-        Assert.Contains("Settling: 2/6 minimum frames", text);
+        Assert.Contains("Stabilizing exposure: 2 frames received (minimum 6)", text);
         Assert.Contains("21 s", text);
         Assert.Contains("about 60 s", text);
         Assert.Contains("estimated", text);
         Assert.DoesNotContain("remaining", text);
+    }
+
+    [Fact]
+    public void SettlingBeyondMinimumExplainsControlsRatherThanShowingAnOverfullFraction()
+    {
+        var progress = Progress() with { SettlingFrames = 60 };
+        var observation = Observation(progress);
+        string text = ExposurePresentation.Describe(observation, TimeSpan.Zero)!;
+        Assert.Contains("60 frames received; waiting for stable exposure and gain", text);
+        Assert.DoesNotContain("60/6", text);
+        var settled = Observation(progress with { Settling = false });
+        Assert.StartsWith("Exposing", ExposurePresentation.Describe(settled, TimeSpan.Zero));
     }
 
     [Fact]
@@ -157,7 +169,7 @@ public sealed class ExposureProgressTests
         await runtime.HandleProgressAsync(Observation(), default);
         Assert.False(runtime.HasImage);
         Assert.Equal("Settling", runtime.ConnectionText);
-        Assert.Contains("Settling: 2/6", runtime.StatusText);
+        Assert.Contains("Stabilizing exposure: 2 frames received", runtime.StatusText);
 
         await runtime.HandleStateAsync(new PreviewStreamState(PreviewStreamPhase.Reconnecting, 1, "disconnected"), default);
         Assert.Equal("Reconnecting", runtime.ConnectionText);
