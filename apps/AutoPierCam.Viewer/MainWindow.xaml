@@ -351,6 +351,11 @@
                                FontSize="12" TextWrapping="Wrap" />
                     <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
                              IsEnabled="False" />
+                    <NumberBox x:Name="PreviewMaxFpsNumberBox" Header="Maximum preview frames per second"
+                               Minimum="1" Maximum="30" SmallChange="1" LargeChange="5"
+                               SpinButtonPlacementMode="Compact" Value="2" IsEnabled="False" />
+                    <TextBlock Text="Default 2 fps. Short exposures are paced; long exposures take the time they need. Faster still schedules and Save next frame can acquire sooner."
+                               FontSize="12" TextWrapping="Wrap" />
                     <StackPanel Spacing="6">
                         <TextBlock Text="Still interval" />
                         <NumberBox
@@ -418,7 +423,7 @@
                         OnContent="Enabled" />
                     <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
                              PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
-                    <TextBlock Text="Security recording saves H.264 MP4 segments from previews (up to 2 fps). Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
+                    <TextBlock Text="Security recording saves H.264 MP4 segments from previews at the configured frame-rate limit. Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
                                TextWrapping="Wrap" />
                 </StackPanel>
                 </ScrollViewer>

@@ -13,7 +13,6 @@ use std::thread::{self, JoinHandle};
 use tracing::warn;
 
 const PREVIEW_JPEG_QUALITY: u8 = 75;
-pub(crate) const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct PreviewFrame {

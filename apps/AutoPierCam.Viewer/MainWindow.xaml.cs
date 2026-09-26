@@ -1099,6 +1099,7 @@ public sealed partial class MainWindow : Window
         MaxExposureNumberBox.Value = maxExposureMs;
         MaxGainNumberBox.Value = configuration.Camera.MaxGain;
         StillIntervalNumberBox.Value = stillIntervalSeconds;
+        PreviewMaxFpsNumberBox.Value = configuration.Capture.PreviewMaxFps ?? 2;
         RetentionMaxMiBNumberBox.Value = configuration.Capture.RetentionMaxBytes is ulong maxBytes
             ? maxBytes / BytesPerMebibyte
             : double.NaN;
@@ -1124,6 +1125,14 @@ public sealed partial class MainWindow : Window
 
     private AgentConfiguration BuildConfigurationFromInputs(AgentConfiguration original)
     {
+        uint? previewMaxFps = original.Capture.PreviewMaxFps;
+        if (_latestAgentStatus?.HasCapability("capture.preview_rate") == true)
+        {
+            double value = PreviewMaxFpsNumberBox.Value;
+            if (!double.IsFinite(value) || value < 1 || value > 30 || value != Math.Truncate(value))
+                throw new UserInputException("Maximum preview frame rate must be a whole number from 1 to 30.");
+            previewMaxFps = (uint)value;
+        }
         long maxExposureUs = ReadScaledInt64(
             MaxExposureNumberBox.Value,
             1000,
@@ -1221,6 +1230,7 @@ public sealed partial class MainWindow : Window
             Capture = original.Capture with
             {
                 IntervalMs = intervalMs,
+                PreviewMaxFps = previewMaxFps,
                 RetentionMaxBytes = retentionMaxBytes,
                 RetentionMinFreeBytes = retentionMinFreeBytes,
             },
@@ -1575,6 +1585,7 @@ public sealed partial class MainWindow : Window
         CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled &&
             (!_cameraInventoryLoaded || CameraComboBox.SelectedItem is not CameraChoice { Id: not null });
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
+        PreviewMaxFpsNumberBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("capture.preview_rate") == true;
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;

@@ -12,6 +12,8 @@ settle_frames = 6
 [capture]
 directory = "captures"
 interval_ms = 10000
+# Maximum preview FPS (1..30). Pace short exposures; longer exposures stay live.
+preview_max_fps = 2
 jpeg_quality = 88
 writer_queue_capacity = 2
 keep_latest = true

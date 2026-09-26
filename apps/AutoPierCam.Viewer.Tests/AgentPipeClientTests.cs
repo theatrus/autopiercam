@@ -7,6 +7,33 @@ using Xunit;
 
 public sealed class AgentPipeClientTests
 {
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(2u)]
+    [InlineData(30u)]
+    public async Task PreviewRateRoundTripsWithoutRestart(uint fps)
+    {
+        var original = JsonSerializer.Deserialize<AgentConfiguration>(
+            await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        Assert.Null(original.Capture.PreviewMaxFps);
+        var config = original with { Capture = original.Capture with { PreviewMaxFps = fps } };
+        config.Validate("test");
+        Assert.Equal(fps, JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!.Capture.PreviewMaxFps);
+        await WithResponse("config.replace", new { revision = 1UL, saved = true, restart_scheduled = false },
+            async client => Assert.False((await client.ReplaceConfigurationAsync(1, config)).RestartScheduled),
+            request => Assert.Equal(fps, request.GetProperty("payload").GetProperty("config").GetProperty("capture").GetProperty("preview_max_fps").GetUInt32()));
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(31u)]
+    public async Task InvalidPreviewRateIsRejected(uint fps)
+    {
+        var config = JsonSerializer.Deserialize<AgentConfiguration>(
+            await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        config = config with { Capture = config.Capture with { PreviewMaxFps = fps } };
+        Assert.Throws<AgentProtocolException>(() => config.Validate("test"));
+    }
     [Fact]
     public async Task SaveAcceptsLiveReloadWithoutRestart()
     {

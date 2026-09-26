@@ -44,13 +44,16 @@ mod upload;
 mod video;
 
 pub use autopiercam_chatstronomy::service::{SharingClient, SharingService};
-use exposure::{ExposureMode, FrameWait, Settling, WaitDecision, poll_timeout_ms};
+use exposure::{
+    ExposureMode, FrameWait, PreviewCadence, Settling, WaitDecision, acquisition_delay,
+    poll_timeout_ms,
+};
 use ledger_maintenance::LedgerLease;
 pub use ledger_maintenance::{
     LedgerArchiveReport, LedgerMaintenanceError, LedgerMigrationReport, archive_upload_ledger,
     migrate_upload_ledger,
 };
-use preview::{PREVIEW_INTERVAL, PreviewEncoder, PreviewJob, PreviewSink};
+use preview::{PreviewEncoder, PreviewJob, PreviewSink};
 pub use preview::{PreviewFrame, PreviewHub, PreviewSession, PreviewSnapshot};
 
 /// Adapt the existing preview to sharing without acquiring another SDK handle.
@@ -340,6 +343,7 @@ impl AgentMonitor {
             "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.raw16".to_owned(),
+            "capture.preview_rate".to_owned(),
             "video.ffmpeg".to_owned(),
         ];
         Self {
@@ -787,6 +791,7 @@ struct CaptureProgress {
     started: Instant,
     wait: FrameWait,
     status: StatusExposure,
+    last_completed_at: Option<Instant>,
 }
 
 impl CaptureProgress {
@@ -800,6 +805,7 @@ impl CaptureProgress {
         let gain = current_gain(camera, limits.min_gain);
         Self {
             started: Instant::now(),
+            last_completed_at: None,
             wait: FrameWait::new(exposure_us),
             status: StatusExposure {
                 session_generation,
@@ -831,6 +837,7 @@ impl CaptureProgress {
     }
 
     fn completed_frame(&mut self, meta: FrameMeta, data: &mut Vec<u8>) -> CompletedFrame {
+        self.last_completed_at = Some(Instant::now());
         self.wait.frame_received(self.started.elapsed());
         CompletedFrame {
             meta,
@@ -839,6 +846,58 @@ impl CaptureProgress {
             exposure_us: self.status.exposure_us,
             gain: self.status.gain,
         }
+    }
+
+    // None for seen_generation means startup settling: only shutdown can
+    // interrupt the wait until queued settings/capture requests can be applied.
+    fn pace_acquisition(
+        &mut self,
+        camera: &mut Camera,
+        max_fps: u32,
+        control: Option<&AgentControl>,
+        seen_generation: Option<u64>,
+        still_due: Option<Instant>,
+    ) -> Result<()> {
+        // Only pace after completed frames, never restart a long exposure
+        // between the SDK's short read-timeout polls.
+        let Some(completed) = self.last_completed_at.take() else {
+            return Ok(());
+        };
+        let remaining = || {
+            let now = Instant::now();
+            acquisition_delay(
+                now.saturating_duration_since(completed),
+                self.status.exposure_us,
+                max_fps,
+                still_due.map(|due| due.saturating_duration_since(now)),
+                seen_generation.is_some_and(|seen| {
+                    control.is_some_and(|control| control.capture_generation() != seen)
+                }),
+            )
+        };
+        if remaining().is_zero() || control.is_some_and(AgentControl::is_shutdown) {
+            return Ok(());
+        }
+        // Sleeping while the video stream runs only drops frames: the camera
+        // and USB transfer stay busy. Retain the handle and application AE state.
+        camera.stop_video()?;
+        loop {
+            // Settling cannot apply reloads yet; do not let a pending save
+            // disable pacing for the rest of startup.
+            if control.is_some_and(|control| {
+                control.is_shutdown()
+                    || (seen_generation.is_some() && control.reload_pending.load(Ordering::Acquire))
+            }) {
+                break;
+            }
+            let delay = remaining();
+            if delay.is_zero() {
+                break;
+            }
+            thread::sleep(delay.min(Duration::from_millis(25)));
+        }
+        // The caller starts the stream only after rechecking cancellation/reload.
+        Ok(())
     }
 }
 
@@ -866,7 +925,8 @@ struct CaptureObserver<'a> {
     bayer: BayerPattern,
     monitor: Option<&'a AgentMonitor>,
     preview: Option<&'a PreviewSink>,
-    next_preview: Instant,
+    preview_cadence: PreviewCadence,
+    preview_max_fps: u32,
     adaptive: Option<AdaptiveExposure>,
     sdk_mode: ExposureMode,
     mode_started: Instant,
@@ -883,7 +943,8 @@ impl<'a> CaptureObserver<'a> {
             bayer,
             monitor,
             preview,
-            next_preview: Instant::now(),
+            preview_cadence: PreviewCadence::default(),
+            preview_max_fps: 2,
             adaptive: None,
             sdk_mode: ExposureMode::default(),
             mode_started: Instant::now(),
@@ -926,7 +987,7 @@ impl<'a> CaptureObserver<'a> {
         }
         let now = Instant::now();
         if let Some(preview) = self.preview
-            && now >= self.next_preview
+            && self.preview_cadence.take_slot(now, self.preview_max_fps)
         {
             let _ = preview.try_publish(|dropped_frames| PreviewJob {
                 width: frame.meta.width,
@@ -944,7 +1005,6 @@ impl<'a> CaptureObserver<'a> {
                 },
                 dropped_frames,
             });
-            self.next_preview = now + PREVIEW_INTERVAL;
         }
     }
 }
@@ -1133,6 +1193,7 @@ fn run_agent_inner(
     };
     camera.set_roi(roi)?;
     info!(camera = %info.name, width = roi.width, height = roi.height, bin = roi.bin,
+        preview_max_fps = config.capture.preview_max_fps,
         "continuous camera session started");
 
     let preview_encoder = preview.cloned().map(PreviewEncoder::start).transpose()?;
@@ -1357,6 +1418,7 @@ fn acquire_disabled_upload_ledger_lease(
 /// requests, reset interval, or lost adaptive controller history.
 struct CaptureLoopState {
     settled: bool,
+    preview_cadence: PreviewCadence,
     adaptive: Option<AdaptiveExposure>,
     seen_capture_generation: u64,
     next_capture: Instant,
@@ -1367,6 +1429,7 @@ impl Default for CaptureLoopState {
     fn default() -> Self {
         Self {
             settled: false,
+            preview_cadence: PreviewCadence::default(),
             adaptive: None,
             seen_capture_generation: 0,
             next_capture: Instant::now(),
@@ -1422,6 +1485,8 @@ fn capture_loop(
     state: &mut CaptureLoopState,
 ) -> Result<bool> {
     let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+    observer.preview_max_fps = config.capture.preview_max_fps;
+    observer.preview_cadence = state.preview_cadence;
     observer.video = video;
     observer.adaptive = state.adaptive.take();
     let result = (|| {
@@ -1482,6 +1547,13 @@ fn capture_loop(
                     state.next_capture =
                         Instant::now() + Duration::from_millis(next.capture.interval_ms);
                 }
+                if observer.preview_max_fps != next.capture.preview_max_fps {
+                    info!(
+                        preview_max_fps = next.capture.preview_max_fps,
+                        "preview rate updated without restarting capture"
+                    );
+                    observer.preview_max_fps = next.capture.preview_max_fps;
+                }
                 *config = next;
             }
             if video.is_some_and(video::VideoWorker::is_finished) {
@@ -1499,6 +1571,23 @@ fn capture_loop(
             let frame = if let Some(frame) = pending_frame.take() {
                 frame
             } else {
+                let still_due = (!control.is_paused()
+                    && !retention.is_some_and(RetentionSink::capture_suspended))
+                .then_some(state.next_capture);
+                progress.pace_acquisition(
+                    camera,
+                    config.capture.preview_max_fps,
+                    Some(control),
+                    Some(state.seen_capture_generation),
+                    still_due,
+                )?;
+                if control.is_shutdown() {
+                    break;
+                }
+                if control.reload_pending.load(Ordering::Acquire) {
+                    continue;
+                }
+                camera.start_video()?;
                 progress.refresh(camera, *auto_limits);
                 progress.publish(&observer);
                 if progress.wait.expired(progress.started.elapsed()) {
@@ -1588,6 +1677,7 @@ fn capture_loop(
         Ok(false)
     })();
     state.adaptive = observer.adaptive.take();
+    state.preview_cadence = observer.preview_cadence;
     result
 }
 
@@ -1613,6 +1703,11 @@ fn wait_for_auto_settle(
         if observer.video.is_some_and(video::VideoWorker::is_finished) {
             bail!("video worker stopped while exposure was settling");
         }
+        progress.pace_acquisition(camera, observer.preview_max_fps, control, None, None)?;
+        if control.is_some_and(AgentControl::is_shutdown) {
+            return Ok(None);
+        }
+        camera.start_video()?;
         progress.refresh(camera, limits);
         progress.publish(observer);
         match settling.decision(
@@ -2488,6 +2583,7 @@ mod tests {
     fn test_exposure_progress(session_generation: u64) -> CaptureProgress {
         CaptureProgress {
             started: Instant::now(),
+            last_completed_at: None,
             wait: FrameWait::new(60_000_000),
             status: StatusExposure {
                 session_generation,
@@ -2741,6 +2837,7 @@ mod tests {
                 "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.raw16".to_owned(),
+                "capture.preview_rate".to_owned(),
                 "video.ffmpeg".to_owned()
             ]
         );

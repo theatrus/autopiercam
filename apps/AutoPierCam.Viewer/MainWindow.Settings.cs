@@ -15,7 +15,7 @@ public sealed partial class MainWindow
     private void TrackSettingsEdits()
     {
         foreach (NumberBox input in new[] { MaxExposureNumberBox, MaxGainNumberBox, StillIntervalNumberBox,
-            RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox })
+            RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox })
         {
             input.ValueChanged += (_, _) => MarkSettingsEdited();
             input.LostFocus += (_, _) => MarkSettingsEdited();
@@ -74,6 +74,7 @@ public sealed partial class MainWindow
         return new() {
             MaxExposure = Number(MaxExposureNumberBox), MaxGain = Number(MaxGainNumberBox),
             Interval = Number(StillIntervalNumberBox), RetentionMax = Number(RetentionMaxMiBNumberBox),
+            PreviewRate = Number(PreviewMaxFpsNumberBox),
             RetentionFree = Number(RetentionMinFreeMiBNumberBox),
             CameraId = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice choice
                 ? choice.Id : _configurationSnapshot?.Config.Camera.CameraId,

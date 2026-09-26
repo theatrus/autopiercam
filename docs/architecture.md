@@ -36,6 +36,32 @@ The intended process and data flow is:
 Only the camera thread calls ASICamera2. The UI never loads the vendor DLL or
 opens a camera.
 
+### Acquisition pacing
+
+`capture.preview_max_fps` is a live-reloadable integer from 1–30, default 2.
+Preview publication is independently rate-limited using a monotonic clock, even
+when explicit still requests or a faster still schedule require more frames.
+For short exposures the capture thread stops the **video stream**, waits for
+the next acquisition slot, and starts it again on the same camera handle. A
+sleep with the stream left running would merely discard frames while leaving
+the camera and USB busy. No camera enumeration or close/open occurs during
+pacing. Exposure/gain controls and application settling/adaptive history are
+retained. Long exposures at least as long as the preview period are not stopped
+for pacing, and no catch-up burst is accumulated after slow processing.
+
+The idle wait checks shutdown, pending live reload, and explicit still requests
+every 25 ms (reloads/requests are applied after startup settling). A rate save
+alone does not drain recording services or restart settling. Paused recording
+and storage pressure keep the preview cadence without acquiring extra scheduled
+stills. Security video and Chatstronomy sample the capped shared preview.
+
+This is host-side pacing, not a firmware FPS setting: SDK pipeline buffering and
+stop/start overhead can make actual frame rates lower or cause extra sensor
+frames. The bundled SDK has no documented frame-rate-limit control. Validate
+SDK auto-exposure convergence and sustained day/night stream stop/start on the
+target hardware before relying on this for unattended operation; unit tests do
+not exercise physical cameras.
+
 ## Components
 
 ### ZWO adapter
