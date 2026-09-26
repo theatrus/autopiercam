@@ -27,7 +27,11 @@ pause capture; capture immediately; or stop the application. The Start menu
 also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
 If several ASI cameras are connected, choose the desired model and camera ID
-from the Viewer's **Camera** picker, then **Save settings** to restart capture.
+from the Viewer's **Camera** picker, then **Save and restart capture**.
+The picker and save button remain visible while other settings scroll. The save
+status shows whether changes are pending, saved or rejected. Refresh asks before
+discarding edits; Capture now does not discard them. The internal configuration
+fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Refresh cameras** updates the list without discarding other unsaved settings;
 discovery runs every five seconds during capture, or on retries (up to 30 seconds)

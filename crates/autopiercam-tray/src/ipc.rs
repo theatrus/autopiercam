@@ -1216,6 +1216,44 @@ mod tests {
     }
 
     #[test]
+    fn viewer_default_config_fixture_matches_agent_and_saves_with_null_limits() {
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/config-default.json"))
+                .unwrap();
+        assert_eq!(config, serde_json::to_value(Config::default()).unwrap());
+        config["camera"]["camera_id"] = serde_json::json!(7);
+        config["camera"]["name_contains"] = serde_json::json!("ASI676MC");
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        let initial = store.snapshot().unwrap();
+        let commands = TestCommands::default();
+        let response = dispatch(
+            Request::new("viewer-save", Method::ConfigReplace).with_payload(serde_json::json!({
+                "expected_revision": initial.revision, "config": config,
+            })),
+            &commands,
+            &AgentMonitor::new(),
+            &store,
+        );
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(store.snapshot().unwrap().config.camera.camera_id, Some(7));
+        assert_eq!(
+            store.snapshot().unwrap().config.capture.retention_max_bytes,
+            None
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap()
+                .config
+                .capture
+                .retention_min_free_bytes,
+            None
+        );
+        assert_eq!(commands.snapshot(), [TrayCommand::Restart]);
+    }
+
+    #[test]
     fn configuration_roundtrip_restarts_and_rejects_stale_revisions() {
         let directory = TestDirectory::new();
         let store = directory.store();
