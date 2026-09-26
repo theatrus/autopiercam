@@ -71,11 +71,11 @@ Copying into a live N.I.N.A. plugin directory is deliberately opt-in:
 
 Build a release archive and SHA-256 N.I.N.A. manifest:
 
-    ./build-nina-package.ps1 -Version 0.2.3.0
+    ./build-nina-package.ps1 -Version 0.2.4.0
 
 The default download URL uses the matching three-part product release tag
-(`v0.2.3` in this example) while the plugin archive and manifest retain the
-four-part N.I.N.A. version. Pass `-ReleaseTag v0.2.3-preview.1` when packaging
+(`v0.2.4` in this example) while the plugin archive and manifest retain the
+four-part N.I.N.A. version. Pass `-ReleaseTag v0.2.4-preview.1` when packaging
 a prerelease of that product version. Its three numeric components must continue
 to match `-Version`. The manifest also defaults to the repository's published
 AutoPierCam featured image; pass `-FeaturedImageUrl` only when a release needs
