@@ -232,7 +232,7 @@ healthy.
   retention protect all managed captures.
 - If protected data prevents a configured byte target from being met, status
   reports blocked storage pressure and scheduled still persistence pauses.
-  Preview, camera draining, and an explicit Capture now request remain
+  Preview, camera draining, and an explicit Save next frame request remain
   available.
 - Preview candidates are sampled at most every 500 milliseconds even while
   scheduled still capture is paused. A one-slot latest-only queue feeds an

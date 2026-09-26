@@ -23,14 +23,15 @@ The choice can be changed later with **Modify** from Windows Installed apps.
 
 The installer starts AutoPierCam when setup finishes, independently of the
 start-at-sign-in choice. The tray menu can open the Viewer, captures, and logs;
-pause capture; capture immediately; or stop the application. The Start menu
+pause capture; save the next completed frame; or stop the application. The Start menu
 also contains **AutoPierCam Viewer** and **Start AutoPierCam**.
 
 If several ASI cameras are connected, choose the desired model and camera ID
 from the Viewer's **Camera** picker, then **Save settings**.
 The picker and save button remain visible while other settings scroll. The save
-status shows whether changes are pending, saved or rejected. Refresh asks before
-discarding edits; Capture now does not discard them. The internal configuration
+status shows whether changes are pending, saved or rejected. **Reload settings**
+inside Settings asks before discarding edits; **Save next frame** does not discard
+them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Refresh cameras** updates the list without discarding other unsaved settings;
@@ -41,7 +42,7 @@ cameras cannot be persistently distinguished by serial number yet.
 **Automatic (use model filter)** restores model-filter selection; ambiguous
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
-preview live; **Capture now** remains an explicit request for a still.
+preview live; **Save next frame** remains an explicit request for a still.
 For exposures beyond the
 SDK's automatic ceiling, enable application-controlled exposure; see the
 [exposure guide](exposure.md).

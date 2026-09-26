@@ -122,6 +122,17 @@ its button marks an unsaved draft. The preview overlay contains only dimensions
 and frame age, with timing/sequence/error diagnostics under **Details**. Normal
 startup and loaded settings do not display warning icons.
 
+**Save next frame** requests an extra full-resolution still from the next
+completed exposure; it neither refreshes the live preview nor posts directly to
+chat. **Reload settings** lives inside Settings and reloads configuration and
+camera discovery, with confirmation before discarding edits. Normal preview
+and status updates need neither button.
+
+The Chatstronomy dialog uses text-backed whole-number fields so collapsed event
+options have the same value before and after their controls are displayed.
+Save validates the current text rather than retaining a transient initialization
+error. An interval-only edit preserves the loaded threshold and burst settings.
+
 Exposure, gain and known day/night mode share a compact single-line summary
 below the preview. Unavailable readings are omitted, and the summary collapses
 entirely before telemetry arrives. There are no placeholder temperature/mode
@@ -275,7 +286,7 @@ Each sweep publishes managed/protected/reclaimable bytes, free space, reclaimed
 counts, pressure, and an optional error through `status.get`. If protected data
 or an unavailable safety check leaves a configured byte target unsatisfied,
 pressure becomes blocked and scheduled still persistence pauses. Preview and
-camera draining continue, and Capture now remains an explicit override. The
+camera draining continue, and Save next frame remains an explicit override. The
 complete policy and safety contract are in `docs/retention.md`.
 
 ## Local IPC and security

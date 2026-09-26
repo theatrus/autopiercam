@@ -3,6 +3,36 @@ using Xunit;
 
 public sealed class SharingSetupTests
 {
+    [Fact]
+    public void IntervalEditPreservesThresholdAndOtherCollapsedNumericFields()
+    {
+        var setup = new SharingSetupState(Status);
+        var saved = setup.Draft;
+        setup.Draft = saved with {
+            IntervalMinutes = SharingSetupState.WholeNumber("25", 0, 1440, "Interval"),
+            SceneThresholdPercent = (byte)SharingSetupState.WholeNumber(saved.SceneThresholdPercent.ToString(), 5, 80, "Threshold"),
+            BurstCount = (byte)SharingSetupState.WholeNumber(saved.BurstCount.ToString(), 1, 3, "Burst"),
+            SpacingSeconds = SharingSetupState.WholeNumber(saved.SpacingSeconds.ToString(), 60, 600, "Spacing")
+        };
+        Assert.Equal(25, setup.ForSave().IntervalMinutes);
+        Assert.Equal(saved.SceneThresholdPercent, setup.ForSave().SceneThresholdPercent);
+        Assert.Equal(saved.BurstCount, setup.ForSave().BurstCount);
+        Assert.Equal(saved.SpacingSeconds, setup.ForSave().SpacingSeconds);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("NaN")]
+    [InlineData("20.5")]
+    [InlineData("4")]
+    [InlineData("81")]
+    [InlineData("65536")]
+    public void InvalidNumericEditsAreRejectedAndCorrectionWorksWithoutReopening(string text)
+    {
+        Assert.Throws<InvalidOperationException>(() => SharingSetupState.WholeNumber(text, 5, 80, "Threshold"));
+        Assert.Equal(20, SharingSetupState.WholeNumber(" 20 ", 5, 80, "Threshold"));
+    }
+
     private static SharingStatus Status => new() {
         Revision = 12, DeviceId = 42, Connection = "Disabled",
         Preferences = new() { HubOrigin = "https://hub.example.test", Snapshots = true, IntervalMinutes = 10 }

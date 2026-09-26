@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace AutoPierCam.Viewer;
 
 // Keep connection refreshes separate from the editable draft. Revisions are
@@ -58,6 +60,14 @@ internal sealed class SharingSetupState(SharingStatus status)
         if (Draft.Enabled && Status.DeviceId is null)
             throw new InvalidOperationException("Pair this camera before enabling image sharing.");
         return Draft;
+    }
+
+    internal static ushort WholeNumber(string text, ushort minimum, ushort maximum, string label)
+    {
+        if (!ushort.TryParse(text, NumberStyles.Integer, CultureInfo.CurrentCulture, out ushort value)
+            || value < minimum || value > maximum)
+            throw new InvalidOperationException($"{label}: enter a whole number from {minimum} to {maximum}.");
+        return value;
     }
 
     internal static string PairingCode(string value)

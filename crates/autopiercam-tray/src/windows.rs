@@ -104,7 +104,7 @@ pub(crate) fn run(options: Options) {
     let open_captures = MenuItem::new("Open captures", true, None);
     let open_logs = MenuItem::new("Open logs", true, None);
     let pause_capture = CheckMenuItem::new("Pause capture", true, false, None);
-    let capture_now = MenuItem::new("Capture now", true, None);
+    let capture_now = MenuItem::new("Save next frame", true, None);
     let quit = MenuItem::new("Quit", true, None);
     if let Err(error) = menu.append_items(&[
         &open_viewer,
