@@ -21,12 +21,17 @@ does not deploy the Hub.
    server under Discord delivery first; adding destinations requires server
    management permission and a live bot/channel check.
 2. In the AutoPierCam Viewer, choose **Chatstronomy**, enter the Hub HTTPS origin
-   (for example `https://hub.example.org`), paste the code, and choose **Pair camera**.
-   Pairing resets all sharing permissions to off.
-3. Explicitly enable **Connect and permit image sharing** and whichever
-   permissions you want: Hub snapshot requests, scene-change posts, and/or stable
-   day/night transitions. Choose **Save permissions**.
-4. Use **Refresh status / reload settings** to see the connection, device ID,
+   (for example `https://hub.example.org`) in **1. Pair with your Hub** at the top,
+   paste the code, and choose **Pair camera**. Pairing preserves your source
+   choices and limits, but keeps the master sharing switch off. Options can be
+   configured and saved before pairing. A rejected code does not clear them.
+3. In **2. Choose what to share**, select snapshots and a periodic interval;
+   expand **Scene and telescope events** or **Chat control** for other options.
+   Turn on **Enable image sharing** and choose **Save and enable sharing**.
+   Save/status controls stay visible while the settings scroll. Later edits use
+   **Save settings**, without restarting capture.
+4. Use **Refresh status** to update connection/delivery information without
+   discarding edits. **Connection details / change Hub** shows the device ID,
    installation ID, and latest confirmed delivery. The Hub's **Snapshot now**
    button sends the completed preview to that device's selected channels.
 
@@ -35,8 +40,9 @@ region in this version. Never enable sharing if the full preview contains
 something you do not want in those channels. The camera's credential does not
 authorize telescope commands, and the Hub cannot enable local permissions.
 
-**Stop sharing** disconnects and discards pending images. **Stop and forget local
-pairing** also removes the credential from Windows Credential Manager. Revoke
+**Stop sharing** disconnects and discards pending images without losing other
+unsaved edits. **Forget pairing**, under **Connection details / change Hub**,
+requires confirmation and clears permissions and the Windows credential. Revoke
 the device credential in the Hub as well: the device protocol has no remote
 revocation endpoint. Messages already accepted by Discord cannot be recalled.
 
@@ -44,6 +50,11 @@ Pairing codes are single-use and expire after an hour. If the response is lost
 or pairing fails after consuming a code, generate a new code; pairing is never
 automatically retried. Credentials never appear in command-line arguments,
 ordinary camera configuration, sharing settings, status responses, or logs.
+
+Unsaved changes are marked explicitly; save or **Discard changes** before closing.
+If settings changed elsewhere (including chat), refresh preserves your draft and
+asks you to either discard it or **Keep my edits** before saving a replacement.
+An unconfirmed agent status blocks pairing/saves until a successful refresh.
 
 ## Triggered sharing and chat configuration
 
@@ -65,9 +76,10 @@ within that local limit. Only the camera owner may invoke these commands; server
 manager privileges alone do not grant access. DMs and unrelated channels fail.
 
 Chat overrides are atomically saved on the camera. **Refresh status** shows the
-active rules as well as local permission limits. Any local **Save permissions**
+active rules as well as local permission limits. Any local **Save settings**
 clears overrides. A stale Viewer save fails with a revision conflict instead of
-overwriting a newer chat update. Pairing/forgetting resets trigger permissions.
+overwriting a newer chat update. Pairing preserves trigger permissions but keeps
+sharing off; forgetting clears permissions. Both reset chat overrides.
 `/piercam snapshot camera:<name>` uses the existing separate local snapshot gate
 and posts to all of the camera's configured destinations, not just the command
 channel. Triggered images likewise use all configured camera destinations.
