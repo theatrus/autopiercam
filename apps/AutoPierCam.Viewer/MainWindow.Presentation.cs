@@ -25,11 +25,22 @@ public sealed partial class MainWindow
     {
         // Collapsing never reloads controls or discards pending changes.
         SettingsPane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        SettingsColumn.Width = new GridLength(visible ? 400 : 0);
-        WorkspaceGrid.ColumnSpacing = visible ? 20 : 0;
+        UpdateSettingsLayout();
         UpdateSettingsButton();
         UpdateSharingPolling();
         if (!visible) SettingsButton.Focus(FocusState.Programmatic);
+    }
+
+    private void WorkspaceGrid_SizeChanged(object sender, SizeChangedEventArgs args) => UpdateSettingsLayout();
+
+    private void UpdateSettingsLayout()
+    {
+        if (SettingsPane is null) return;
+        var layout = SettingsLayout.ForWidth(WorkspaceGrid.ActualWidth, SettingsPane.Visibility == Visibility.Visible);
+        PreviewPane.Visibility = layout.PreviewVisible ? Visibility.Visible : Visibility.Collapsed;
+        PreviewColumn.Width = layout.PreviewVisible ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+        SettingsColumn.Width = new GridLength(layout.PaneWidth);
+        WorkspaceGrid.ColumnSpacing = layout.Gap;
     }
 
     private void UpdateSettingsButton() => SettingsButton.Content =

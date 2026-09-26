@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AutoPierCam.Preview;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media.Imaging;
@@ -47,7 +48,6 @@ public sealed partial class MainWindow : Window
         InitializeSharingSection();
         Title = "AutoPierCam";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "autopiercam.ico"));
-        AppWindow.Resize(new SizeInt32(1180, 760));
         _previewFreshnessTimer = DispatcherQueue.CreateTimer();
         _previewFreshnessTimer.Interval = TimeSpan.FromSeconds(1);
         _previewFreshnessTimer.IsRepeating = true;
@@ -63,6 +63,11 @@ public sealed partial class MainWindow : Window
         }
 
         _initialRefreshStarted = true;
+        // AppWindow sizes are physical pixels, while the form uses DIPs. The
+        // old fixed pixel size left almost no form viewport at 150–200% DPI.
+        var workArea = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        var initialSize = SettingsLayout.InitialWindowSize(Content.XamlRoot.RasterizationScale, workArea.Width, workArea.Height);
+        AppWindow.Resize(new SizeInt32(initialSize.Width, initialSize.Height));
         _previewFreshnessTimer.Start();
         _previewTask = RunPreviewLoopAsync(_lifetime.Token);
         _progressTask = RunExposureProgressLoopAsync(_lifetime.Token);
@@ -99,15 +104,13 @@ public sealed partial class MainWindow : Window
                         ? new ExposureProgressObservation(progress, received) : null;
                     if (!_operationInProgress)
                     {
-                        if (status is not null) ApplyStatus(status);
-                        if (sharing is not null) ApplyPolledSharing(sharing);
-                        else
+                        new StatusPollResult(status, sharing).Apply(ApplyStatus, () =>
                         {
                             _liveStatusUnavailable = true;
                             StatusWarningIcon.Visibility = Visibility.Visible;
                             StatusText.Text = "Agent status unavailable · reconnecting";
                             SetControlsForOperation(false);
-                        }
+                        }, ApplyPolledSharing);
                     }
                     UpdatePreviewPresentation();
                     return Task.CompletedTask;
