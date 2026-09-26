@@ -92,8 +92,15 @@ struct Outbound {
     captured_at: u64,
     session: u64,
     retry_at: Instant,
+    scene_reference: Option<media::SceneReference>,
 }
 impl Outbound {
+    fn delivered(&mut self, detector: &mut Detector) {
+        if let Some(reference) = self.scene_reference.take() {
+            detector.delivered(reference);
+        }
+    }
+
     fn fresh(&self, frame: Option<&Frame>) -> bool {
         frame.is_some_and(|f| f.session == self.session)
             && now_ms().saturating_sub(self.captured_at) <= 300_000
@@ -101,15 +108,28 @@ impl Outbound {
     }
 }
 
+struct Observations {
+    detector: Detector,
+    last_new_event: Instant,
+}
+
 pub(crate) async fn run(shared: Arc<Shared>) {
     let mut changes = shared.changes.subscribe();
     let mut outbox = None;
+    let mut observations = Observations {
+        detector: Detector::default(),
+        last_new_event: Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now),
+    };
+    let mut detector_epoch = None;
     let mut attempt = 0u32;
-    let mut last_new_event = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
     loop {
         let epoch = *changes.borrow_and_update();
+        if detector_epoch != Some(epoch) {
+            observations.detector = Detector::default();
+            detector_epoch = Some(epoch);
+        }
         if shared.stopped.load(Ordering::Acquire) {
             return;
         }
@@ -152,7 +172,7 @@ pub(crate) async fn run(shared: Arc<Shared>) {
         let result = tokio::select! {
             biased;
             _ = changes.changed() => { outbox = None; attempt = 0; continue; }
-            result = session(&shared, &settings, &origin, &credential, &mut outbox, epoch, &mut last_new_event) => result
+            result = session(&shared, &settings, &origin, &credential, &mut outbox, epoch, &mut observations) => result
         };
         if matches!(&result, Ok(false))
             || result
@@ -218,8 +238,12 @@ async fn session(
     credential: &Secret,
     outbox: &mut Option<Outbound>,
     epoch: u64,
-    last_new_event: &mut Instant,
+    observations: &mut Observations,
 ) -> Result<bool> {
+    let Observations {
+        detector,
+        last_new_event,
+    } = observations;
     let version = if settings.preferences.interval_minutes > 0
         || settings.preferences.telescope_events
         || settings.preferences.chat_configuration
@@ -267,7 +291,6 @@ async fn session(
     let mut scheduler = Scheduler::new(rules.clone(), Instant::now());
     let mut ticks = interval(Duration::from_millis(100));
     let mut last_rx = Instant::now();
-    let mut detector = Detector::default();
     let mut request: Option<SnapshotFence> = None;
     let mut snapshot_outbox: Option<Outbound> = None;
     let mut last_sequence = 0;
@@ -290,7 +313,7 @@ async fn session(
                         if accepted {
                             rules = proposed;
                             scheduler = Scheduler::new(rules.clone(), Instant::now());
-                            detector = Detector::default();
+                            *detector = Detector::default();
                             // Clear reconnect-retained bytes before any awaited write.
                             *outbox = None; snapshot_outbox = None;
                             if let Some(fence) = request.take() {
@@ -324,7 +347,10 @@ async fn session(
                             if ack == "retry" || ack == "rate_limited" {
                                 item.retry_at = Instant::now() + Duration::from_secs(retry_after_seconds.clamp(60, 3600));
                             } else {
-                                if ack == "delivered" { *shared.last_delivery.lock().unwrap() = Some(now_ms()); status(shared, "Connected; image delivered"); }
+                                if ack == "delivered" {
+                                    item.delivered(detector);
+                                    *shared.last_delivery.lock().unwrap() = Some(now_ms()); status(shared, "Connected; image delivered");
+                                }
                                 else { status(shared, match ack.as_str() { "no_destinations" => "Connected; select destination channels in the Hub", _ => "Connected; Hub declined the image" }); }
                                 *slot = None;
                                 if request.as_ref().is_some() && snapshot_outbox.is_none() { request = None; }
@@ -363,11 +389,12 @@ async fn session(
                         let mut detection = settings.preferences.clone();
                         detection.scene_changes = rules.scene_changes;
                         detection.day_night = rules.day_night;
-                        if let Some((kind, summary)) = detector.observe(f, &detection, Instant::now()).unwrap_or(None) {
+                        if let Some((kind, summary)) = detector.observe(f, &detection, Instant::now()).unwrap_or(None)
+                            && (kind != "scene_change" || outbox.is_none()) {
                             scheduler.trigger(kind, summary, f, Instant::now(), false);
                         }
                     }
-                } else if frame.is_none() { detector = Detector::default(); last_sequence = 0; }
+                } else if frame.is_none() { *detector = Detector::default(); last_sequence = 0; }
                 let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms());
                 if let Some((kind, summary)) = due && let Some(f) = frame.as_ref()
                     && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
@@ -422,6 +449,16 @@ fn event(
     request_id: Option<&str>,
     jpeg: Vec<u8>,
 ) -> Result<Outbound> {
+    // Use the JPEG actually sent, including network resizing/re-encoding, not
+    // the detection sample or a newer frame observed while waiting for the ACK.
+    let scene_reference = if kind == "scene_change" {
+        media::scene_reference(&Frame {
+            jpeg: jpeg.clone().into(),
+            ..frame.clone()
+        })?
+    } else {
+        None
+    };
     let id = random_uuid()?;
     let captured_at = time::OffsetDateTime::from_unix_timestamp_nanos(
         i128::from(frame.captured_at_unix_ms) * 1_000_000,
@@ -438,5 +475,95 @@ fn event(
         captured_at: frame.captured_at_unix_ms,
         session: frame.session,
         retry_at: Instant::now(),
+        scene_reference,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{service::Preferences, tests::frame};
+
+    #[test]
+    fn delivery_commits_the_immutable_sent_jpeg_not_the_latest_preview() {
+        let now = Instant::now();
+        let prefs = Preferences {
+            scene_changes: true,
+            ..Default::default()
+        };
+        let mut detector = Detector::default();
+        detector.observe(&frame(1, false), &prefs, now).unwrap();
+        for sequence in 2..=4 {
+            detector
+                .observe(&frame(sequence, true), &prefs, now)
+                .unwrap();
+        }
+        let reported = frame(4, true);
+        let mut outbound = event(
+            &reported,
+            "scene_change",
+            "test",
+            None,
+            media::jpeg(&reported, MAX_JPEG_BYTES).unwrap(),
+        )
+        .unwrap();
+        // Ordinary observations while a report waits/retries cannot move its reference.
+        for sequence in 5..=8 {
+            assert!(
+                detector
+                    .observe(&frame(sequence, false), &prefs, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        outbound.delivered(&mut detector);
+        assert!(outbound.scene_reference.is_none());
+        for sequence in 9..=11 {
+            assert_eq!(
+                detector
+                    .observe(&frame(sequence, false), &prefs, now)
+                    .unwrap()
+                    .is_some(),
+                sequence == 11
+            );
+        }
+    }
+
+    #[test]
+    fn non_scene_reports_never_replace_the_scene_reference() {
+        let now = Instant::now();
+        let prefs = Preferences {
+            scene_changes: true,
+            ..Default::default()
+        };
+        let mut detector = Detector::default();
+        detector.observe(&frame(1, false), &prefs, now).unwrap();
+        for kind in [
+            "snapshot",
+            "periodic",
+            "telescope_event",
+            "day_night_transition",
+        ] {
+            let report = frame(2, true);
+            let mut outbound = event(
+                &report,
+                kind,
+                "test",
+                None,
+                media::jpeg(&report, MAX_JPEG_BYTES).unwrap(),
+            )
+            .unwrap();
+            assert!(outbound.scene_reference.is_none());
+            outbound.delivered(&mut detector);
+        }
+        for sequence in 2..=4 {
+            assert_eq!(
+                detector
+                    .observe(&frame(sequence, true), &prefs, now)
+                    .unwrap()
+                    .is_some(),
+                sequence == 4
+            );
+        }
+    }
 }

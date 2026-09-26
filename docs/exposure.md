@@ -15,11 +15,29 @@ max_gain = 300
 settle_frames = 6
 ```
 
-The effective limit appears in the Viewer and agent logs. Configuration changes
-restart the camera session; an in-flight exposure is cancelled before applying
-the new controls. Pause affects scheduled still persistence and video sampling, not exposure or
-preview. Capture now requests the next eligible completed frame; it does not
+The effective limit appears in the Viewer and agent logs. Settings that do not
+change camera acquisition apply without restarting or re-settling capture.
+Camera/format changes still require a new session; exposure limits are updated
+on the capture thread. Pause affects scheduled still persistence and video sampling, not exposure or
+preview. Save next frame requests the next eligible completed frame; it does not
 force a long exposure to finish early.
+
+## Reported day/night lighting mode
+
+SDK auto mode infers lighting mode from completed exposure times instead of
+reporting Unknown. The first valid exposure initializes the mode (under 0.5 s
+is Day, otherwise Night). After that, switching to Night requires exposures of
+at least 1 s; switching to Day requires exposures of at most 0.25 s. A switch
+requires at least three frames and 30 seconds of sustained evidence. Values in
+between retain the current mode, so twilight does not make the label flicker.
+This classification does not change SDK exposure controls or restart capture.
+
+Time here is monotonic elapsed time, not a fixed wall-clock sunrise/sunset:
+without site coordinates and roof state, clock time is not a reliable lighting
+measurement. A closed roof or artificial lights can legitimately disagree with
+astronomical day/night. Adaptive mode retains its controller's exposure-based
+three-frame hysteresis; Chatstronomy additionally requires a 30-second mode
+dwell before reporting a transition.
 
 ## Camera limits
 

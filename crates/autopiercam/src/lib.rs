@@ -44,7 +44,7 @@ mod upload;
 mod video;
 
 pub use autopiercam_chatstronomy::service::{SharingClient, SharingService};
-use exposure::{FrameWait, Settling, WaitDecision, poll_timeout_ms};
+use exposure::{ExposureMode, FrameWait, Settling, WaitDecision, poll_timeout_ms};
 use ledger_maintenance::LedgerLease;
 pub use ledger_maintenance::{
     LedgerArchiveReport, LedgerMaintenanceError, LedgerMigrationReport, archive_upload_ledger,
@@ -827,6 +827,8 @@ struct CaptureObserver<'a> {
     preview: Option<&'a PreviewSink>,
     next_preview: Instant,
     adaptive: Option<AdaptiveExposure>,
+    sdk_mode: ExposureMode,
+    mode_started: Instant,
     video: Option<&'a video::VideoWorker>,
     inventory_sdk: Option<&'a Sdk>,
     next_inventory: Instant,
@@ -844,6 +846,8 @@ impl<'a> CaptureObserver<'a> {
             preview,
             next_preview: Instant::now(),
             adaptive: None,
+            sdk_mode: ExposureMode::default(),
+            mode_started: Instant::now(),
             video: None,
             inventory_sdk: None,
             next_inventory: Instant::now() + Duration::from_secs(5),
@@ -882,6 +886,9 @@ impl<'a> CaptureObserver<'a> {
     }
 
     fn frame_received(&mut self, frame: &CompletedFrame, settling: bool, paused: bool) {
+        let sdk_mode = self
+            .sdk_mode
+            .observe(frame.exposure_us, self.mode_started.elapsed());
         if let Some(monitor) = self.monitor {
             if settling {
                 monitor.settling_frame_captured();
@@ -903,7 +910,7 @@ impl<'a> CaptureObserver<'a> {
                 exposure_us: frame.exposure_us,
                 gain: frame.gain,
                 mode: match self.adaptive.as_ref().map(AdaptiveExposure::mode) {
-                    None => autopiercam_protocol::PreviewMode::Unknown,
+                    None => sdk_mode,
                     Some(LightMode::Day) => autopiercam_protocol::PreviewMode::Day,
                     Some(LightMode::Night) => autopiercam_protocol::PreviewMode::Night,
                 },
