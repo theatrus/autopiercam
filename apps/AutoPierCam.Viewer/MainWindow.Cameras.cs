@@ -35,12 +35,12 @@ public sealed partial class MainWindow
         CameraHelpText.Text = scan + (inventory.Error is not null
             ? $"Discovery failed: {inventory.Error}. "
             : inventory.Cameras.Any(camera => camera.IsColor) ? string.Empty : "No supported color cameras detected. ") +
-            "IDs may change after USB reconnects. Refresh discovery after connecting a camera (allow up to 30 seconds).";
+            "Camera discovery is cached while acquiring to avoid interrupting capture. Restart the tray agent to discover newly attached cameras. After a camera fault, discovery retries automatically (up to 30 seconds). IDs may change after USB reconnects.";
     }
 
     private async void RefreshCamerasButton_Click(object sender, RoutedEventArgs args)
     {
-        await RunUiOperationAsync("Refreshing detected cameras…", cancellationToken => RefreshCamerasAsync(cancellationToken, true));
+        await RunUiOperationAsync("Reloading cached camera list…", cancellationToken => RefreshCamerasAsync(cancellationToken, true));
     }
 
     private void CameraComboBox_SelectionChanged(object sender, SelectionChangedEventArgs args)

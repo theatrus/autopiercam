@@ -34,9 +34,11 @@ inside Settings asks before discarding edits; **Save next frame** does not disca
 them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
-**Refresh cameras** updates the list without discarding other unsaved settings;
-discovery runs every five seconds during capture, or on retries (up to 30 seconds)
-after a fault. A saved but disconnected camera stays selected as unavailable.
+**Reload camera list** reads cached discovery without discarding unsaved settings.
+Discovery runs before capture starts, or on retries (up to 30 seconds) after a
+fault. It never probes other cameras during acquisition or settling, even with
+recording paused. Restart the tray agent to discover newly connected cameras.
+A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
 cameras cannot be persistently distinguished by serial number yet.
 **Automatic (use model filter)** restores model-filter selection; ambiguous
@@ -131,6 +133,14 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 ```
 
 ## Silent installation and diagnostics
+
+If capture stops progressing, the agent reports a camera-worker fault independently
+of the Viewer connection. Restarting the Viewer does not restart capture. Quit
+the tray agent and relaunch it. Quit allows 30 seconds for graceful cleanup, then
+terminates its own process if a native SDK call or cleanup is stuck. Unfinished
+stills/video or uploads may be interrupted; already finalized files remain.
+Restart requests never open a second camera handle while the original worker is
+still running. An unresponsive restart asks the operator to quit and relaunch.
 
 Before installing a downloaded release, compare its published SHA-256 with:
 
