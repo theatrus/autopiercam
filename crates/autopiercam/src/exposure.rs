@@ -1,7 +1,9 @@
 //! Monotonic timing policy shared by startup settling and continuous capture.
 //!
-//! The SDK's short read timeout only bounds cancellation latency. It is not the
-//! deadline for a complete exposure, which can span many such polls.
+//! The SDK's short read timeout requests bounded cancellation latency, but native
+//! calls can still hang. It is not the deadline for a complete exposure, which can
+//! span many such polls. Independent status aging and host shutdown guard against
+//! a camera thread that no longer returns to this policy.
 
 use std::time::Duration;
 

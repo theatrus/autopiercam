@@ -172,6 +172,7 @@ impl AgentControl {
 #[derive(Clone, Debug)]
 pub struct AgentMonitor {
     inner: Arc<RwLock<AgentStatus>>,
+    camera_progress_at: Arc<RwLock<Instant>>,
     cameras: Arc<RwLock<CameraList>>,
     capturing_generation: Arc<AtomicU64>,
     upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
@@ -343,6 +344,7 @@ impl AgentMonitor {
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
+            camera_progress_at: Arc::new(RwLock::new(Instant::now())),
             cameras: Arc::new(RwLock::new(CameraList::default())),
             capturing_generation: Arc::new(AtomicU64::new(0)),
             upload_admin: Arc::new(RwLock::new(None)),
@@ -351,10 +353,40 @@ impl AgentMonitor {
     }
 
     pub fn snapshot(&self) -> AgentStatus {
-        match self.inner.read() {
-            Ok(status) => status.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> AgentStatus {
+        // Lock in the same order as the camera publisher. Transport/storage activity
+        // must not reset this clock or make an old exposure look newly observed.
+        let stored = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let progress_at = self
+            .camera_progress_at
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let age = now.saturating_duration_since(*progress_at);
+        let mut status = stored.clone();
+        let timeout = status
+            .exposure
+            .as_ref()
+            .map_or(Duration::from_secs(60), |exposure| {
+                Duration::from_millis(exposure.frame_timeout_ms).max(Duration::from_secs(30))
+                    + Duration::from_secs(30)
+            });
+        if matches!(
+            status.state,
+            AgentState::Starting | AgentState::Capturing | AgentState::Paused
+        ) && age >= timeout
+        {
+            status.state = AgentState::Faulted;
+            status.exposure = None;
+            status.last_error = Some("Camera worker is not responding. Restart the AutoPierCam tray agent; restarting the Viewer will not recover capture.".to_owned());
+        } else if let Some(exposure) = &mut status.exposure {
+            exposure.wait_elapsed_ms = exposure
+                .wait_elapsed_ms
+                .saturating_add(duration_millis(age));
         }
+        status
     }
 
     pub fn cameras(&self) -> CameraList {
@@ -486,6 +518,10 @@ impl AgentMonitor {
 
     fn begin_attempt(&self) {
         let mut status = self.write();
+        *self
+            .camera_progress_at
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Instant::now();
         status.state = AgentState::Starting;
         status.camera = None;
         status.last_error = None;
@@ -516,7 +552,12 @@ impl AgentMonitor {
     }
 
     fn exposure_progress(&self, exposure: StatusExposure) {
-        self.write().exposure = Some(exposure);
+        let mut status = self.write();
+        status.exposure = Some(exposure);
+        *self
+            .camera_progress_at
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Instant::now();
     }
 
     fn settling_frame_captured(&self) {
@@ -830,8 +871,6 @@ struct CaptureObserver<'a> {
     sdk_mode: ExposureMode,
     mode_started: Instant,
     video: Option<&'a video::VideoWorker>,
-    inventory_sdk: Option<&'a Sdk>,
-    next_inventory: Instant,
 }
 
 impl<'a> CaptureObserver<'a> {
@@ -849,17 +888,6 @@ impl<'a> CaptureObserver<'a> {
             sdk_mode: ExposureMode::default(),
             mode_started: Instant::now(),
             video: None,
-            inventory_sdk: None,
-            next_inventory: Instant::now() + Duration::from_secs(5),
-        }
-    }
-
-    fn refresh_inventory(&mut self) {
-        if Instant::now() >= self.next_inventory {
-            if let (Some(sdk), Some(monitor)) = (self.inventory_sdk, self.monitor) {
-                let _ = monitor.scan_cameras(sdk);
-            }
-            self.next_inventory = Instant::now() + Duration::from_secs(5);
         }
     }
 
@@ -1028,7 +1056,8 @@ fn run_agent_inner(
     monitor: &AgentMonitor,
     preview: Option<&PreviewSession>,
 ) -> Result<()> {
-    // Publish all choices before configuration/selection/open can fail.
+    // Publish choices only before opening a camera. ASIGetCameraProperty internally
+    // opens devices and can hang; never enumerate from acquisition/settling loops.
     let cameras = monitor.scan_cameras(sdk)?;
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
@@ -1114,7 +1143,6 @@ fn run_agent_inner(
     let result = (|| {
         loop {
             if !run_recording_epoch(
-                sdk,
                 &mut camera,
                 bayer,
                 &mut auto_limits,
@@ -1168,7 +1196,6 @@ fn run_agent_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn run_recording_epoch(
-    sdk: &Sdk,
     camera: &mut Camera,
     bayer: BayerPattern,
     auto_limits: &mut AutoLimits,
@@ -1266,7 +1293,6 @@ fn run_recording_epoch(
         .context("starting still writer")?;
 
     let capture_result = capture_loop(
-        sdk,
         camera,
         bayer,
         auto_limits,
@@ -1377,7 +1403,6 @@ impl CaptureLoopState {
 
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
-    sdk: &Sdk,
     camera: &mut Camera,
     bayer: BayerPattern,
     auto_limits: &mut AutoLimits,
@@ -1397,7 +1422,6 @@ fn capture_loop(
     state: &mut CaptureLoopState,
 ) -> Result<bool> {
     let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
-    observer.inventory_sdk = Some(sdk);
     observer.video = video;
     observer.adaptive = state.adaptive.take();
     let result = (|| {
@@ -1460,9 +1484,11 @@ fn capture_loop(
                 }
                 *config = next;
             }
-            observer.refresh_inventory();
             if video.is_some_and(video::VideoWorker::is_finished) {
                 bail!("video worker stopped unexpectedly");
+            }
+            if preview.is_some_and(PreviewSink::is_stopped) {
+                bail!("preview encoder stopped unexpectedly");
             }
             if upload_health.is_some_and(UploadHealth::is_stopped) {
                 bail!("durable upload worker stopped unexpectedly");
@@ -1578,7 +1604,12 @@ fn wait_for_auto_settle(
     let mut frame_buffer = Vec::new();
     let mut latest: Option<CompletedFrame> = None;
     loop {
-        observer.refresh_inventory();
+        if control.is_some_and(AgentControl::is_shutdown) {
+            return Ok(None);
+        }
+        if observer.preview.is_some_and(PreviewSink::is_stopped) {
+            bail!("preview encoder stopped while exposure was settling");
+        }
         if observer.video.is_some_and(video::VideoWorker::is_finished) {
             bail!("video worker stopped while exposure was settling");
         }
@@ -2561,6 +2592,71 @@ mod tests {
         progress.publish(&observer);
         monitor.begin_attempt();
         assert!(monitor.snapshot().exposure.is_none());
+    }
+
+    #[test]
+    fn cached_status_ages_without_viewer_or_storage_refresh_resetting_it() {
+        let monitor = AgentMonitor::new();
+        monitor.set_state(AgentState::Capturing);
+        let mut exposure = test_exposure_progress(1).status;
+        exposure.frame_timeout_ms = 5_100;
+        monitor.exposure_progress(exposure.clone());
+        let observed = *monitor.camera_progress_at.read().unwrap();
+        let status = monitor.snapshot_at(observed + Duration::from_secs(20));
+        assert_eq!(status.exposure.unwrap().wait_elapsed_ms, 20_000);
+        // A writer/storage update does not establish camera-worker liveness.
+        monitor.artifact_saved(Path::new("completed.jpg"));
+        let fault = monitor.snapshot_at(observed + Duration::from_secs(60));
+        assert_eq!(fault.state, AgentState::Faulted);
+        assert!(fault.exposure.is_none());
+        assert!(fault.last_error.unwrap().contains("not responding"));
+        assert_eq!(fault.frames_saved, 1);
+        // A transient delay can recover without a sticky synthetic fault.
+        monitor.exposure_progress(exposure);
+        assert_eq!(monitor.snapshot().state, AgentState::Capturing);
+    }
+
+    #[test]
+    fn stall_detection_allows_long_exposures_and_covers_settling_and_pause() {
+        let monitor = AgentMonitor::new();
+        let mut exposure = test_exposure_progress(1).status;
+        exposure.frame_timeout_ms = 605_000;
+        for state in [
+            AgentState::Starting,
+            AgentState::Capturing,
+            AgentState::Paused,
+        ] {
+            monitor.set_state(state.clone());
+            monitor.exposure_progress(exposure.clone());
+            let observed = *monitor.camera_progress_at.read().unwrap();
+            assert_eq!(
+                monitor
+                    .snapshot_at(observed + Duration::from_secs(600))
+                    .state,
+                state
+            );
+            assert_eq!(
+                monitor
+                    .snapshot_at(observed + Duration::from_secs(635))
+                    .state,
+                AgentState::Faulted
+            );
+        }
+        monitor.begin_attempt();
+        let observed = *monitor.camera_progress_at.read().unwrap();
+        assert_eq!(
+            monitor
+                .snapshot_at(observed + Duration::from_secs(60))
+                .state,
+            AgentState::Faulted
+        );
+        monitor.mark_stopping();
+        assert_eq!(
+            monitor
+                .snapshot_at(observed + Duration::from_secs(600))
+                .state,
+            AgentState::Stopping
+        );
     }
 
     #[test]

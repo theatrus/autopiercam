@@ -3,7 +3,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
@@ -16,6 +16,7 @@ use autopiercam_asi::Sdk;
 use autopiercam_protocol::{AgentState, AgentStatus};
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const MAX_CAPTURE_REQUESTS_PER_POLL: u64 = 1_024;
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -65,6 +66,41 @@ struct WorkerSignals {
     stopping: AtomicBool,
 }
 
+// Native SDK calls cannot be cancelled safely. Only an explicit whole-host
+// shutdown permits this fallback; never abandon a camera owner and reopen a
+// second handle in the same process. Keep this independent of the supervisor,
+// which may itself be joining a stuck camera or draining another service.
+fn shutdown_watchdog(signals: Weak<WorkerSignals>, grace: Duration, on_timeout: impl FnOnce()) {
+    let mut started = None;
+    loop {
+        let Some(signals) = signals.upgrade() else {
+            return;
+        };
+        if signals.stopping.load(Ordering::Acquire) {
+            let since = started.get_or_insert_with(Instant::now);
+            if since.elapsed() >= grace {
+                on_timeout();
+                return;
+            }
+        }
+        drop(signals);
+        thread::sleep(SUPERVISOR_POLL_INTERVAL);
+    }
+}
+
+fn terminate_stuck_host() {
+    // No logging/locking or DLL detach callbacks here: those can also be stuck.
+    // SAFETY: This pseudo-handle targets only this process, after shutdown grace
+    // has expired. TerminateProcess avoids ExitProcess's DLL-detach deadlocks.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            1,
+        );
+    }
+    std::process::abort(); // Only reached if self-termination unexpectedly failed.
+}
+
 impl WorkerClient {
     pub(crate) fn send(&self, command: TrayCommand) -> Result<(), WorkerStopped> {
         let _admission = self
@@ -102,7 +138,12 @@ impl WorkerClient {
             TrayCommand::Restart if self.signals.restart_pending.swap(true, Ordering::AcqRel) => {
                 return Ok(());
             }
-            TrayCommand::Shutdown => self.signals.stopping.store(true, Ordering::Release),
+            TrayCommand::Shutdown => {
+                self.signals.stopping.store(true, Ordering::Release);
+                tracing::info!(
+                    "shutdown requested; allowing 30 seconds for cleanup before whole-process termination"
+                );
+            }
             TrayCommand::SetPaused(_)
             | TrayCommand::CaptureNow
             | TrayCommand::Restart
@@ -174,6 +215,10 @@ where
     let monitor = AgentMonitor::new();
     let preview = PreviewHub::new();
     let signals = Arc::new(WorkerSignals::default());
+    let shutdown_signals = Arc::downgrade(&signals);
+    thread::Builder::new()
+        .name("autopiercam-shutdown-watchdog".to_owned())
+        .spawn(move || shutdown_watchdog(shutdown_signals, SHUTDOWN_GRACE, terminate_stuck_host))?;
     let sharing_preview = preview.clone();
     let sharing_monitor = monitor.clone();
     let sharing_signals = signals.clone();
@@ -272,13 +317,25 @@ fn supervise_camera<F>(
         if session.as_ref().is_some_and(CameraSession::is_finished) {
             let finished = session.take().expect("finished session was present");
             let reached_capturing = finished.reached_capturing;
+            let restarting = finished.stop_requested_at.is_some();
             let outcome = finished.join_finished();
-            report_unexpected_exit(monitor, outcome);
+            if restarting {
+                report_controlled_exit(monitor, outcome);
+                monitor.mark_stopping();
+                signals.restart_pending.store(false, Ordering::Release);
+            } else {
+                report_unexpected_exit(monitor, outcome);
+            }
             publish_status_if_changed(monitor, emit, last_status);
             if reached_capturing {
                 backoff.reset();
             }
-            retry_at = Instant::now() + backoff.next_delay();
+            retry_at = Instant::now()
+                + if restarting {
+                    Duration::ZERO
+                } else {
+                    backoff.next_delay()
+                };
             continue;
         }
 
@@ -302,6 +359,7 @@ fn supervise_camera<F>(
                 continue;
             }
             Err(TryRecvError::Disconnected) => {
+                signals.stopping.store(true, Ordering::Release);
                 orderly_shutdown(&mut session, monitor, emit, last_status);
                 return;
             }
@@ -353,6 +411,7 @@ fn supervise_camera<F>(
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                signals.stopping.store(true, Ordering::Release);
                 orderly_shutdown(&mut session, monitor, emit, last_status);
                 return;
             }
@@ -375,14 +434,11 @@ fn handle_command<F>(
 where
     F: Fn(WorkerEvent),
 {
-    if command == TrayCommand::Restart {
-        restart_pending.store(false, Ordering::Release);
-    }
     let status = monitor.snapshot();
     let session_ready = matches!(status.state, AgentState::Capturing | AgentState::Paused)
-        && session
-            .as_ref()
-            .is_some_and(|camera| camera.ready && !camera.is_finished());
+        && session.as_ref().is_some_and(|camera| {
+            camera.ready && camera.stop_requested_at.is_none() && !camera.is_finished()
+        });
     let lifecycle = intent.accept(command, session_ready);
 
     match command {
@@ -408,6 +464,11 @@ where
         LifecycleRequest::None => false,
         LifecycleRequest::Restart => {
             restart_session(session, monitor, emit, last_status);
+            // Keep sharing fenced and repeated restart requests coalesced while
+            // the original owner stops, not merely until command dequeue.
+            if session.is_none() {
+                restart_pending.store(false, Ordering::Release);
+            }
             backoff.reset();
             *retry_at = Instant::now();
             false
@@ -429,6 +490,17 @@ fn observe_session_status<F>(
 ) where
     F: Fn(WorkerEvent),
 {
+    if let Some(camera) = session.as_ref()
+        && let Some(started) = camera.stop_requested_at
+    {
+        if started.elapsed() >= SHUTDOWN_GRACE {
+            monitor.report_fault("Camera worker did not stop for restart. Quit and relaunch the AutoPierCam tray agent; no replacement camera handle will be opened while the old worker is running.");
+        } else {
+            monitor.mark_stopping();
+        }
+        publish_status_if_changed(monitor, emit, last_status);
+        return;
+    }
     let status = monitor.snapshot();
     if let Some(camera) = session {
         if monitor.capturing_generation() != camera.started_capturing_generation {
@@ -465,11 +537,9 @@ fn restart_session<F>(
 {
     monitor.mark_stopping();
     publish_status_if_changed(monitor, emit, last_status);
-    if let Some(camera) = session.take() {
-        report_controlled_exit(monitor, camera.shutdown_and_join());
+    if let Some(camera) = session {
+        camera.request_stop();
     }
-    monitor.mark_stopping();
-    publish_status_if_changed(monitor, emit, last_status);
 }
 
 fn orderly_shutdown<F>(
@@ -527,6 +597,14 @@ fn publish_snapshot_if_changed<F>(
     if last_status.as_ref() == Some(&status) {
         return;
     }
+    if status.state == AgentState::Faulted
+        && last_status.as_ref().is_none_or(|last| {
+            last.state != AgentState::Faulted || last.last_error != status.last_error
+        })
+    {
+        tracing::warn!(error = ?status.last_error, frames_captured = status.frames_captured,
+            frames_saved = status.frames_saved, "capture worker fault");
+    }
     emit(WorkerEvent::StatusChanged(Box::new(status.clone())));
     *last_status = Some(status);
 }
@@ -537,6 +615,7 @@ struct CameraSession {
     ready: bool,
     reached_capturing: bool,
     started_capturing_generation: u64,
+    stop_requested_at: Option<Instant>,
 }
 
 impl CameraSession {
@@ -571,11 +650,18 @@ impl CameraSession {
             ready: false,
             reached_capturing: false,
             started_capturing_generation,
+            stop_requested_at: None,
         })
     }
 
     fn is_finished(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested_at.get_or_insert_with(Instant::now);
+        self.ready = false;
+        self.control.shutdown();
     }
 
     fn set_paused(&self, paused: bool) {
@@ -613,8 +699,9 @@ impl CameraSession {
 
 impl Drop for CameraSession {
     fn drop(&mut self) {
-        // A supervisor panic must not detach the camera owner. Agent SDK calls use bounded waits,
-        // so requesting shutdown and joining here is finite under the worker contract.
+        // Never detach a live SDK owner and let another session open a handle.
+        // This join can hang inside native code; the independent host watchdog
+        // bounds an explicit Quit even when this cleanup cannot finish.
         self.control.shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -730,6 +817,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quit_watchdog_uses_injected_process_exit_and_stops_without_owner() {
+        let signals = Arc::new(WorkerSignals::default());
+        signals.stopping.store(true, Ordering::Release);
+        let timed_out = AtomicBool::new(false);
+        shutdown_watchdog(Arc::downgrade(&signals), Duration::ZERO, || {
+            timed_out.store(true, Ordering::Release);
+        });
+        assert!(timed_out.load(Ordering::Acquire));
+        shutdown_watchdog(Weak::new(), Duration::ZERO, || panic!("owner already gone"));
+    }
+
+    #[test]
+    fn quit_deadline_terminates_only_the_synthetic_child_process() {
+        const CHILD_FLAG: &str = "AUTOPIERCAM_TEST_QUIT_WATCHDOG_CHILD";
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            // No SDK, files, uploads, or production process are involved.
+            let signals = Arc::new(WorkerSignals::default());
+            signals.stopping.store(true, Ordering::Release);
+            shutdown_watchdog(
+                Arc::downgrade(&signals),
+                Duration::from_millis(20),
+                terminate_stuck_host,
+            );
+            panic!("termination returned");
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worker::tests::quit_deadline_terminates_only_the_synthetic_child_process",
+            ])
+            .env(CHILD_FLAG, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(1));
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("shutdown watchdog failed to terminate its test child");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn restart_retains_stuck_owner_without_blocking_supervisor_or_opening_replacement() {
+        let (release, blocked) = mpsc::channel();
+        let control = AgentControl::new();
+        let mut session = Some(CameraSession {
+            control: control.clone(),
+            thread: Some(thread::spawn(move || {
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+                Ok(())
+            })),
+            ready: true,
+            reached_capturing: true,
+            started_capturing_generation: 0,
+            stop_requested_at: None,
+        });
+        let monitor = AgentMonitor::new();
+        let mut last_status = None;
+        let restart_pending = AtomicBool::new(true);
+        let mut intent = SupervisorIntent::new(false);
+        assert!(!handle_command(
+            TrayCommand::Restart,
+            &mut session,
+            &mut intent,
+            &mut RetryBackoff::default(),
+            &mut Instant::now(),
+            &restart_pending,
+            &monitor,
+            &|_| {},
+            &mut last_status,
+        ));
+        assert!(restart_pending.load(Ordering::Acquire));
+        assert!(control.is_shutdown());
+        assert!(session.is_some());
+        assert!(!session.as_ref().unwrap().is_finished());
+        assert!(!session.as_ref().unwrap().ready);
+        session.as_mut().unwrap().stop_requested_at = Some(Instant::now() - SHUTDOWN_GRACE);
+        intent.accept(TrayCommand::CaptureNow, false);
+        observe_session_status(
+            &monitor,
+            &|_| {},
+            &mut last_status,
+            &mut session,
+            &mut intent,
+            &mut RetryBackoff::default(),
+        );
+        assert_eq!(monitor.snapshot().state, AgentState::Faulted);
+        assert_eq!(intent.pending_captures, 1);
+        release.send(()).unwrap();
+        assert_eq!(
+            session.take().unwrap().shutdown_and_join(),
+            SessionExit::Completed
+        );
+    }
+
+    #[test]
     fn settings_reload_preserves_pause_and_pending_captures_without_lifecycle_change() {
         let mut intent = SupervisorIntent::new(true);
         intent.accept(TrayCommand::CaptureNow, false);
@@ -809,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_restart_requests_are_coalesced_until_dequeued() {
+    fn repeated_restart_requests_are_coalesced_until_session_stops() {
         let (sender, receiver) = mpsc::channel();
         let directory = tempfile::tempdir().unwrap();
         let sharing = autopiercam::SharingService::start(

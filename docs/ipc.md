@@ -45,8 +45,11 @@ Reserved methods currently return a structured `not_implemented` error:
 is_color }], scanned_at_unix_ms, error }`. The capture thread publishes this
 inventory before selecting/opening a camera, including when selection faults.
 IPC only reads the cached inventory; it never opens a camera or calls the SDK.
-Discovery refreshes every five seconds while capturing/settling, including long
-exposure waits, and on supervised retry after faults (up to 30 seconds).
+Discovery runs before opening a camera and on supervised retry after faults
+(up to 30 seconds). It never runs during acquisition, settling, or paused recording:
+the SDK's property lookup can internally open devices and hang. While acquiring,
+the Viewer reloads only the cached inventory. Restart the tray agent to discover
+newly attached cameras.
 An enumeration/SDK-load failure clears the list and records an error. A null
 scan timestamp means discovery has not run yet. An empty successful list means
 no cameras were found. Selecting a camera uses the existing revision-checked
@@ -121,6 +124,13 @@ to tolerate a queued night frame during a transition to daylight. The agent
 never shortens an in-flight deadline. `settling_frames` counts complete startup
 frames and `settling_min_frames` is the effective minimum, at least four;
 reaching that count alone does not guarantee convergence.
+
+The agent also adds elapsed time since the last camera-thread publication when
+answering status requests. Repeated Viewer polls and retention updates therefore
+cannot make a frozen exposure timer look fresh. If no publication arrives within
+the larger of the frame timeout or 30 seconds, plus 30 seconds grace (60 seconds
+for startup without exposure metadata), status becomes `faulted` with an agent
+restart instruction and no exposure object. New progress clears this derived fault.
 
 Both image clients independently poll read-only `status.get` for progress every
 two seconds, with two-second connect and response bounds and one poll in flight.

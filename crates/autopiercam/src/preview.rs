@@ -7,7 +7,7 @@ use autopiercam_protocol::{
 use image::{ColorType, ImageEncoder, codecs::jpeg::JpegEncoder};
 use std::sync::{
     Arc, Condvar, Mutex, RwLock, TryLockError,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use tracing::warn;
@@ -171,7 +171,10 @@ impl PreviewEncoder {
         let encoder_queue = Arc::clone(&queue);
         let thread = thread::Builder::new()
             .name("autopiercam-preview-encoder".to_owned())
-            .spawn(move || preview_encoder_loop(&encoder_queue, &session))
+            .spawn(move || {
+                let _health = EncoderExitGuard(&encoder_queue);
+                preview_encoder_loop(&encoder_queue, &session);
+            })
             .context("starting preview encoder")?;
         Ok(Self {
             queue,
@@ -211,10 +214,17 @@ pub(crate) struct PreviewSink {
 }
 
 impl PreviewSink {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.queue.encoder_stopped.load(Ordering::Acquire)
+    }
+
     pub(crate) fn try_publish<F>(&self, build: F) -> bool
     where
         F: FnOnce(u64) -> PreviewJob,
     {
+        if self.is_stopped() {
+            return false;
+        }
         let mut state = match self.queue.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => {
@@ -241,6 +251,16 @@ struct LatestPreviewQueue {
     state: Mutex<LatestPreviewState>,
     available: Condvar,
     dropped_frames: AtomicU64,
+    encoder_stopped: AtomicBool,
+}
+
+struct EncoderExitGuard<'a>(&'a LatestPreviewQueue);
+
+impl Drop for EncoderExitGuard<'_> {
+    fn drop(&mut self) {
+        // Publish even during panic unwinding, without taking a possibly poisoned lock.
+        self.0.encoder_stopped.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -352,6 +372,22 @@ fn lock_unpoisoned<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_panic_is_visible_and_rejects_new_frames() {
+        let queue = Arc::new(LatestPreviewQueue::default());
+        let sink = PreviewSink {
+            queue: queue.clone(),
+        };
+        assert!(!sink.is_stopped());
+        let result = std::panic::catch_unwind(|| {
+            let _health = EncoderExitGuard(&queue);
+            panic!("injected encoder failure");
+        });
+        assert!(result.is_err());
+        assert!(sink.is_stopped());
+        assert!(!sink.try_publish(|_| panic!("must not build a frame for a dead encoder")));
+    }
 
     #[test]
     fn full_hd_sensor_is_not_reduced_to_720p() {
