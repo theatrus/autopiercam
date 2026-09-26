@@ -36,6 +36,32 @@ The intended process and data flow is:
 Only the camera thread calls ASICamera2. The UI never loads the vendor DLL or
 opens a camera.
 
+### Acquisition pacing
+
+`capture.preview_max_fps` is a live-reloadable integer from 1–30, default 2.
+Preview publication is independently rate-limited using a monotonic clock, even
+when explicit still requests or a faster still schedule require more frames.
+For short exposures the capture thread stops the **video stream**, waits for
+the next acquisition slot, and starts it again on the same camera handle. A
+sleep with the stream left running would merely discard frames while leaving
+the camera and USB busy. No camera enumeration or close/open occurs during
+pacing. Exposure/gain controls and application settling/adaptive history are
+retained. Long exposures at least as long as the preview period are not stopped
+for pacing, and no catch-up burst is accumulated after slow processing.
+
+The idle wait checks shutdown, pending live reload, and explicit still requests
+every 25 ms (reloads/requests are applied after startup settling). A rate save
+alone does not drain recording services or restart settling. Paused recording
+and storage pressure keep the preview cadence without acquiring extra scheduled
+stills. Security video and Chatstronomy sample the capped shared preview.
+
+This is host-side pacing, not a firmware FPS setting: SDK pipeline buffering and
+stop/start overhead can make actual frame rates lower or cause extra sensor
+frames. The bundled SDK has no documented frame-rate-limit control. Validate
+SDK auto-exposure convergence and sustained day/night stream stop/start on the
+target hardware before relying on this for unattended operation; unit tests do
+not exercise physical cameras.
+
 ## Components
 
 ### ZWO adapter
@@ -128,10 +154,24 @@ chat. **Reload settings** lives inside Settings and reloads configuration and
 camera discovery, with confirmation before discarding edits. Normal preview
 and status updates need neither button.
 
-The Chatstronomy dialog uses text-backed whole-number fields so collapsed event
-options have the same value before and after their controls are displayed.
-Save validates the current text rather than retaining a transient initialization
-error. An interval-only edit preserves the loaded threshold and burst settings.
+Settings has two sections, **Capture** and **Chatstronomy**, that work the same
+way: **Reload settings** at the top (confirming before it discards edits),
+scrolling fields, and a fixed footer with an InfoBar, **Discard changes** and
+**Save settings**. Each section saves separately because the agent stores
+capture configuration and sharing preferences as separate revisioned documents.
+When a save finds that settings changed elsewhere, both sections offer **Keep my
+edits** (adopt the newer revision and replace it on the next save) or **Discard
+changes**. Hiding the panel or switching sections keeps edits; the Settings
+button shows a dot while either section has unsaved changes.
+
+Numbers use bounded `NumberBox` controls with a label and unit in both
+sections, and on/off choices use toggle switches. A Chatstronomy number is read
+from the box's text while it has focus and from its committed value otherwise,
+so collapsed event options keep their loaded values and Save validates the
+current entry rather than a transient initialization error. An interval-only
+edit preserves the loaded threshold and burst settings. While the Chatstronomy
+section is open, the status loop also refreshes sharing status, so connection
+state stays current without a manual refresh.
 
 Exposure, gain and known day/night mode share a compact single-line summary
 below the preview. Unavailable readings are omitted, and the summary collapses

@@ -5,6 +5,17 @@ using Xunit;
 
 public sealed class SettingsFormValuesTests
 {
+    [Fact]
+    public void PreviewRateDefaultsAreCleanAndOnlyRealChangesAreDirty()
+    {
+        var baseline = SettingsFormValues.FromConfiguration(Config);
+        Assert.Equal(baseline, SettingsFormValues.FromConfiguration(Config with {
+            Capture = Config.Capture with { PreviewMaxFps = 2 }
+        }));
+        var changed = baseline with { PreviewRate = SettingsFormValues.Number(5) };
+        Assert.NotEqual(baseline, changed);
+        Assert.Equal(baseline, changed with { PreviewRate = SettingsFormValues.Number(2) });
+    }
     private static AgentConfiguration Config => JsonSerializer.Deserialize<AgentConfiguration>(
         File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
 

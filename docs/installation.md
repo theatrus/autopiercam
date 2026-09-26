@@ -168,6 +168,20 @@ Report problems at <https://github.com/theatrus/autopiercam/issues>. Include the
 AutoPierCam version, camera model, relevant log excerpt, and whether the ZWO
 camera appears in Device Manager. Do not include upload bearer tokens.
 
+## Preview frame rate
+
+In Viewer **Settings**, use **Maximum preview frames per second** (whole numbers
+1–30, default 2). Saving this setting does not reopen the camera or repeat
+startup settling. Short daytime exposures are paced by stopping the video stream
+between frames; long night exposures are allowed to finish uninterrupted.
+Faster scheduled stills and **Save next frame** can acquire sooner, but do not
+raise the preview publication cap. Security video and Chatstronomy use that
+shared preview, so they cannot receive new images faster than this limit.
+
+For file-based configuration, set `preview_max_fps = 2` under `[capture]`.
+Omitting it uses 2 fps. A higher cap permits more CPU/USB work, but does not
+guarantee that exposure, encoding or clients can sustain that rate.
+
 ## Building and signing the MSI
 
 The packaging pipeline requires Rust, the .NET SDK, and WiX Toolset 6 with the

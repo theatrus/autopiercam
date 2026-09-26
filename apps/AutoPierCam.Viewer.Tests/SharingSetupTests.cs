@@ -33,6 +33,18 @@ public sealed class SharingSetupTests
         Assert.Equal(20, SharingSetupState.WholeNumber(" 20 ", 5, 80, "Threshold"));
     }
 
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(20.5)]
+    [InlineData(4)]
+    [InlineData(81)]
+    public void BlankFractionalAndOutOfRangeNumberBoxValuesAreRejected(double value)
+    {
+        var error = Assert.Throws<InvalidOperationException>(() => SharingSetupState.WholeNumber(value, 5, 80, "Changed area threshold"));
+        Assert.Equal("Changed area threshold: enter a whole number from 5 to 80.", error.Message);
+        Assert.Equal(20, SharingSetupState.WholeNumber(20d, 5, 80, "Changed area threshold"));
+    }
+
     private static SharingStatus Status => new() {
         Revision = 12, DeviceId = 42, Connection = "Disabled",
         Preferences = new() { HubOrigin = "https://hub.example.test", Snapshots = true, IntervalMinutes = 10 }

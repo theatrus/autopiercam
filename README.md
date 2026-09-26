@@ -77,8 +77,8 @@ repeat settling; camera and RAW-format changes still restart. The updated NINA p
 
 ## Install on Windows
 
-Version 0.2.6 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
-in the Viewer to pair, allow snapshots, periodic images, scene/day-night posts,
+Version 0.2.6 includes opt-in Chatstronomy image sharing: open **Settings** in
+the Viewer and choose the **Chatstronomy** section to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
 

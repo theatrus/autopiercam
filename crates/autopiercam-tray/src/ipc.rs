@@ -1185,6 +1185,7 @@ mod tests {
                 "cameras.list",
                 "camera.adaptive_exposure",
                 "camera.raw16",
+                "capture.preview_rate",
                 "video.ffmpeg"
             ]
         );
@@ -1273,6 +1274,7 @@ mod tests {
             if changed {
                 next.camera.max_exposure_us = 30_000_000;
                 next.capture.interval_ms = 5000;
+                next.capture.preview_max_fps = 5;
             }
             let response = dispatch(
                 Request::new("live-save", Method::ConfigReplace).with_payload(
@@ -1289,6 +1291,7 @@ mod tests {
             let saved: ConfigSaved = serde_json::from_value(response.result.unwrap()).unwrap();
             assert!(saved.saved);
             assert!(!saved.restart_scheduled);
+            assert_eq!(store.snapshot().unwrap().config.capture.preview_max_fps, 5);
             if !changed {
                 assert_eq!(saved.revision, current.revision);
             }

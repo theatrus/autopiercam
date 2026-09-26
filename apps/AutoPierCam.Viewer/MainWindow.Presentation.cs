@@ -25,21 +25,26 @@ public sealed partial class MainWindow
     {
         // Collapsing never reloads controls or discards pending changes.
         SettingsPane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        SettingsColumn.Width = new GridLength(visible ? 360 : 0);
+        SettingsColumn.Width = new GridLength(visible ? 400 : 0);
         WorkspaceGrid.ColumnSpacing = visible ? 20 : 0;
         UpdateSettingsButton();
+        UpdateSharingPolling();
         if (!visible) SettingsButton.Focus(FocusState.Programmatic);
     }
 
     private void UpdateSettingsButton() => SettingsButton.Content =
-        (SettingsPane.Visibility == Visibility.Visible ? "Hide settings" : "Settings") + (_hasUnsavedSettings ? " •" : "");
+        (SettingsPane.Visibility == Visibility.Visible ? "Hide settings" : "Settings") + (_hasUnsavedSettings || SharingHasEdits ? " •" : "");
 
     private void SetConfigurationFeedback(InfoBarSeverity severity, bool show, bool openSettings = false)
     {
         ConfigInfoBar.Severity = severity;
         ConfigInfoBar.IsOpen = show;
         ConfigInfoBar.IsIconVisible = show && severity is InfoBarSeverity.Warning or InfoBarSeverity.Error;
-        if (openSettings) SetSettingsVisible(true);
+        if (openSettings)
+        {
+            SettingsSectionBar.SelectedItem = CaptureSectionItem;
+            SetSettingsVisible(true);
+        }
         UpdateSettingsButton();
     }
 

@@ -57,6 +57,46 @@ pub(crate) fn poll_timeout_ms(exposure_us: i64) -> i32 {
     (exposure_us.max(1) / 1_000 + 500).clamp(500, 2_000) as i32
 }
 
+pub(crate) fn preview_interval(max_fps: u32) -> Duration {
+    // Round up so integer division cannot exceed the requested maximum.
+    Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(max_fps.clamp(1, 30))))
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PreviewCadence {
+    last: Option<std::time::Instant>,
+}
+
+impl PreviewCadence {
+    pub(crate) fn take_slot(&mut self, now: std::time::Instant, max_fps: u32) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < preview_interval(max_fps))
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+/// Delay before starting the next short exposure, measured from the last frame.
+/// Faster still schedules can bypass the preview cadence without raising its cap.
+pub(crate) fn acquisition_delay(
+    since_frame: Duration,
+    exposure_us: i64,
+    max_fps: u32,
+    still_due_in: Option<Duration>,
+    requested: bool,
+) -> Duration {
+    if requested {
+        return Duration::ZERO;
+    }
+    let preview_due_in = preview_interval(max_fps).saturating_sub(since_frame);
+    let due_in = still_due_in.map_or(preview_due_in, |still| still.min(preview_due_in));
+    due_in.saturating_sub(Duration::from_micros(exposure_us.max(1) as u64))
+}
+
 fn frame_timeout(exposure_us: i64) -> Duration {
     Duration::from_micros(exposure_us.max(1) as u64)
         .saturating_mul(2)
@@ -208,6 +248,90 @@ impl Settling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_cap_survives_extra_stills_rate_changes_and_delays() {
+        let now = std::time::Instant::now();
+        let mut cadence = PreviewCadence::default();
+        assert!(cadence.take_slot(now, 2));
+        for ms in 1..500 {
+            assert!(!cadence.take_slot(now + Duration::from_millis(ms), 2));
+        }
+        assert!(cadence.take_slot(now + Duration::from_millis(500), 2));
+        // Lowering the rate applies against the last emitted frame, not a reset clock.
+        assert!(!cadence.take_slot(now + Duration::from_secs(1), 1));
+        assert!(cadence.take_slot(now + Duration::from_millis(1500), 1));
+        assert!(cadence.take_slot(now + Duration::from_millis(1600), 10));
+        // Copying cadence across a recording epoch preserves the same cap.
+        let mut reloaded = cadence;
+        assert!(!reloaded.take_slot(now + Duration::from_millis(1601), 10));
+        assert!(reloaded.take_slot(now + Duration::from_secs(10), 10));
+        assert!(!reloaded.take_slot(now + Duration::from_secs(10), 10));
+    }
+
+    #[test]
+    fn preview_period_never_exceeds_requested_rate() {
+        assert_eq!(preview_interval(1), Duration::from_secs(1));
+        assert_eq!(preview_interval(2), Duration::from_millis(500));
+        for fps in 1..=30 {
+            assert!(preview_interval(fps) * fps >= Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn daytime_acquisition_waits_but_long_exposures_are_uninterrupted() {
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 50_000, 2, None, false),
+            Duration::from_millis(450)
+        );
+        assert_eq!(
+            acquisition_delay(Duration::from_millis(100), 50_000, 2, None, false),
+            Duration::from_millis(350)
+        );
+        for exposure in [500_000, 30_000_000, 60_000_000, 120_000_000] {
+            assert_eq!(
+                acquisition_delay(Duration::ZERO, exposure, 2, None, false),
+                Duration::ZERO
+            );
+        }
+        // Slow processing never adds a catch-up sleep or a burst budget.
+        assert_eq!(
+            acquisition_delay(Duration::from_secs(10), 50_000, 2, None, false),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn still_requests_can_acquire_sooner_than_preview_cadence() {
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 50_000, 1, None, true),
+            Duration::ZERO
+        );
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 50_000, 1, Some(Duration::ZERO), false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            acquisition_delay(
+                Duration::ZERO,
+                50_000,
+                1,
+                Some(Duration::from_millis(200)),
+                false
+            ),
+            Duration::from_millis(150)
+        );
+        assert_eq!(
+            acquisition_delay(
+                Duration::ZERO,
+                50_000,
+                1,
+                Some(Duration::from_secs(10)),
+                false
+            ),
+            Duration::from_millis(950)
+        );
+    }
 
     #[test]
     fn sdk_mode_uses_exposure_and_sustained_time_not_wall_clock() {

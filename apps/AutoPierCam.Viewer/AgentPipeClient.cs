@@ -738,11 +738,12 @@ internal sealed record AgentConfiguration
         }
 
         if (Capture.IntervalMs == 0 ||
+            Capture.PreviewMaxFps is < 1 or > 30 ||
             Capture.JpegQuality is < 1 or > 100 ||
             Capture.WriterQueueCapacity == 0)
         {
             throw new AgentProtocolException(
-                $"{method} returned invalid capture timing, JPEG quality, or writer capacity.");
+                $"{method} returned invalid capture timing, preview frame rate, JPEG quality, or writer capacity.");
         }
 
         if (Capture.RetentionMaxBytes == 0 || Capture.RetentionMinFreeBytes == 0)
@@ -863,6 +864,10 @@ internal sealed record AgentCaptureConfiguration
     [JsonPropertyName("interval_ms")]
     [JsonRequired]
     public ulong IntervalMs { get; init; }
+
+    [JsonPropertyName("preview_max_fps")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? PreviewMaxFps { get; init; }
 
     [JsonPropertyName("jpeg_quality")]
     [JsonRequired]

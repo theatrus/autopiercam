@@ -182,7 +182,7 @@ loaded non-null values unchanged. The agent validates the document and expected
 revision, syncs a unique temporary file, atomically replaces the TOML file, and
 schedules application on the camera-owning thread. Camera selection, ROI/binning
 and RAW format changes schedule a controlled restart. Other settings do not:
-exposure limits, gain, cadence and JPEG quality update in place; recording-service
+exposure limits, gain, cadence, preview frame rate and JPEG quality update in place; recording-service
 changes drain and replace those services while preserving the open camera,
 preview session, paused state and completed startup settling. Success confirms
 persistence and acceptance, not that the asynchronous application has finished:
@@ -194,7 +194,13 @@ Clients must not treat that as failure. Unchanged saves do not rewrite the file
 or reconfigure hardware/services. Invalid runtime settings still surface through
 normal agent fault status.
 
-Exposure/cadence changes apply at a capture-thread poll after startup settling.
+The `capture.preview_rate` capability advertises editing of
+`capture.preview_max_fps`: an integer from 1–30, default 2 when omitted. The
+default may be omitted from canonical JSON. Viewer preserves an existing value
+without offering edits when that capability is absent. Preview publication is
+capped independently of scheduled stills and explicit capture requests.
+
+Exposure/cadence/frame-rate changes apply at a capture-thread poll after startup settling.
 Service changes may briefly delay delivery while writers/encoders drain, but do
 not close the camera or repeat settling. A save response is not an apply receipt.
 

@@ -17,6 +17,7 @@ impl Config {
     pub fn requires_recording_reload(&self, next: &Self) -> bool {
         let mut capture = self.capture.clone();
         capture.interval_ms = next.capture.interval_ms;
+        capture.preview_max_fps = next.capture.preview_max_fps;
         capture.jpeg_quality = next.capture.jpeg_quality;
         capture != next.capture || self.upload != next.upload || self.video != next.video
     }
@@ -72,6 +73,11 @@ impl Config {
         if self.capture.interval_ms == 0 {
             return Err(ConfigError::Validation(
                 "capture.interval_ms must be greater than zero",
+            ));
+        }
+        if !(1..=30).contains(&self.capture.preview_max_fps) {
+            return Err(ConfigError::Validation(
+                "capture.preview_max_fps must be between 1 and 30",
             ));
         }
         if self.capture.writer_queue_capacity == 0 {
@@ -240,6 +246,9 @@ fn is_false(value: &bool) -> bool {
 pub struct CaptureConfig {
     pub directory: PathBuf,
     pub interval_ms: u64,
+    /// Preview publication cap and idle acquisition cadence. Stills can request sooner.
+    #[serde(skip_serializing_if = "is_default_preview_fps")]
+    pub preview_max_fps: u32,
     pub jpeg_quality: u8,
     pub writer_queue_capacity: usize,
     pub keep_latest: bool,
@@ -256,6 +265,7 @@ impl Default for CaptureConfig {
         Self {
             directory: PathBuf::from("captures"),
             interval_ms: 10_000,
+            preview_max_fps: 2,
             jpeg_quality: 88,
             writer_queue_capacity: 2,
             keep_latest: true,
@@ -264,6 +274,10 @@ impl Default for CaptureConfig {
             retention_days: 14,
         }
     }
+}
+
+fn is_default_preview_fps(value: &u32) -> bool {
+    *value == 2
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -339,6 +353,26 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_rate_defaults_round_trips_and_reloads_without_camera_or_recorder_restart() {
+        let original: Config = toml::from_str("").unwrap();
+        assert_eq!(original.capture.preview_max_fps, 2);
+        for rate in [1, 2, 15, 30] {
+            let mut next = original.clone();
+            next.capture.preview_max_fps = rate;
+            next.validate().unwrap();
+            assert!(!original.requires_camera_restart(&next));
+            assert!(!original.requires_recording_reload(&next));
+            let round_trip: Config = toml::from_str(&toml::to_string(&next).unwrap()).unwrap();
+            assert_eq!(round_trip.capture.preview_max_fps, rate);
+        }
+        for rate in [0, 31, u32::MAX] {
+            let mut next = original.clone();
+            next.capture.preview_max_fps = rate;
+            assert!(next.validate().is_err());
+        }
+    }
 
     #[test]
     fn save_policy_only_reopens_for_device_or_image_layout_changes() {
