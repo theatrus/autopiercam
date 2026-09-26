@@ -25,7 +25,11 @@
                     FontSize="24"
                     FontWeight="SemiBold"
                     Text="AutoPierCam" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
                     <FontIcon
                         FontFamily="Segoe MDL2 Assets"
                         FontSize="12"
@@ -33,9 +37,11 @@
                         Glyph="&#xE783;" />
                     <TextBlock
                         x:Name="StatusText"
+                        Grid.Column="1"
+                        TextTrimming="CharacterEllipsis"
                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                         Text="Waiting for the local capture agent" />
-                </StackPanel>
+                </Grid>
             </StackPanel>
             <StackPanel
                 Grid.Column="1"
@@ -166,8 +172,13 @@
                 </Grid>
             </Grid>
 
-            <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
-                <StackPanel Spacing="16">
+            <Grid Grid.Column="1" RowSpacing="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel Spacing="8">
                     <TextBlock FontSize="20" FontWeight="SemiBold" Text="Capture settings" />
                     <StackPanel Spacing="6">
                         <TextBlock Text="Camera" />
@@ -181,6 +192,11 @@
                         <Button x:Name="RefreshCamerasButton" Content="Refresh cameras" IsEnabled="False" Click="RefreshCamerasButton_Click" />
                         <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
                     </StackPanel>
+                </StackPanel>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="16">
+                    <Expander Header="Agent activity and storage" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="12">
                     <Border Padding="12" Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="4">
                             <TextBlock
@@ -302,6 +318,8 @@
                                 Visibility="Collapsed" />
                         </StackPanel>
                     </Border>
+                    </StackPanel>
+                    </Expander>
                     <Grid ColumnSpacing="10">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
@@ -410,21 +428,24 @@
                              PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
                     <TextBlock Text="Security recording saves H.264 MP4 segments from previews (up to 2 fps). Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
                                TextWrapping="Wrap" />
+                </StackPanel>
+                </ScrollViewer>
+                <StackPanel Grid.Row="2" Spacing="8">
                     <InfoBar
                         x:Name="ConfigInfoBar"
                         IsClosable="False"
                         IsOpen="True"
-                        Message="Connect to the local agent to load versioned settings."
+                        Message="Connect to the local agent to load settings."
                         Severity="Informational" />
                     <Button
                         x:Name="SaveButton"
                         HorizontalAlignment="Stretch"
                         Click="SaveButton_Click"
-                        Content="Save settings"
+                        Content="Save and restart capture"
                         IsEnabled="False"
                         Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>
-            </ScrollViewer>
+            </Grid>
         </Grid>
 
         <Grid

@@ -110,7 +110,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autopiercam"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "autopiercam-asi",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-asi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libloading",
  "thiserror 2.0.20",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-chatstronomy"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-tray"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "autopiercam",
  "autopiercam-asi",

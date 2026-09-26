@@ -35,7 +35,7 @@ public sealed partial class MainWindow
         CameraHelpText.Text = scan + (inventory.Error is not null
             ? $"Discovery failed: {inventory.Error}. "
             : inventory.Cameras.Any(camera => camera.IsColor) ? string.Empty : "No supported color cameras detected. ") +
-            "Choose a camera, then Save settings to restart capture. IDs may change after USB reconnects. Discovery updates every 5 seconds during capture, or on retries (up to 30 seconds) after a fault.";
+            "IDs may change after USB reconnects. Refresh discovery after connecting a camera (allow up to 30 seconds).";
     }
 
     private async void RefreshCamerasButton_Click(object sender, RoutedEventArgs args)
@@ -47,6 +47,7 @@ public sealed partial class MainWindow
     {
         if (CameraNameFilterTextBox is not null)
         {
+            MarkSettingsEdited();
             SetControlsForOperation(_operationInProgress);
         }
     }

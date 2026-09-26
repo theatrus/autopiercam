@@ -41,6 +41,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        TrackSettingsEdits();
         Title = "AutoPierCam";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "autopiercam.ico"));
         AppWindow.Resize(new SizeInt32(1180, 760));
@@ -457,6 +458,18 @@ public sealed partial class MainWindow : Window
 
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_hasUnsavedSettings)
+        {
+            var confirm = new ContentDialog {
+                XamlRoot = Content.XamlRoot,
+                Title = "Discard unsaved settings?",
+                Content = "Refresh reloads settings from the agent. Your unsaved changes will be lost.",
+                PrimaryButtonText = "Discard and refresh",
+                CloseButtonText = "Keep editing",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await confirm.ShowAsync() != ContentDialogResult.Primary) return;
+        }
         await RunUiOperationAsync(
             "Refreshing status and configuration…",
             RefreshStatusAndConfigurationAsync);
@@ -493,8 +506,8 @@ public sealed partial class MainWindow : Window
     private async Task CaptureAndRefreshAsync(CancellationToken cancellationToken)
     {
         await _agentClient.CaptureNowAsync(cancellationToken);
-        StatusText.Text = "Capture request accepted; refreshing status and configuration…";
-        await RefreshStatusAndConfigurationAsync(cancellationToken);
+        ApplyStatus(await _agentClient.GetStatusAsync(cancellationToken));
+        StatusText.Text = "Capture requested. Unsaved settings were not changed.";
     }
 
     private async void PauseButton_Click(object sender, RoutedEventArgs args)
@@ -540,16 +553,20 @@ public sealed partial class MainWindow : Window
             Revision = result.Revision,
             Config = updatedConfiguration,
         };
-        _latestAgentStatus = null;
+        _hasUnsavedSettings = false;
+        // Capabilities remain valid across an accepted camera restart.
+        if (_latestAgentStatus is { } priorStatus)
+            _latestAgentStatus = priorStatus with { State = "starting", Camera = null, Upload = null, Storage = null };
+        ApplyConfiguration(_configurationSnapshot);
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
         _configurationNeedsRefresh = false;
         ApplyUploadActivity(null, updatedConfiguration.Upload.Enabled);
         ClearStorageStatus();
-        ConfigInfoBar.Title = $"Configuration revision {result.Revision:N0}";
-        ConfigInfoBar.Message = "Saved; a camera restart was scheduled.";
+        ConfigInfoBar.Title = "Settings saved";
+        ConfigInfoBar.Message = "Capture is restarting with your settings.";
         ConfigInfoBar.Severity = InfoBarSeverity.Success;
-        StatusText.Text = $"Configuration revision {result.Revision:N0} saved; camera restart scheduled.";
+        StatusText.Text = "Settings saved; capture restart requested.";
     }
 
     private async Task ManageOutboxAsync(CancellationToken cancellationToken)
@@ -1022,6 +1039,10 @@ public sealed partial class MainWindow : Window
         {
             ShowSavedWithoutRestart(exception);
         }
+        catch (AgentRequestException exception) when (exception.Code == "invalid_config")
+        {
+            ShowConfigurationValidationFailure(FormatAgentError(exception));
+        }
         catch (AgentRequestException exception)
         {
             ShowAgentFailure(FormatAgentError(exception));
@@ -1090,9 +1111,10 @@ public sealed partial class MainWindow : Window
         _configurationSnapshot = snapshot;
         _configurationNeedsRefresh = false;
         ApplyUploadActivity(_latestAgentStatus?.Upload, configuration.Upload.Enabled);
-        ConfigInfoBar.Title = $"Configuration revision {snapshot.Revision:N0}";
+        _hasUnsavedSettings = false;
+        ConfigInfoBar.Title = "Settings loaded";
         ConfigInfoBar.Message =
-            "Loaded from the capture agent. Hidden settings are preserved when saving.";
+            "Choose your settings, then save to apply them and restart capture.";
         ConfigInfoBar.Severity = InfoBarSeverity.Informational;
     }
 
@@ -1336,13 +1358,10 @@ public sealed partial class MainWindow : Window
         }
 
         _configurationNeedsRefresh = true;
-        string revision = exception.CurrentRevision is ulong currentRevision
-            ? $" The agent is currently at revision {currentRevision:N0}."
-            : string.Empty;
         string message =
-            $"Configuration was changed by another client.{revision} Select Refresh to load it before making further edits.";
+            "Settings were changed elsewhere. Refresh to load them before saving your changes.";
         StatusText.Text = message;
-        ConfigInfoBar.Title = "Configuration revision conflict";
+        ConfigInfoBar.Title = "Settings changed elsewhere";
         ConfigInfoBar.Message = message;
         ConfigInfoBar.Severity = InfoBarSeverity.Error;
         AgentLastErrorText.Text = message;
@@ -1377,11 +1396,11 @@ public sealed partial class MainWindow : Window
         }
 
         string message = $"Settings were not saved: {Compact(detail)}";
-        StatusText.Text = message;
+        StatusText.Text = "Settings were not saved — see the message beside Save.";
         ConfigInfoBar.Title = "Check configuration values";
         ConfigInfoBar.Message = message;
         ConfigInfoBar.Severity = InfoBarSeverity.Error;
-        ClearUploadActivity("Unavailable", "Refresh to reload upload activity after correcting the settings.");
+        // Rejected settings do not disconnect the agent or revoke capabilities.
     }
 
     private void ApplyUploadActivity(AgentUploadStatus? upload, bool? uploadEnabled)
@@ -1549,7 +1568,7 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
         FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
-        SaveButton.IsEnabled = configurationControlsEnabled;
+        SaveButton.IsEnabled = configurationControlsEnabled && _hasUnsavedSettings;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
 
@@ -1613,7 +1632,7 @@ public sealed partial class MainWindow : Window
                 _configurationSnapshot?.Config.Capture.RetentionMinFreeBytes is not null;
             RetentionSettingsAvailabilityText.Text = hasExistingLimit
                 ? "This agent does not advertise retention editing. Loaded limits are read-only and will be preserved unchanged."
-                : "Retention limits require an agent that advertises storage.retention; blank values will not be sent to this agent.";
+                : "Refresh agent status to enable retention editing. Existing settings are preserved when saving.";
         }
     }
 

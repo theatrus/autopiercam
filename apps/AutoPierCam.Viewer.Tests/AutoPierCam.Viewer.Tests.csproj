@@ -7,6 +7,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <None Include="../../tests/fixtures/config-default.json" Link="config-default.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../AutoPierCam.Viewer/MainWindow.xaml" Link="MainWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="../AutoPierCam.Viewer/CameraSelection.cs" Link="CameraSelection.cs" />
     <Compile Include="../AutoPierCam.Viewer/AgentPipeClient.cs" Link="AgentPipeClient.cs" />
     <Compile Include="../AutoPierCam.Viewer/SharingModels.cs" Link="SharingModels.cs" />

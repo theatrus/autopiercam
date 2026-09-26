@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.IO.Pipes;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AutoPierCam.Viewer;
 
@@ -25,7 +26,23 @@ internal sealed class AgentPipeClient : IAsyncDisposable
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = false,
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver
+        {
+            Modifiers = { PreserveRetentionFieldPresence },
+        },
     };
+
+    private static void PreserveRetentionFieldPresence(JsonTypeInfo typeInfo)
+    {
+        if (typeInfo.Type != typeof(AgentCaptureConfiguration)) return;
+        foreach (JsonPropertyInfo property in typeInfo.Properties)
+        {
+            if (property.Name == "retention_max_bytes")
+                property.ShouldSerialize = (parent, value) => ((AgentCaptureConfiguration)parent).HasRetentionMaxBytes || value is not null;
+            if (property.Name == "retention_min_free_bytes")
+                property.ShouldSerialize = (parent, value) => ((AgentCaptureConfiguration)parent).HasRetentionMinFreeBytes || value is not null;
+        }
+    }
 
     private readonly string _pipeName;
     private readonly TimeSpan _connectTimeout;
@@ -197,7 +214,13 @@ internal sealed class AgentPipeClient : IAsyncDisposable
         AgentConfigurationSnapshot snapshot =
             DeserializeResult<AgentConfigurationSnapshot>(result, "config.get");
         snapshot.Config.Validate("config.get");
-        return snapshot;
+        JsonElement capture = result.GetProperty("config").GetProperty("capture");
+        // A modern complete replacement requires explicit null for disabled limits.
+        // Older agents omit these fields entirely and reject unknown fields.
+        return snapshot with { Config = snapshot.Config with { Capture = snapshot.Config.Capture with {
+            HasRetentionMaxBytes = capture.TryGetProperty("retention_max_bytes", out _),
+            HasRetentionMinFreeBytes = capture.TryGetProperty("retention_min_free_bytes", out _),
+        } } };
     }
 
     internal async Task<AgentConfigurationReplaceResult> ReplaceConfigurationAsync(
@@ -826,6 +849,12 @@ internal sealed record AgentCameraConfiguration
 
 internal sealed record AgentCaptureConfiguration
 {
+    [JsonIgnore]
+    public bool HasRetentionMaxBytes { get; init; } = true;
+
+    [JsonIgnore]
+    public bool HasRetentionMinFreeBytes { get; init; } = true;
+
     [JsonPropertyName("directory")]
     [JsonRequired]
     public string Directory { get; init; } = string.Empty;
@@ -851,11 +880,9 @@ internal sealed record AgentCaptureConfiguration
     public uint RetentionDays { get; init; }
 
     [JsonPropertyName("retention_max_bytes")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ulong? RetentionMaxBytes { get; init; }
 
     [JsonPropertyName("retention_min_free_bytes")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ulong? RetentionMinFreeBytes { get; init; }
 }
 

@@ -176,6 +176,8 @@ completed/accepted steps:
     { "revision": 42, "saved": true, "restart_scheduled": true }
 
 The revision is derived from canonical configuration content, so a no-op save
+does not represent a new software/configuration version. It is an opaque 64-bit
+conflict token; clients should not display it as a version or edit count. A no-op save
 can retain the same revision. A stale write returns `revision_conflict` with
 `expected_revision` and `current_revision` details. If persistence succeeds but
 the worker has already stopped, the response is the structured

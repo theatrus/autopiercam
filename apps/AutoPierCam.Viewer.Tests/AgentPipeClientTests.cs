@@ -1,12 +1,13 @@
 using System.Buffers.Binary;
 using System.IO.Pipes;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using AutoPierCam.Viewer;
 using Xunit;
 
 public sealed class AgentPipeClientTests
 {
-    private static async Task WithResponse(string method, object result, Func<AgentPipeClient, Task> assertion)
+    private static async Task WithResponse(string method, object result, Func<AgentPipeClient, Task> assertion, Action<JsonElement>? inspectRequest = null)
     {
         string name = $"apc-test-{Guid.NewGuid():N}";
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -21,6 +22,7 @@ public sealed class AgentPipeClientTests
             await server.ReadExactlyAsync(body, timeout.Token);
             using var request = JsonDocument.Parse(body);
             Assert.Equal(method, request.RootElement.GetProperty("method").GetString());
+            inspectRequest?.Invoke(request.RootElement);
             byte[] response = JsonSerializer.SerializeToUtf8Bytes(new {
                 version = 1, request_id = request.RootElement.GetProperty("request_id").GetString(), result });
             BinaryPrimitives.WriteInt32LittleEndian(prefix, response.Length);
@@ -31,6 +33,68 @@ public sealed class AgentPipeClientTests
         await using var client = new AgentPipeClient(name, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
         await assertion(client);
         await serve;
+    }
+
+    [Fact]
+    public async Task DefaultConfigurationRoundTripsThroughRealClientWithExplicitNullLimits()
+    {
+        var fixture = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        AgentConfigurationSnapshot? snapshot = null;
+        await WithResponse("config.get", new { revision = 12509826116217928070UL, config = fixture },
+            async client => snapshot = await client.GetConfigurationAsync());
+        var updated = snapshot!.Config with { Camera = snapshot.Config.Camera with { CameraId = 7, NameContains = "ASI676MC" } };
+        fixture["camera"]!["camera_id"] = 7;
+        fixture["camera"]!["name_contains"] = "ASI676MC";
+        await WithResponse("config.replace", new { revision = 1UL, saved = true, restart_scheduled = true },
+            client => client.ReplaceConfigurationAsync(snapshot.Revision, updated), request => {
+                var payload = request.GetProperty("payload");
+                Assert.Equal(snapshot.Revision, payload.GetProperty("expected_revision").GetUInt64());
+                Assert.True(JsonNode.DeepEquals(fixture, JsonNode.Parse(payload.GetProperty("config").GetRawText())));
+            });
+    }
+
+    [Theory]
+    [InlineData(1000000, 2000000)]
+    [InlineData(1000000, null)]
+    [InlineData(null, 2000000)]
+    public async Task ExistingLimitsCanBeExplicitlyDisabled(int? maxBytes, int? freeBytes)
+    {
+        var fixture = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        fixture["capture"]!["retention_max_bytes"] = maxBytes;
+        fixture["capture"]!["retention_min_free_bytes"] = freeBytes;
+        AgentConfigurationSnapshot? snapshot = null;
+        await WithResponse("config.get", new { revision = 1, config = fixture },
+            async client => snapshot = await client.GetConfigurationAsync());
+        Assert.Equal((ulong?)maxBytes, snapshot!.Config.Capture.RetentionMaxBytes);
+        Assert.Equal((ulong?)freeBytes, snapshot.Config.Capture.RetentionMinFreeBytes);
+        var updated = snapshot.Config with { Capture = snapshot.Config.Capture with { RetentionMaxBytes = null, RetentionMinFreeBytes = null } };
+        fixture["capture"]!["retention_max_bytes"] = null;
+        fixture["capture"]!["retention_min_free_bytes"] = null;
+        await WithResponse("config.replace", new { revision = 2, saved = true, restart_scheduled = true },
+            client => client.ReplaceConfigurationAsync(1, updated), request =>
+                Assert.True(JsonNode.DeepEquals(fixture, JsonNode.Parse(request.GetProperty("payload").GetProperty("config").GetRawText()))));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task RetentionPresenceIsPreservedIncludingLegacyAgents(bool maxPresent, bool freePresent)
+    {
+        var fixture = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        if (!maxPresent) fixture["capture"]!.AsObject().Remove("retention_max_bytes");
+        if (!freePresent) fixture["capture"]!.AsObject().Remove("retention_min_free_bytes");
+        AgentConfigurationSnapshot? snapshot = null;
+        await WithResponse("config.get", new { revision = 1, config = fixture },
+            async client => snapshot = await client.GetConfigurationAsync());
+        // Mirrors the Viewer's with-expression when controls are disabled.
+        var updated = snapshot!.Config with { Capture = snapshot.Config.Capture with {
+            RetentionMaxBytes = null, RetentionMinFreeBytes = null,
+        } };
+        await WithResponse("config.replace", new { revision = 2, saved = true, restart_scheduled = true },
+            client => client.ReplaceConfigurationAsync(1, updated), request =>
+                Assert.True(JsonNode.DeepEquals(fixture, JsonNode.Parse(request.GetProperty("payload").GetProperty("config").GetRawText()))));
     }
 
     [Fact]

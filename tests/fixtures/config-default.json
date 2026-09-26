@@ -1,0 +1,36 @@
+{
+  "camera": {
+    "camera_id": null,
+    "name_contains": null,
+    "width": null,
+    "height": null,
+    "bin": 1,
+    "min_exposure_us": 100,
+    "max_exposure_us": 60000000,
+    "max_gain": 300,
+    "target_brightness": 100,
+    "settle_frames": 6
+  },
+  "capture": {
+    "directory": "captures",
+    "interval_ms": 10000,
+    "jpeg_quality": 88,
+    "writer_queue_capacity": 2,
+    "keep_latest": true,
+    "retention_max_bytes": null,
+    "retention_min_free_bytes": null,
+    "retention_days": 14
+  },
+  "upload": {
+    "enabled": false,
+    "endpoint": null,
+    "bearer_token_env": null,
+    "queue_capacity": 32
+  },
+  "video": {
+    "enabled": false,
+    "segment_seconds": 300,
+    "frames_per_second": 4
+  },
+  "api": { "listen": "127.0.0.1:4762" }
+}
