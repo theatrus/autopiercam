@@ -38,11 +38,13 @@ public sealed partial class MainWindow : Window
     private int _operationGeneration;
     private bool _liveStatusUnavailable = true;
     private bool _closed;
+    private bool _captureNeedsReview;
 
     public MainWindow()
     {
         InitializeComponent();
         TrackSettingsEdits();
+        InitializeSharingSection();
         Title = "AutoPierCam";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "autopiercam.ico"));
         AppWindow.Resize(new SizeInt32(1180, 760));
@@ -82,6 +84,12 @@ public sealed partial class MainWindow : Window
                 AgentStatus? status = null;
                 try { status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false); }
                 catch (AgentClientException) { /* A later poll can recover. */ }
+                SharingStatus? sharing = null;
+                if (_sharingPollWanted)
+                {
+                    try { sharing = await client.GetSharingAsync(cancellationToken).ConfigureAwait(false); }
+                    catch (AgentClientException) { /* A later poll can recover. */ }
+                }
                 long received = System.Diagnostics.Stopwatch.GetTimestamp();
                 await RunOnDispatcherAsync(() => {
                     // Never let a response begun before a save/command undo its
@@ -92,6 +100,7 @@ public sealed partial class MainWindow : Window
                     if (!_operationInProgress)
                     {
                         if (status is not null) ApplyStatus(status);
+                        if (sharing is not null) ApplyPolledSharing(sharing);
                         else
                         {
                             _liveStatusUnavailable = true;
@@ -452,18 +461,7 @@ public sealed partial class MainWindow : Window
 
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_hasUnsavedSettings)
-        {
-            var confirm = new ContentDialog {
-                XamlRoot = Content.XamlRoot,
-                Title = "Discard unsaved settings?",
-                Content = "Reloading settings from the agent will discard your unsaved changes.",
-                PrimaryButtonText = "Discard and refresh",
-                CloseButtonText = "Keep editing",
-                DefaultButton = ContentDialogButton.Close,
-            };
-            if (await confirm.ShowAsync() != ContentDialogResult.Primary) return;
-        }
+        if ((_hasUnsavedSettings || _captureNeedsReview) && !await ConfirmDiscardAsync()) return;
         await RunUiOperationAsync(
             "Refreshing status and configuration…",
             RefreshStatusAndConfigurationAsync);
@@ -536,11 +534,20 @@ public sealed partial class MainWindow : Window
 
         AgentConfiguration updatedConfiguration =
             BuildConfigurationFromInputs(snapshot.Config);
-        AgentConfigurationReplaceResult result =
-            await _agentClient.ReplaceConfigurationAsync(
+        AgentConfigurationReplaceResult result;
+        try
+        {
+            result = await _agentClient.ReplaceConfigurationAsync(
                 snapshot.Revision,
                 updatedConfiguration,
                 cancellationToken);
+        }
+        catch (AgentRequestException exception) when (exception.IsRevisionConflict)
+        {
+            // Only a capture save offers Keep my edits; outbox conflicts do not.
+            _captureNeedsReview = true;
+            throw;
+        }
 
         _configurationSnapshot = new AgentConfigurationSnapshot
         {
@@ -1088,12 +1095,12 @@ public sealed partial class MainWindow : Window
         }
 
         AgentConfiguration configuration = snapshot.Config;
-        AdaptiveExposureCheckBox.IsChecked = configuration.Camera.ExposureControl == "adaptive";
-        Raw16CheckBox.IsChecked = configuration.Camera.Raw16 == true;
+        AdaptiveExposureToggle.IsOn = configuration.Camera.ExposureControl == "adaptive";
+        Raw16Toggle.IsOn = configuration.Camera.Raw16 == true;
         CameraNameFilterTextBox.Text = configuration.Camera.NameContains ?? string.Empty;
         double maxExposureMs = configuration.Camera.MaxExposureUs / 1000.0;
         double stillIntervalSeconds = configuration.Capture.IntervalMs / 1000.0;
-        MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureCheckBox.IsChecked == true ? 2_000_000 : 60_000, maxExposureMs);
+        MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureToggle.IsOn ? 2_000_000 : 60_000, maxExposureMs);
         MaxGainNumberBox.Maximum = Math.Max(600, configuration.Camera.MaxGain);
         StillIntervalNumberBox.Maximum = Math.Max(86_400, stillIntervalSeconds);
         MaxExposureNumberBox.Value = maxExposureMs;
@@ -1114,6 +1121,8 @@ public sealed partial class MainWindow : Window
         _configurationSnapshot = snapshot;
         _settingsBaseline = SettingsFormValues.FromConfiguration(configuration);
         _configurationNeedsRefresh = false;
+        _captureNeedsReview = false;
+        CaptureKeepEditsButton.Visibility = Visibility.Collapsed;
         ApplyUploadActivity(_latestAgentStatus?.Upload, configuration.Upload.Enabled);
         _hasUnsavedSettings = false;
         ConfigInfoBar.Title = "Settings loaded";
@@ -1209,9 +1218,9 @@ public sealed partial class MainWindow : Window
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
                 ExposureControl = _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true
-                    ? AdaptiveExposureCheckBox.IsChecked == true ? "adaptive" : null : original.Camera.ExposureControl,
+                    ? AdaptiveExposureToggle.IsOn ? "adaptive" : null : original.Camera.ExposureControl,
                 Raw16 = _latestAgentStatus?.HasCapability("camera.raw16") == true
-                    ? Raw16CheckBox.IsChecked == true ? true : null : original.Camera.Raw16,
+                    ? Raw16Toggle.IsOn ? true : null : original.Camera.Raw16,
                 NameContains = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice { Id: not null } choice
                     ? choice.NameFilter : NormalizeOptionalText(CameraNameFilterTextBox.Text),
                 CameraId = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice selection
@@ -1368,8 +1377,10 @@ public sealed partial class MainWindow : Window
         }
 
         _configurationNeedsRefresh = true;
-        string message =
-            "Settings were changed elsewhere. Select Reload settings before saving your changes.";
+        string message = _captureNeedsReview
+            ? "Settings changed elsewhere. Discard your edits to load them, or keep your edits to replace them on the next save."
+            : "Settings were changed elsewhere. Select Reload settings before saving your changes.";
+        CaptureKeepEditsButton.Visibility = _captureNeedsReview ? Visibility.Visible : Visibility.Collapsed;
         StatusText.Text = message;
         ConfigInfoBar.Title = "Settings changed elsewhere";
         ConfigInfoBar.Message = message;
@@ -1562,7 +1573,6 @@ public sealed partial class MainWindow : Window
         CaptureButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         PauseButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable && _latestAgentStatus?.State is "capturing" or "paused";
         PauseButton.Content = _latestAgentStatus?.State == "paused" ? "Resume recording" : "Pause recording";
-        SharingButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable && _latestAgentStatus?.HasCapability("sharing.get") == true;
 
         bool configurationControlsEnabled =
             generalControlsEnabled &&
@@ -1570,8 +1580,8 @@ public sealed partial class MainWindow : Window
             !_configurationNeedsRefresh;
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
-        AdaptiveExposureCheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
-        Raw16CheckBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
+        AdaptiveExposureToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
+        Raw16Toggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
         CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled &&
             (!_cameraInventoryLoaded || CameraComboBox.SelectedItem is not CameraChoice { Id: not null });
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
@@ -1580,18 +1590,23 @@ public sealed partial class MainWindow : Window
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
         FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
         SaveButton.IsEnabled = configurationControlsEnabled && !_liveStatusUnavailable && _hasUnsavedSettings;
+        CaptureDiscardButton.IsEnabled = generalControlsEnabled && _configurationSnapshot is not null &&
+            (_hasUnsavedSettings || _captureNeedsReview);
+        CaptureKeepEditsButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
 
         CameraComboBox.IsEnabled = configurationControlsEnabled && _cameraInventoryLoaded;
         RefreshCamerasButton.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("cameras.list") == true;
+        UpdateSharingPolling();
+        RenderSharing();
     }
 
     private void ExposureControl_Changed(object sender, RoutedEventArgs args)
     {
         if (MaxExposureNumberBox is not null)
         {
-            MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureCheckBox.IsChecked == true ? 2_000_000 : 60_000,
+            MaxExposureNumberBox.Maximum = Math.Max(AdaptiveExposureToggle.IsOn ? 2_000_000 : 60_000,
                 double.IsNaN(MaxExposureNumberBox.Value) ? 0 : MaxExposureNumberBox.Value);
         }
     }

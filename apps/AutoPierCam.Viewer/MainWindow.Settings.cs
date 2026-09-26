@@ -25,13 +25,9 @@ public sealed partial class MainWindow
         }
         foreach (TextBox input in new[] { CameraNameFilterTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
-        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle })
+        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
-        foreach (CheckBox input in new[] { AdaptiveExposureCheckBox, Raw16CheckBox })
-        {
-            input.Checked += (_, _) => MarkSettingsEdited();
-            input.Unchecked += (_, _) => MarkSettingsEdited();
-        }
+
     }
 
     private void MarkSettingsEdited()
@@ -48,6 +44,29 @@ public sealed partial class MainWindow
             ShowSettingsEditState();
             SetControlsForOperation(false);
         });
+    }
+
+    private async void CaptureDiscardButton_Click(object sender, RoutedEventArgs e) =>
+        await RunUiOperationAsync("Discarding unsaved settings…", RefreshStatusAndConfigurationAsync);
+
+    private async void CaptureKeepEditsButton_Click(object sender, RoutedEventArgs e) =>
+        await RunUiOperationAsync("Loading the latest settings to keep your edits…", KeepCaptureEditsAsync);
+
+    // Adopt the newer revision and hidden fields without touching the form,
+    // like SharingSetupState.KeepEdits. The next save replaces the other edit.
+    private async Task KeepCaptureEditsAsync(CancellationToken cancellationToken)
+    {
+        AgentConfigurationSnapshot latest = await _agentClient.GetConfigurationAsync(cancellationToken);
+        _configurationSnapshot = latest;
+        _settingsBaseline = SettingsFormValues.FromConfiguration(latest.Config);
+        _configurationNeedsRefresh = false;
+        _captureNeedsReview = false;
+        CaptureKeepEditsButton.Visibility = Visibility.Collapsed;
+        _hasUnsavedSettings = ReadSettingsForm() != _settingsBaseline;
+        ConfigInfoBar.Title = "Your edits are kept";
+        ConfigInfoBar.Message = "Saving will replace the settings that changed elsewhere.";
+        SetConfigurationFeedback(InfoBarSeverity.Informational, true);
+        StatusText.Text = "Your settings edits are kept; save to apply them.";
     }
 
     private void ShowSettingsEditState()
@@ -78,7 +97,7 @@ public sealed partial class MainWindow
             CameraId = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice choice
                 ? choice.Id : _configurationSnapshot?.Config.Camera.CameraId,
             CameraFilter = SettingsFormValues.Text(CameraNameFilterTextBox.Text),
-            Adaptive = AdaptiveExposureCheckBox.IsChecked == true, Raw16 = Raw16CheckBox.IsChecked == true,
+            Adaptive = AdaptiveExposureToggle.IsOn, Raw16 = Raw16Toggle.IsOn,
             Upload = UploadEnabledToggle.IsOn, Endpoint = SettingsFormValues.Text(UploadEndpointTextBox.Text),
             Video = VideoEnabledToggle.IsOn, Ffmpeg = SettingsFormValues.Text(FfmpegPathTextBox.Text)
         };

@@ -50,10 +50,6 @@
                 Orientation="Horizontal"
                 Spacing="8">
                 <Button
-                    x:Name="SharingButton"
-                    Click="SharingButton_Click"
-                    Content="Chatstronomy" />
-                <Button
                     x:Name="CaptureButton"
                     Click="CaptureButton_Click"
                     Content="Save next frame"
@@ -162,282 +158,438 @@
                     Visibility="Collapsed" />
             </Grid>
 
-            <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="12" Visibility="Collapsed">
+            <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="8" Visibility="Collapsed">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
-                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <StackPanel Spacing="8">
-                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="Capture settings" />
-                    <Button x:Name="RefreshButton" Click="RefreshButton_Click" Content="Reload settings"
-                            ToolTipService.ToolTip="Reload settings and camera discovery from the agent. The live preview updates automatically." />
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="Camera" />
-                        <ComboBox
-                            x:Name="CameraComboBox"
-                            DisplayMemberPath="Label"
-                            IsEnabled="False"
-                            HorizontalAlignment="Stretch"
-                            SelectionChanged="CameraComboBox_SelectionChanged"
-                            PlaceholderText="Agent not connected" />
-                        <Button x:Name="RefreshCamerasButton" Content="Refresh cameras" IsEnabled="False" Click="RefreshCamerasButton_Click" />
-                        <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
-                    </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="Settings" />
+                    <SelectorBar x:Name="SettingsSectionBar" SelectionChanged="SettingsSectionBar_SelectionChanged">
+                        <SelectorBarItem x:Name="CaptureSectionItem" Text="Capture" IsSelected="True" />
+                        <SelectorBarItem x:Name="SharingSectionItem" Text="Chatstronomy" />
+                    </SelectorBar>
                 </StackPanel>
-                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                <StackPanel Spacing="16">
-                    <Expander Header="Agent activity and storage" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
-                    <StackPanel Spacing="12">
-                    <Border Padding="12" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="4">
-                            <TextBlock
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Agent activity" />
-                            <TextBlock
-                                x:Name="FrameCountsText"
-                                Text="No status available" />
-                            <TextBlock
-                                x:Name="ExposureProgressText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Waiting for camera exposure status"
-                                TextWrapping="Wrap" />
-                            <TextBlock
-                                x:Name="LastArtifactText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Last artifact: none"
-                                TextTrimming="CharacterEllipsis"
-                                TextWrapping="NoWrap" />
-                            <TextBlock
-                                x:Name="AgentLastErrorText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                TextWrapping="Wrap"
-                                Visibility="Collapsed" />
+
+                <!-- Both sections share one layout: Reload at the top, scrolling
+                     fields, and a fixed footer with feedback, Discard and Save. -->
+                <Grid x:Name="CaptureSection" Grid.Row="1" RowSpacing="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Spacing="8">
+                        <Button x:Name="RefreshButton" Click="RefreshButton_Click" Content="Reload settings"
+                                ToolTipService.ToolTip="Reload settings and camera discovery from the agent. The live preview updates automatically." />
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Camera" />
+                            <ComboBox
+                                x:Name="CameraComboBox"
+                                DisplayMemberPath="Label"
+                                IsEnabled="False"
+                                HorizontalAlignment="Stretch"
+                                SelectionChanged="CameraComboBox_SelectionChanged"
+                                PlaceholderText="Agent not connected" />
+                            <Button x:Name="RefreshCamerasButton" Content="Refresh cameras" IsEnabled="False" Click="RefreshCamerasButton_Click" />
+                            <TextBlock x:Name="CameraHelpText" FontSize="12" TextWrapping="Wrap" Text="Connect to the agent to choose a camera." />
                         </StackPanel>
-                    </Border>
-                    <Border Padding="12" Style="{StaticResource CardBorderStyle}">
-                        <StackPanel Spacing="4">
-                            <Grid ColumnSpacing="8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
+                    </StackPanel>
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <StackPanel Spacing="16">
+                        <Expander Header="Agent activity and storage" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <StackPanel Spacing="12">
+                        <Border Padding="12" Style="{StaticResource CardBorderStyle}">
+                            <StackPanel Spacing="4">
                                 <TextBlock
-                                    VerticalAlignment="Center"
                                     FontSize="12"
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                    Text="Upload activity" />
-                                <Button
-                                    x:Name="ManageOutboxButton"
-                                    Grid.Column="1"
-                                    Padding="8,3"
-                                    Click="ManageOutboxButton_Click"
-                                    Content="Manage outbox"
+                                    Text="Agent activity" />
+                                <TextBlock
+                                    x:Name="FrameCountsText"
+                                    Text="No status available" />
+                                <TextBlock
+                                    x:Name="ExposureProgressText"
                                     FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Waiting for camera exposure status"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="LastArtifactText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Last artifact: none"
+                                    TextTrimming="CharacterEllipsis"
+                                    TextWrapping="NoWrap" />
+                                <TextBlock
+                                    x:Name="AgentLastErrorText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
                                     Visibility="Collapsed" />
-                            </Grid>
-                            <TextBlock
-                                x:Name="OutboxAvailabilityText"
-                                FontSize="12"
-                                Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                                Text="Outbox management is unavailable because the upload service is not running."
-                                TextWrapping="Wrap"
-                                Visibility="Collapsed" />
-                            <TextBlock
-                                x:Name="UploadActivityStateText"
-                                Text="Unavailable" />
-                            <TextBlock
-                                x:Name="UploadActivityCountsText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="No upload telemetry loaded"
-                                TextWrapping="Wrap" />
-                            <TextBlock
-                                x:Name="UploadActivityTotalsText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Visibility="Collapsed" />
-                            <TextBlock
-                                x:Name="UploadLastSuccessText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Visibility="Collapsed" />
-                            <TextBlock
-                                x:Name="UploadLastFailureText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                TextWrapping="Wrap"
-                                Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+                        <Border Padding="12" Style="{StaticResource CardBorderStyle}">
+                            <StackPanel Spacing="4">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        VerticalAlignment="Center"
+                                        FontSize="12"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="Upload activity" />
+                                    <Button
+                                        x:Name="ManageOutboxButton"
+                                        Grid.Column="1"
+                                        Padding="8,3"
+                                        Click="ManageOutboxButton_Click"
+                                        Content="Manage outbox"
+                                        FontSize="12"
+                                        Visibility="Collapsed" />
+                                </Grid>
+                                <TextBlock
+                                    x:Name="OutboxAvailabilityText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                                    Text="Outbox management is unavailable because the upload service is not running."
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="UploadActivityStateText"
+                                    Text="Unavailable" />
+                                <TextBlock
+                                    x:Name="UploadActivityCountsText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="No upload telemetry loaded"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="UploadActivityTotalsText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="UploadLastSuccessText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="UploadLastFailureText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+                        <Border
+                            x:Name="StorageStatusCard"
+                            Padding="12"
+                            Style="{StaticResource CardBorderStyle}"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="4">
+                                <TextBlock
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Storage retention" />
+                                <TextBlock
+                                    x:Name="StoragePressureText"
+                                    Text="Unavailable" />
+                                <TextBlock
+                                    x:Name="StorageBytesText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="StorageFreeText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="StorageSweepText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="StorageErrorText"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
                         </StackPanel>
-                    </Border>
-                    <Border
-                        x:Name="StorageStatusCard"
-                        Padding="12"
-                        Style="{StaticResource CardBorderStyle}"
-                        Visibility="Collapsed">
-                        <StackPanel Spacing="4">
-                            <TextBlock
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Storage retention" />
-                            <TextBlock
-                                x:Name="StoragePressureText"
-                                Text="Unavailable" />
-                            <TextBlock
-                                x:Name="StorageBytesText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                TextWrapping="Wrap" />
-                            <TextBlock
-                                x:Name="StorageFreeText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                TextWrapping="Wrap" />
-                            <TextBlock
-                                x:Name="StorageSweepText"
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                TextWrapping="Wrap" />
-                            <TextBlock
-                                x:Name="StorageErrorText"
-                                FontSize="12"
-                                Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                                TextWrapping="Wrap"
-                                Visibility="Collapsed" />
-                        </StackPanel>
-                    </Border>
-                    </StackPanel>
-                    </Expander>
-                    <Grid ColumnSpacing="10">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
+                        </Expander>
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Max exposure" />
+                                <NumberBox
+                                    x:Name="MaxExposureNumberBox"
+                                    Header="Milliseconds"
+                                    IsEnabled="False"
+                                    Maximum="60000"
+                                    Minimum="0.001"
+                                    SpinButtonPlacementMode="Compact"
+                                    Value="60000" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Spacing="6">
+                                <TextBlock Text="Max gain" />
+                                <NumberBox
+                                    x:Name="MaxGainNumberBox"
+                                    IsEnabled="False"
+                                    Maximum="600"
+                                    Minimum="0"
+                                    SpinButtonPlacementMode="Compact"
+                                    Value="300" />
+                            </StackPanel>
+                        </Grid>
+                        <TextBlock
+                            FontSize="12"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="30,000 ms = 30 seconds · 60,000 ms = 1 minute. Automatic exposure adapts within the camera's supported limit."
+                            TextWrapping="Wrap" />
+                        <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
+                                      IsEnabled="False" Toggled="ExposureControl_Changed" />
+                        <ToggleSwitch x:Name="Raw16Toggle" Header="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
+                        <TextBlock Text="Application control can exceed the SDK's 60-second auto limit, within the camera's manual range. RAW16 uses more storage."
+                                   FontSize="12" TextWrapping="Wrap" />
+                        <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
+                                 IsEnabled="False" />
                         <StackPanel Spacing="6">
-                            <TextBlock Text="Max exposure" />
+                            <TextBlock Text="Still interval" />
                             <NumberBox
-                                x:Name="MaxExposureNumberBox"
-                                Header="Milliseconds"
+                                x:Name="StillIntervalNumberBox"
+                                Header="Seconds"
                                 IsEnabled="False"
-                                Maximum="60000"
+                                Maximum="86400"
                                 Minimum="0.001"
                                 SpinButtonPlacementMode="Compact"
-                                Value="60000" />
+                                Value="10" />
                         </StackPanel>
-                        <StackPanel Grid.Column="1" Spacing="6">
-                            <TextBlock Text="Max gain" />
-                            <NumberBox
-                                x:Name="MaxGainNumberBox"
-                                IsEnabled="False"
-                                Maximum="600"
-                                Minimum="0"
-                                SpinButtonPlacementMode="Compact"
-                                Value="300" />
-                        </StackPanel>
-                    </Grid>
-                    <TextBlock
-                        FontSize="12"
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                        Text="30,000 ms = 30 seconds · 60,000 ms = 1 minute. Automatic exposure adapts within the camera's supported limit."
-                        TextWrapping="Wrap" />
-                    <CheckBox x:Name="AdaptiveExposureCheckBox" Content="Application-controlled day/night exposure"
-                              IsEnabled="False" Checked="ExposureControl_Changed" Unchecked="ExposureControl_Changed" />
-                    <CheckBox x:Name="Raw16CheckBox" Content="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
-                    <TextBlock Text="Application control can exceed the SDK's 60-second auto limit, within the camera's manual range. RAW16 uses more storage."
-                               FontSize="12" TextWrapping="Wrap" />
-                    <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
-                             IsEnabled="False" />
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="Still interval" />
-                        <NumberBox
-                            x:Name="StillIntervalNumberBox"
-                            Header="Seconds"
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Managed image limit" />
+                                <NumberBox
+                                    x:Name="RetentionMaxMiBNumberBox"
+                                    Header="MiB · blank disables"
+                                    IsEnabled="False"
+                                    Maximum="8796093022208"
+                                    Minimum="1"
+                                    PlaceholderText="Disabled"
+                                    SmallChange="128"
+                                    SpinButtonPlacementMode="Compact" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Spacing="6">
+                                <TextBlock Text="Minimum disk free" />
+                                <NumberBox
+                                    x:Name="RetentionMinFreeMiBNumberBox"
+                                    Header="MiB · blank disables"
+                                    IsEnabled="False"
+                                    Maximum="8796093022208"
+                                    Minimum="1"
+                                    PlaceholderText="Disabled"
+                                    SmallChange="128"
+                                    SpinButtonPlacementMode="Compact" />
+                            </StackPanel>
+                        </Grid>
+                        <TextBlock
+                            x:Name="RetentionSettingsAvailabilityText"
+                            FontSize="12"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="Retention limits are read-only because this agent does not advertise retention management."
+                            TextWrapping="Wrap"
+                            Visibility="Collapsed" />
+                        <ToggleSwitch
+                            x:Name="UploadEnabledToggle"
+                            Header="HTTP upload"
                             IsEnabled="False"
-                            Maximum="86400"
-                            Minimum="0.001"
-                            SpinButtonPlacementMode="Compact"
-                            Value="10" />
+                            OffContent="Disabled"
+                            OnContent="Enabled" />
+                        <TextBox
+                            x:Name="UploadEndpointTextBox"
+                            Header="Upload endpoint"
+                            IsEnabled="False"
+                            PlaceholderText="https://example.test/camera/latest" />
+                        <ToggleSwitch
+                            x:Name="VideoEnabledToggle"
+                            Header="Security video"
+                            IsEnabled="False"
+                            OffContent="Disabled"
+                            OnContent="Enabled" />
+                        <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
+                                 PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
+                        <TextBlock Text="Security recording saves H.264 MP4 segments from previews (up to 2 fps). Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
+                                   TextWrapping="Wrap" />
                     </StackPanel>
-                    <Grid ColumnSpacing="10">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Spacing="6">
-                            <TextBlock Text="Managed image limit" />
-                            <NumberBox
-                                x:Name="RetentionMaxMiBNumberBox"
-                                Header="MiB · blank disables"
+                    </ScrollViewer>
+                    <StackPanel Grid.Row="2" Spacing="8">
+                        <InfoBar
+                            x:Name="ConfigInfoBar"
+                            IsClosable="False"
+                            IsOpen="False"
+                            IsIconVisible="False"
+                            Message="Connect to the local agent to load settings."
+                            Severity="Informational">
+                            <InfoBar.ActionButton>
+                                <Button x:Name="CaptureKeepEditsButton" Content="Keep my edits"
+                                        Click="CaptureKeepEditsButton_Click" Visibility="Collapsed" />
+                            </InfoBar.ActionButton>
+                        </InfoBar>
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                x:Name="CaptureDiscardButton"
+                                HorizontalAlignment="Stretch"
+                                Click="CaptureDiscardButton_Click"
+                                Content="Discard changes"
+                                IsEnabled="False" />
+                            <Button
+                                x:Name="SaveButton"
+                                Grid.Column="1"
+                                HorizontalAlignment="Stretch"
+                                Click="SaveButton_Click"
+                                Content="Save settings"
                                 IsEnabled="False"
-                                Maximum="8796093022208"
-                                Minimum="1"
-                                PlaceholderText="Disabled"
-                                SmallChange="128"
-                                SpinButtonPlacementMode="Compact" />
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </Grid>
+                    </StackPanel>
+                </Grid>
+
+                <Grid x:Name="SharingSection" Grid.Row="1" RowSpacing="12" Visibility="Collapsed">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Spacing="8">
+                        <Button x:Name="SharingReloadButton" Click="SharingReloadButton_Click" Content="Reload settings"
+                                ToolTipService.ToolTip="Reload Chatstronomy settings from the agent. Connection status updates automatically." />
+                        <TextBlock x:Name="SharingConnectionText" TextWrapping="Wrap" Text="Not loaded" />
+                    </StackPanel>
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="SharingFields" Spacing="16">
+                            <StackPanel x:Name="SharingPairingGroup" Spacing="10">
+                                <TextBlock FontSize="16" FontWeight="SemiBold" Text="Pair with your Hub" />
+                                <TextBlock TextWrapping="Wrap"
+                                           Text="In the Hub, open Observatory devices, add a pier camera, attach it to a server, pick its channels, and choose Pair camera." />
+                                <TextBox x:Name="SharingOriginTextBox" Header="Hub HTTPS origin" PlaceholderText="https://your-chatstronomy-hub" />
+                                <PasswordBox x:Name="SharingCodePasswordBox" Header="One-use device pairing code" PlaceholderText="Paste code from the Hub" />
+                                <Button x:Name="SharingPairButton" Click="SharingPairButton_Click" Content="Pair camera" />
+                                <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Text="Pairing keeps your settings below. It does not start sharing." />
+                            </StackPanel>
+                            <StackPanel Spacing="10">
+                                <TextBlock FontSize="16" FontWeight="SemiBold" Text="Choose what to share" />
+                                <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Text="The full preview goes to the channels selected in the Hub. Snapshot now uses the latest completed frame (up to 120 seconds old); it does not change exposure." />
+                                <ToggleSwitch x:Name="SharingEnabledToggle" Header="Enable image sharing" />
+                                <Button x:Name="SharingStopButton" Click="SharingStopButton_Click" Content="Stop sharing now"
+                                        ToolTipService.ToolTip="Turn sharing off immediately using the saved settings. Your other edits stay here." />
+                                <ToggleSwitch x:Name="SharingSnapshotsToggle" Header="Allow Snapshot now requests" />
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Send an image every" />
+                                    <NumberBox x:Name="SharingIntervalNumberBox" Header="Minutes · 0 = off"
+                                               Minimum="0" Maximum="1440" SmallChange="1" SpinButtonPlacementMode="Compact" />
+                                </StackPanel>
+                                <Expander Header="Scene and telescope events" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                                    <StackPanel Spacing="10">
+                                        <ToggleSwitch x:Name="SharingScenesToggle" Header="Send when the scene changes" />
+                                        <StackPanel Spacing="6">
+                                            <TextBlock Text="Changed area threshold" />
+                                            <NumberBox x:Name="SharingThresholdNumberBox" Header="Percent · 5–80"
+                                                       Minimum="5" Maximum="80" SmallChange="1" SpinButtonPlacementMode="Compact" />
+                                        </StackPanel>
+                                        <ToggleSwitch x:Name="SharingDayNightToggle" Header="Send on day / night transitions" />
+                                        <ToggleSwitch x:Name="SharingTelescopeToggle" Header="Send on slew / sequence events" />
+                                        <Grid ColumnSpacing="10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Spacing="6">
+                                                <TextBlock Text="Images per event" />
+                                                <NumberBox x:Name="SharingBurstNumberBox" Header="1–3"
+                                                           Minimum="1" Maximum="3" SmallChange="1" SpinButtonPlacementMode="Compact" />
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Spacing="6">
+                                                <TextBlock Text="Time between images" />
+                                                <NumberBox x:Name="SharingSpacingNumberBox" Header="Seconds · 60–600"
+                                                           Minimum="60" Maximum="600" SmallChange="10" SpinButtonPlacementMode="Compact" />
+                                            </StackPanel>
+                                        </Grid>
+                                        <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                   Text="Scene changes are not person or threat detection. Telescope events require the same owner and a shared Hub channel. Bursts wait for distinct completed frames; busy events are coalesced. The Hub posts at most one image per minute." />
+                                    </StackPanel>
+                                </Expander>
+                                <Expander Header="Chat control" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                                    <StackPanel Spacing="10">
+                                        <ToggleSwitch x:Name="SharingChatToggle" Header="Allow the camera owner to adjust triggers in chat" />
+                                        <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                   Text="Chat can turn permitted triggers off, slow sends, or reduce bursts. It cannot enable a source you disabled or exceed your limits. Saving settings resets chat overrides." />
+                                    </StackPanel>
+                                </Expander>
+                                <Expander Header="Connection details / change Hub" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                                    <StackPanel Spacing="10">
+                                        <TextBlock x:Name="SharingDetailsText" IsTextSelectionEnabled="True" TextWrapping="Wrap" />
+                                        <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                   Text="To change Hub, forget this pairing first. This clears saved permissions. Revoke the credential in the Hub too." />
+                                        <CheckBox x:Name="SharingForgetConsentCheckBox" Content="Remove pairing and clear sharing permissions"
+                                                  Checked="SharingForgetConsent_Changed" Unchecked="SharingForgetConsent_Changed" />
+                                        <Button x:Name="SharingForgetButton" Click="SharingForgetButton_Click" Content="Forget pairing" />
+                                    </StackPanel>
+                                </Expander>
+                                <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Text="Stopping sharing disconnects and discards queued images. Messages already posted cannot be recalled. Retries may duplicate a post after a Hub crash." />
+                            </StackPanel>
                         </StackPanel>
-                        <StackPanel Grid.Column="1" Spacing="6">
-                            <TextBlock Text="Minimum disk free" />
-                            <NumberBox
-                                x:Name="RetentionMinFreeMiBNumberBox"
-                                Header="MiB · blank disables"
+                    </ScrollViewer>
+                    <StackPanel Grid.Row="2" Spacing="8">
+                        <InfoBar
+                            x:Name="SharingInfoBar"
+                            IsClosable="False"
+                            IsOpen="False"
+                            IsIconVisible="False"
+                            Severity="Informational">
+                            <InfoBar.ActionButton>
+                                <Button x:Name="SharingKeepEditsButton" Content="Keep my edits"
+                                        Click="SharingKeepEditsButton_Click" Visibility="Collapsed" />
+                            </InfoBar.ActionButton>
+                        </InfoBar>
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                x:Name="SharingDiscardButton"
+                                HorizontalAlignment="Stretch"
+                                Click="SharingDiscardButton_Click"
+                                Content="Discard changes"
+                                IsEnabled="False" />
+                            <Button
+                                x:Name="SharingSaveButton"
+                                Grid.Column="1"
+                                HorizontalAlignment="Stretch"
+                                Click="SharingSaveButton_Click"
+                                Content="Save settings"
                                 IsEnabled="False"
-                                Maximum="8796093022208"
-                                Minimum="1"
-                                PlaceholderText="Disabled"
-                                SmallChange="128"
-                                SpinButtonPlacementMode="Compact" />
-                        </StackPanel>
-                    </Grid>
-                    <TextBlock
-                        x:Name="RetentionSettingsAvailabilityText"
-                        FontSize="12"
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                        Text="Retention limits are read-only because this agent does not advertise retention management."
-                        TextWrapping="Wrap"
-                        Visibility="Collapsed" />
-                    <ToggleSwitch
-                        x:Name="UploadEnabledToggle"
-                        Header="HTTP upload"
-                        IsEnabled="False"
-                        OffContent="Disabled"
-                        OnContent="Enabled" />
-                    <TextBox
-                        x:Name="UploadEndpointTextBox"
-                        Header="Upload endpoint"
-                        IsEnabled="False"
-                        PlaceholderText="https://example.test/camera/latest" />
-                    <ToggleSwitch
-                        x:Name="VideoEnabledToggle"
-                        Header="Security video"
-                        IsEnabled="False"
-                        OffContent="Disabled"
-                        OnContent="Enabled" />
-                    <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
-                             PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
-                    <TextBlock Text="Security recording saves H.264 MP4 segments from previews (up to 2 fps). Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
-                               TextWrapping="Wrap" />
-                </StackPanel>
-                </ScrollViewer>
-                <StackPanel Grid.Row="2" Spacing="8">
-                    <InfoBar
-                        x:Name="ConfigInfoBar"
-                        IsClosable="False"
-                        IsOpen="False"
-                        IsIconVisible="False"
-                        Message="Connect to the local agent to load settings."
-                        Severity="Informational" />
-                    <Button
-                        x:Name="SaveButton"
-                        HorizontalAlignment="Stretch"
-                        Click="SaveButton_Click"
-                        Content="Save settings"
-                        IsEnabled="False"
-                        Style="{StaticResource AccentButtonStyle}" />
-                </StackPanel>
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </Grid>
+                    </StackPanel>
+                </Grid>
             </Grid>
         </Grid>
     </Grid>

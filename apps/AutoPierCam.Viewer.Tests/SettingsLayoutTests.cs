@@ -62,4 +62,81 @@ public sealed class SettingsLayoutTests
         Assert.DoesNotContain(element.Ancestors(), ancestor => ancestor.Name.LocalName == "ScrollViewer");
         if (name == "SaveButton") Assert.Equal("Save settings", (string?)element.Attribute("Content"));
     }
+
+    private static XElement Named(XDocument markup, string name)
+    {
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        return Assert.Single(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == name);
+    }
+
+    private static XDocument Markup() => XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+
+    [Fact]
+    public void ChatstronomyIsASettingsSectionNotAToolbarButton()
+    {
+        var markup = Markup();
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        Assert.DoesNotContain(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "SharingButton");
+        var bar = Named(markup, "SettingsSectionBar");
+        Assert.Equal("SelectorBar", bar.Name.LocalName);
+        Assert.Equal(["Capture", "Chatstronomy"], bar.Elements().Select(e => (string?)e.Attribute("Text")));
+        foreach (string section in new[] { "CaptureSection", "SharingSection" })
+            Assert.Contains(Named(markup, section).Ancestors(), e => (string?)e.Attribute(xaml + "Name") == "SettingsPane");
+        Assert.Equal("Collapsed", (string?)Named(markup, "SharingSection").Attribute("Visibility"));
+    }
+
+    [Theory]
+    [InlineData("CaptureSection", "RefreshButton", "CaptureDiscardButton", "SaveButton", "ConfigInfoBar", "CaptureKeepEditsButton")]
+    [InlineData("SharingSection", "SharingReloadButton", "SharingDiscardButton", "SharingSaveButton", "SharingInfoBar", "SharingKeepEditsButton")]
+    public void BothSectionsShareReloadDiscardSaveAndReviewLayout(
+        string section, string reload, string discard, string save, string infoBar, string keepEdits)
+    {
+        var markup = Markup();
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        foreach (var (name, content) in new[] {
+            (reload, "Reload settings"), (discard, "Discard changes"), (save, "Save settings") })
+        {
+            var button = Named(markup, name);
+            Assert.Equal(content, (string?)button.Attribute("Content"));
+            Assert.Contains(button.Ancestors(), e => (string?)e.Attribute(xaml + "Name") == section);
+            Assert.DoesNotContain(button.Ancestors(), e => e.Name.LocalName == "ScrollViewer");
+        }
+        Assert.Equal("{StaticResource AccentButtonStyle}", (string?)Named(markup, save).Attribute("Style"));
+        var bar = Named(markup, infoBar);
+        Assert.DoesNotContain(bar.Ancestors(), e => e.Name.LocalName == "ScrollViewer");
+        var keep = Named(markup, keepEdits);
+        Assert.Equal("Keep my edits", (string?)keep.Attribute("Content"));
+        Assert.Equal("Collapsed", (string?)keep.Attribute("Visibility"));
+        Assert.Contains(keep.Ancestors(), e => e == bar);
+    }
+
+    [Theory]
+    [InlineData("StillIntervalNumberBox")]
+    [InlineData("SharingIntervalNumberBox")]
+    [InlineData("SharingThresholdNumberBox")]
+    [InlineData("SharingBurstNumberBox")]
+    [InlineData("SharingSpacingNumberBox")]
+    public void NumbersUseBoundedNumberBoxesWithALabelAndUnitInBothSections(string name)
+    {
+        var box = Named(Markup(), name);
+        Assert.Equal("NumberBox", box.Name.LocalName);
+        Assert.NotNull(box.Attribute("Minimum"));
+        Assert.NotNull(box.Attribute("Maximum"));
+        Assert.Equal("Compact", (string?)box.Attribute("SpinButtonPlacementMode"));
+        var label = box.ElementsBeforeSelf().Last();
+        Assert.Equal("TextBlock", label.Name.LocalName);
+    }
+
+    [Fact]
+    public void OnOffSettingsUseToggleSwitchesInBothSections()
+    {
+        var markup = Markup();
+        foreach (string name in new[] { "AdaptiveExposureToggle", "Raw16Toggle", "UploadEnabledToggle",
+            "SharingEnabledToggle", "SharingSnapshotsToggle", "SharingScenesToggle" })
+            Assert.Equal("ToggleSwitch", Named(markup, name).Name.LocalName);
+        // The only checkbox left confirms forgetting a pairing.
+        var boxes = markup.Descendants().Where(e => e.Name.LocalName == "CheckBox").ToList();
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        Assert.Equal(["SharingForgetConsentCheckBox"], boxes.Select(e => (string?)e.Attribute(xaml + "Name")));
+    }
 }
