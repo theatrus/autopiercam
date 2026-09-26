@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.5 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.6 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.5)](https://github.com/theatrus/autopiercam/releases/download/v0.2.5/AutoPierCam-0.2.5-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.5)
+[Download the signed Windows x64 installer (0.2.6)](https://github.com/theatrus/autopiercam/releases/download/v0.2.6/AutoPierCam-0.2.6-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.6)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -64,9 +64,10 @@ The repository now contains a hardware-validated background capture slice:
 - a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
   Camera** panel to the Imaging tab.
 
-Version 0.2.5 fixes Chatstronomy numeric validation, tracks scene changes against
-the last delivered report, and reports SDK-auto lighting mode. It also replaces
-large telemetry cards with a compact summary and clarifies live-view actions.
+Version 0.2.6 shows images skipped by the Chatstronomy Hub's one-per-minute
+limit as skipped rather than declined. Version 0.2.5 fixed Chatstronomy numeric
+validation, tracks scene changes against the last delivered report, and reports
+SDK-auto lighting mode.
 
 The Viewer includes full-HD previews, hides settings until needed, and moves verbose
 diagnostics into Details. Ordinary settings saves no longer restart capture or
@@ -76,7 +77,7 @@ repeat settling; camera and RAW-format changes still restart. The updated NINA p
 
 ## Install on Windows
 
-Version 0.2.5 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
+Version 0.2.6 includes opt-in Chatstronomy image sharing: choose **Chatstronomy**
 in the Viewer to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
