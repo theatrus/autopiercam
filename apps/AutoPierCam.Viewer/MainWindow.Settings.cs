@@ -64,7 +64,7 @@ public sealed partial class MainWindow
         CaptureKeepEditsButton.Visibility = Visibility.Collapsed;
         _hasUnsavedSettings = ReadSettingsForm() != _settingsBaseline;
         ConfigInfoBar.Title = "Your edits are kept";
-        ConfigInfoBar.Message = "Saving will replace the settings that changed elsewhere.";
+        ConfigInfoBar.Message = "Save will overwrite the other changes.";
         SetConfigurationFeedback(InfoBarSeverity.Informational, true);
         StatusText.Text = "Your settings edits are kept; save to apply them.";
     }
@@ -73,7 +73,7 @@ public sealed partial class MainWindow
     {
         ConfigInfoBar.Title = _hasUnsavedSettings ? "Unsaved changes" : "Settings loaded";
         ConfigInfoBar.Message = _hasUnsavedSettings
-            ? "Save applies settings without restarting capture. Changing camera or RAW format requires a restart."
+            ? "Save applies changes. Only camera or RAW format changes restart capture."
             : "Settings match the saved configuration.";
         SetConfigurationFeedback(InfoBarSeverity.Informational, _hasUnsavedSettings);
     }

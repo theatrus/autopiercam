@@ -19,7 +19,7 @@ public sealed partial class MainWindow
             _cameraInventoryLoaded = false;
             CameraComboBox.ItemsSource = null;
             CameraComboBox.PlaceholderText = "Upgrade the agent to choose a camera";
-            CameraHelpText.Text = "This agent does not support camera discovery. The model filter below remains available.";
+            CameraHelpText.Text = "Update the agent to list cameras, or use the model filter.";
             return;
         }
         CameraInventory inventory = await _agentClient.GetCamerasAsync(cancellationToken);
@@ -35,7 +35,7 @@ public sealed partial class MainWindow
         CameraHelpText.Text = scan + (inventory.Error is not null
             ? $"Discovery failed: {inventory.Error}. "
             : inventory.Cameras.Any(camera => camera.IsColor) ? string.Empty : "No supported color cameras detected. ") +
-            "Camera discovery is cached while acquiring to avoid interrupting capture. Restart the tray agent to discover newly attached cameras. After a camera fault, discovery retries automatically (up to 30 seconds). IDs may change after USB reconnects.";
+            "Cached during capture. Restart the agent after connecting a camera. After a fault, discovery retries within 30 s. USB reconnects may change IDs.";
     }
 
     private async void RefreshCamerasButton_Click(object sender, RoutedEventArgs args)

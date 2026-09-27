@@ -5,6 +5,36 @@ using Xunit;
 public sealed class SettingsLayoutTests
 {
     [Fact]
+    public void HeaderUsesCompactBrandingAndPreservesStatusAndActions()
+    {
+        var markup = Markup();
+        var header = Named(markup, "HeaderBar");
+        Assert.Equal("16,6", (string?)header.Attribute("Padding"));
+        Assert.Equal("16", (string?)Named(markup, "BrandNameText").Attribute("FontSize"));
+        var logo = Named(markup, "BrandLogo");
+        Assert.Equal("32", (string?)logo.Attribute("Width"));
+        Assert.Equal("32", (string?)logo.Attribute("Height"));
+        Assert.Equal("ms-appx:///Assets/autopiercam.png", (string?)logo.Attribute("Source"));
+        foreach (string name in new[] { "BrandLogo", "StatusText", "CaptureButton", "PauseButton", "SettingsButton" })
+            Assert.Contains(header, Named(markup, name).Ancestors());
+        Assert.NotNull(Named(markup, "StatusText").Attribute("ToolTipService.ToolTip"));
+        var project = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "Viewer.csproj"));
+        var asset = Assert.Single(project.Descendants("Content"), e => (string?)e.Attribute("Link") == @"Assets\autopiercam.png");
+        Assert.Equal("PreserveNewest", (string?)asset.Attribute("CopyToOutputDirectory"));
+        Assert.Equal("PreserveNewest", (string?)asset.Attribute("CopyToPublishDirectory"));
+    }
+
+    [Fact]
+    public void PreviewDetailsContainLiveDiagnosticsNotResolutionBoilerplate()
+    {
+        var markup = Markup();
+        var details = Named(markup, "PreviewDiagnosticsText").Parent!;
+        Assert.Equal(2, details.Elements().Count()); // heading and live data
+        Assert.DoesNotContain(markup.Descendants().Attributes("Text"), a =>
+            a.Value.Contains("1920-pixel long edge") || a.Value.Contains("full sensor by default"));
+    }
+
+    [Fact]
     public void ReloadIsInSettingsAndManualStillIsNotALiveRefresh()
     {
         var markup = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
