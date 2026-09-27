@@ -164,6 +164,10 @@ edits** (adopt the newer revision and replace it on the next save) or **Discard
 changes**. Hiding the panel or switching sections keeps edits; the Settings
 button shows a dot while either section has unsaved changes.
 
+The compact header uses the existing AutoPierCam logo, a two-line name/status
+block, and the three capture/settings actions. Preview Details shows live
+diagnostics only.
+
 Each section has one width-constrained vertical form viewport with scrollbar
 clearance; the camera picker scrolls with the capture fields and discovery help
 lives in a flyout. Long numeric fields stack vertically. At narrow window widths

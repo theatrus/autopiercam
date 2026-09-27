@@ -43,6 +43,10 @@
              Link="autopiercam.ico"
              CopyToOutputDirectory="PreserveNewest"
              CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\branding\png\autopiercam-128.png"
+             Link="Assets\autopiercam.png"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- The Windows App SDK publish pipeline omits compiled XAML and the PRI

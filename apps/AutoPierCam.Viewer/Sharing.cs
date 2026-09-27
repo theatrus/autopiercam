@@ -171,9 +171,9 @@ public sealed partial class MainWindow
         // edit state. Hidden when there is nothing to say.
         (string Title, string Message, InfoBarSeverity Severity)? state =
             !supported ? ("Unavailable", "Update the AutoPierCam agent to share images with Chatstronomy.", InfoBarSeverity.Warning)
-            : _sharingStatusUnknown ? ("Status unknown", "Agent status could not be confirmed. Reload settings before saving or pairing.", InfoBarSeverity.Warning)
-            : review ? ("Settings changed elsewhere", "Settings changed in the agent or chat. Discard your edits to load them, or keep your edits to replace them on the next save.", InfoBarSeverity.Error)
-            : SharingHasEdits ? ("Unsaved changes", "Save applies your sharing choices. Saving resets chat overrides.", InfoBarSeverity.Informational)
+            : _sharingStatusUnknown ? ("Status unknown", "Reload settings before saving or pairing.", InfoBarSeverity.Warning)
+            : review ? ("Settings changed elsewhere", "Discard to load the new settings. Keep edits to overwrite them on Save.", InfoBarSeverity.Error)
+            : SharingHasEdits ? ("Unsaved changes", "Save applies changes and clears chat overrides.", InfoBarSeverity.Informational)
             : _sharing?.HasChatOverrides == true ? ("Chat overrides active", "Save settings to restore your local trigger choices.", InfoBarSeverity.Informational)
             : loaded && !paired ? ("Not paired", "Pair above, then enable sharing and save.", InfoBarSeverity.Informational)
             : null;

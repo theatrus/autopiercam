@@ -12,38 +12,51 @@
         </Grid.RowDefinitions>
 
         <Grid
+            x:Name="HeaderBar"
             Grid.Row="0"
-            Padding="24,18"
+            Padding="16,6"
             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <StackPanel Spacing="2">
-                <TextBlock
-                    FontSize="24"
-                    FontWeight="SemiBold"
-                    Text="AutoPierCam" />
-                <Grid ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <FontIcon
-                        x:Name="StatusWarningIcon"
-                        FontFamily="Segoe MDL2 Assets"
-                        FontSize="12"
-                        Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                        Glyph="&#xE783;"
-                        Visibility="Collapsed" />
+            <Grid ColumnSpacing="10" Margin="0,0,12,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Image x:Name="BrandLogo" Source="ms-appx:///Assets/autopiercam.png"
+                       Width="32" Height="32" Stretch="Uniform" VerticalAlignment="Center"
+                       AutomationProperties.Name="AutoPierCam logo" />
+                <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
                     <TextBlock
-                        x:Name="StatusText"
-                        Grid.Column="1"
-                        TextTrimming="CharacterEllipsis"
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                        Text="Waiting for the local capture agent" />
-                </Grid>
-            </StackPanel>
+                        x:Name="BrandNameText"
+                        FontSize="16"
+                        FontWeight="SemiBold"
+                        Text="AutoPierCam" />
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <FontIcon
+                            x:Name="StatusWarningIcon"
+                            FontFamily="Segoe MDL2 Assets"
+                            FontSize="12"
+                            Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                            Glyph="&#xE783;"
+                            Visibility="Collapsed" />
+                        <TextBlock
+                            x:Name="StatusText"
+                            FontSize="12"
+                            Grid.Column="1"
+                            TextTrimming="CharacterEllipsis"
+                            ToolTipService.ToolTip="{Binding Text, ElementName=StatusText}"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="Connecting…" />
+                    </Grid>
+                </StackPanel>
+            </Grid>
             <StackPanel
                 Grid.Column="1"
                 VerticalAlignment="Center"
@@ -53,7 +66,7 @@
                     x:Name="CaptureButton"
                     Click="CaptureButton_Click"
                     Content="Save next frame"
-                    ToolTipService.ToolTip="Save an extra full-resolution still when the current exposure completes. This does not send an image to chat."
+                    ToolTipService.ToolTip="Save the next completed frame to disk."
                     Style="{StaticResource AccentButtonStyle}" />
                 <Button x:Name="PauseButton" Content="Pause recording" IsEnabled="False" Click="PauseButton_Click" />
                 <Button x:Name="SettingsButton" Content="Settings" Click="SettingsButton_Click" />
@@ -96,11 +109,11 @@
                                 Glyph="&#xE722;" />
                             <TextBlock
                                 Foreground="#FFCBD5E1"
-                                Text="Live preview will appear here" />
+                                Text="Waiting for a frame" />
                             <TextBlock
                                 FontSize="12"
                                 Foreground="#FF718096"
-                                Text="Frames appear as each exposure completes" />
+                                Text="Updates after each exposure" />
                         </StackPanel>
                         <Border
                             Margin="12"
@@ -122,8 +135,6 @@
                                     <StackPanel Width="380" Spacing="12">
                                         <TextBlock Text="Preview details" FontSize="18" FontWeight="SemiBold" />
                                         <TextBlock x:Name="PreviewDiagnosticsText" Text="Waiting for preview stream" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                                        <TextBlock Text="The preview is reduced to a 1920-pixel long edge (full HD for 16:9 cameras). Saved stills use the capture dimensions (full sensor by default), not the preview size. Security video uses the preview resolution."
-                                                   TextWrapping="Wrap" />
                                     </StackPanel>
                                 </Flyout>
                             </Button.Flyout>
@@ -180,7 +191,7 @@
                     </Grid.RowDefinitions>
                     <StackPanel Spacing="8">
                         <Button x:Name="RefreshButton" Click="RefreshButton_Click" Content="Reload settings"
-                                ToolTipService.ToolTip="Reload settings and camera discovery from the agent. The live preview updates automatically." />
+                                ToolTipService.ToolTip="Reload saved settings and the cached camera list." />
                     </StackPanel>
                     <ScrollViewer x:Name="CaptureSettingsScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled" HorizontalScrollMode="Disabled"
@@ -262,7 +273,7 @@
                                     x:Name="OutboxAvailabilityText"
                                     FontSize="12"
                                     Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                                    Text="Outbox management is unavailable because the upload service is not running."
+                                    Text="Upload service is stopped."
                                     TextWrapping="Wrap"
                                     Visibility="Collapsed" />
                                 <TextBlock
@@ -356,7 +367,7 @@
                         <TextBlock
                             FontSize="12"
                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Text="30,000 ms = 30 seconds · 60,000 ms = 1 minute. Automatic exposure adapts within the camera's supported limit."
+                            Text="30,000 ms = 30 s · 60,000 ms = 1 min"
                             TextWrapping="Wrap" />
                         <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
                                       IsEnabled="False" Toggled="ExposureControl_Changed" />
@@ -367,12 +378,12 @@
                             <ToggleSwitch x:Name="PreferShortExposuresToggle" Header="Prefer shorter exposures"
                                           IsEnabled="False" />
                             <TextBlock x:Name="GainControlHelpText" FontSize="12" TextWrapping="Wrap"
-                                       Text="Application control is required for a gain floor. SDK auto can lower gain below your preference." />
+                                       Text="Minimum gain requires application control." />
                             <TextBlock FontSize="12" TextWrapping="Wrap"
-                                       Text="For a floor of 200, set minimum gain to 200 and maximum to 300; set both to 200 for fixed gain. Shorter exposures raises gain first, trading noise for cadence. Maximum exposure still limits shutter time; preview rate is a cap, not a guaranteed frame rate." />
+                                       Text="Equal gain limits hold gain fixed. Shorter exposures raises gain first, increasing noise." />
                         </StackPanel>
                         <ToggleSwitch x:Name="Raw16Toggle" Header="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
-                        <TextBlock Text="Application control can exceed the SDK's 60-second auto limit, within the camera's manual range. RAW16 uses more storage."
+                        <TextBlock Text="Application control allows exposures over 60 s. RAW16 saves larger PNGs."
                                    FontSize="12" TextWrapping="Wrap" />
                         <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
                                  IsEnabled="False" />
@@ -381,7 +392,7 @@
                             <NumberBox x:Name="PreviewMaxFpsNumberBox" Header="Frames per second"
                                        Minimum="1" Maximum="30" SmallChange="1" LargeChange="5"
                                        SpinButtonPlacementMode="Compact" Value="2" IsEnabled="False" />
-                            <TextBlock Text="Default 2 fps. Short exposures are paced; long exposures take the time they need. Faster still schedules and Save next frame can acquire sooner."
+                            <TextBlock Text="Default: 2 fps. Exposure time may limit the actual rate."
                                        FontSize="12" TextWrapping="Wrap" />
                         </StackPanel>
                         <StackPanel Spacing="6">
@@ -425,7 +436,7 @@
                             x:Name="RetentionSettingsAvailabilityText"
                             FontSize="12"
                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Text="Retention limits are read-only because this agent does not advertise retention management."
+                            Text="Update the agent to edit storage limits."
                             TextWrapping="Wrap"
                             Visibility="Collapsed" />
                         <ToggleSwitch
@@ -447,7 +458,7 @@
                             OnContent="Enabled" />
                         <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
                                  PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
-                        <TextBlock Text="Security recording saves H.264 MP4 segments from previews at the configured frame-rate limit. Long exposures produce fewer frames. Pause and storage limits also pause video sampling."
+                        <TextBlock Text="Records H.264 MP4 at preview resolution. Pauses with recording or storage limits."
                                    TextWrapping="Wrap" />
                     </StackPanel>
                     </ScrollViewer>
@@ -495,7 +506,7 @@
                     </Grid.RowDefinitions>
                     <StackPanel Spacing="8">
                         <Button x:Name="SharingReloadButton" Click="SharingReloadButton_Click" Content="Reload settings"
-                                ToolTipService.ToolTip="Reload Chatstronomy settings from the agent. Connection status updates automatically." />
+                                ToolTipService.ToolTip="Reload saved sharing settings." />
                         <TextBlock x:Name="SharingConnectionText" TextWrapping="Wrap" Text="Not loaded" />
                     </StackPanel>
                     <ScrollViewer x:Name="SharingSettingsScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"
@@ -505,20 +516,20 @@
                             <StackPanel x:Name="SharingPairingGroup" Spacing="10">
                                 <TextBlock FontSize="16" FontWeight="SemiBold" Text="Pair with your Hub" />
                                 <TextBlock TextWrapping="Wrap"
-                                           Text="In the Hub, open Observatory devices, add a pier camera, attach it to a server, pick its channels, and choose Pair camera." />
+                                           Text="Hub → Observatory devices → Add pier camera. Select a server and channels, then choose Pair camera." />
                                 <TextBox x:Name="SharingOriginTextBox" Header="Hub HTTPS origin" PlaceholderText="https://your-chatstronomy-hub" />
                                 <PasswordBox x:Name="SharingCodePasswordBox" Header="One-use device pairing code" PlaceholderText="Paste code from the Hub" />
                                 <Button x:Name="SharingPairButton" Click="SharingPairButton_Click" Content="Pair camera" />
                                 <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                           Text="Pairing keeps your settings below. It does not start sharing." />
+                                           Text="Pairing keeps settings and does not enable sharing." />
                             </StackPanel>
                             <StackPanel Spacing="10">
                                 <TextBlock FontSize="16" FontWeight="SemiBold" Text="Choose what to share" />
                                 <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                           Text="The full preview goes to the channels selected in the Hub. Snapshot now uses the latest completed frame (up to 120 seconds old); it does not change exposure." />
+                                           Text="Sends previews to your Hub channels. Snapshot now uses the latest frame, up to 2 min old." />
                                 <ToggleSwitch x:Name="SharingEnabledToggle" Header="Enable image sharing" />
                                 <Button x:Name="SharingStopButton" Click="SharingStopButton_Click" Content="Stop sharing now"
-                                        ToolTipService.ToolTip="Turn sharing off immediately using the saved settings. Your other edits stay here." />
+                                        ToolTipService.ToolTip="Stop sharing now. Keep unsaved edits." />
                                 <ToggleSwitch x:Name="SharingSnapshotsToggle" Header="Allow Snapshot now requests" />
                                 <StackPanel Spacing="6">
                                     <TextBlock Text="Send an image every" />
@@ -548,28 +559,28 @@
                                             </StackPanel>
                                         </StackPanel>
                                         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                                   Text="Scene changes are not person or threat detection. Telescope events require the same owner and a shared Hub channel. Bursts wait for distinct completed frames; busy events are coalesced. The Hub posts at most one image per minute." />
+                                                   Text="Telescope events need the same owner and a shared Hub channel. The Hub posts at most one image per minute." />
                                     </StackPanel>
                                 </Expander>
                                 <Expander Header="Chat control" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                                     <StackPanel Spacing="10">
                                         <ToggleSwitch x:Name="SharingChatToggle" Header="Allow the camera owner to adjust triggers in chat" />
                                         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                                   Text="Chat can turn permitted triggers off, slow sends, or reduce bursts. It cannot enable a source you disabled or exceed your limits. Saving settings resets chat overrides." />
+                                                   Text="Chat can disable triggers or reduce sending. It cannot exceed these limits. Saving clears chat overrides." />
                                     </StackPanel>
                                 </Expander>
                                 <Expander Header="Connection details / change Hub" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                                     <StackPanel Spacing="10">
                                         <TextBlock x:Name="SharingDetailsText" IsTextSelectionEnabled="True" TextWrapping="Wrap" />
                                         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                                   Text="To change Hub, forget this pairing first. This clears saved permissions. Revoke the credential in the Hub too." />
+                                                   Text="Forget pairing to change Hub. This clears permissions. Also revoke the device in the Hub." />
                                         <CheckBox x:Name="SharingForgetConsentCheckBox" Content="Remove pairing and clear sharing permissions"
                                                   Checked="SharingForgetConsent_Changed" Unchecked="SharingForgetConsent_Changed" />
                                         <Button x:Name="SharingForgetButton" Click="SharingForgetButton_Click" Content="Forget pairing" />
                                     </StackPanel>
                                 </Expander>
                                 <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                           Text="Stopping sharing disconnects and discards queued images. Messages already posted cannot be recalled. Retries may duplicate a post after a Hub crash." />
+                                           Text="Stopping clears queued images, not posted messages. Retries may duplicate posts." />
                             </StackPanel>
                         </StackPanel>
                     </ScrollViewer>

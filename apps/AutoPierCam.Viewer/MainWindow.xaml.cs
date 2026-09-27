@@ -502,7 +502,7 @@ public sealed partial class MainWindow : Window
     {
         await _agentClient.CaptureNowAsync(cancellationToken);
         ApplyStatus(await _agentClient.GetStatusAsync(cancellationToken));
-        StatusText.Text = "Still requested; waiting for the next completed frame. Unsaved settings were not changed.";
+        StatusText.Text = "Saving the next completed frame…";
     }
 
     private async void PauseButton_Click(object sender, RoutedEventArgs args)
@@ -587,7 +587,7 @@ public sealed partial class MainWindow : Window
             !status.HasCapability(AgentPipeClient.UploadsRequeueCapability))
         {
             throw new UserInputException(
-                "This capture agent does not advertise durable outbox management. Refresh after upgrading or restarting the agent.");
+                "Update the agent to manage uploads, then reload settings.");
         }
 
         if (status.Upload is null)
@@ -633,7 +633,7 @@ public sealed partial class MainWindow : Window
             var dialog = new ContentDialog
             {
                 XamlRoot = Content.XamlRoot,
-                Title = "Durable upload outbox",
+                Title = "Upload outbox",
                 PrimaryButtonText = "Requeue selected",
                 CloseButtonText = "Close",
                 DefaultButton = ContentDialogButton.Close,
@@ -646,7 +646,7 @@ public sealed partial class MainWindow : Window
             };
             content.Children.Add(new TextBlock
             {
-                Text = "Pending and retrying jobs are shown for context. Only permanently failed jobs whose exact artifact still verifies can be requeued.",
+                Text = "Select a failed upload to retry. The file must be unchanged.",
                 TextWrapping = TextWrapping.Wrap,
             });
 
@@ -847,7 +847,7 @@ public sealed partial class MainWindow : Window
                 Content = new TextBlock
                 {
                     Text =
-                        $"{selectedJob.Filename}\n\nThe agent will verify the exact file size, digest, ledger identity, delivery binding, state, and revision before making it pending again.",
+                        $"{selectedJob.Filename}\n\nRetry this upload? The agent will check the file and destination first.",
                     TextWrapping = TextWrapping.Wrap,
                 },
                 PrimaryButtonText = "Requeue",
@@ -889,8 +889,8 @@ public sealed partial class MainWindow : Window
             }
 
             notice = requeue.WorkerNotified
-                ? $"{requeue.Job.Filename} was safely requeued and the uploader was notified."
-                : $"{requeue.Job.Filename} was safely requeued. The durable job will resume when the upload worker is available.";
+                ? $"{requeue.Job.Filename} queued for retry."
+                : $"{requeue.Job.Filename} queued. Waiting for the upload service.";
             noticeSeverity = requeue.WorkerNotified
                 ? InfoBarSeverity.Success
                 : InfoBarSeverity.Warning;
@@ -1160,7 +1160,7 @@ public sealed partial class MainWindow : Window
         if ((minGain ?? 0) < 0 || (minGain ?? 0) > maxGain)
             throw new UserInputException("Minimum gain must be between zero and Max gain.");
         if (!AdaptiveExposureToggle.IsOn && ((minGain ?? 0) > 0 || preferShort == true))
-            throw new UserInputException("Enable application-controlled exposure to use minimum gain or shorter exposures. To use SDK auto, set minimum gain to 0 and turn off Prefer shorter exposures first.");
+            throw new UserInputException("Enable application control, or set minimum gain to 0 and turn off Prefer shorter exposures.");
         ulong intervalMs = ReadScaledUInt64(
             StillIntervalNumberBox.Value,
             1000,
@@ -1404,7 +1404,7 @@ public sealed partial class MainWindow : Window
 
         _configurationNeedsRefresh = true;
         string message = _captureNeedsReview
-            ? "Settings changed elsewhere. Discard your edits to load them, or keep your edits to replace them on the next save."
+            ? "Discard to load the new settings. Keep edits to overwrite them on Save."
             : "Settings were changed elsewhere. Select Reload settings before saving your changes.";
         CaptureKeepEditsButton.Visibility = _captureNeedsReview ? Visibility.Visible : Visibility.Collapsed;
         StatusText.Text = message;
@@ -1650,8 +1650,8 @@ public sealed partial class MainWindow : Window
         GainControlHelpText.Text = !supported
             ? "Update the capture agent to configure minimum gain and shorter exposures."
             : AdaptiveExposureToggle.IsOn
-                ? "Gain stays within your range and the camera's supported limits. Changes apply without reopening the camera."
-                : "Application control is required for a gain floor or shorter-exposure preference. SDK auto can lower gain below your preference.";
+                ? "Gain limits apply without restarting capture."
+                : "Minimum gain and shorter exposures require application control.";
     }
 
     private void UpdateOutboxControlAvailability()
@@ -1700,8 +1700,8 @@ public sealed partial class MainWindow : Window
                 _configurationSnapshot?.Config.Capture.RetentionMaxBytes is not null ||
                 _configurationSnapshot?.Config.Capture.RetentionMinFreeBytes is not null;
             RetentionSettingsAvailabilityText.Text = hasExistingLimit
-                ? "This agent does not advertise retention editing. Loaded limits are read-only and will be preserved unchanged."
-                : "Refresh agent status to enable retention editing. Existing settings are preserved when saving.";
+                ? "Update the agent to edit storage limits. Current limits are kept."
+                : "Reload settings to edit storage limits.";
         }
     }
 
