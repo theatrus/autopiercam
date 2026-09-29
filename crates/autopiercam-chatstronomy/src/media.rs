@@ -43,13 +43,97 @@ pub(crate) struct SceneReference {
     grid: Vec<f32>,
 }
 
+const GRID_WIDTH: usize = 32;
+const GRID_HEIGHT: usize = 24;
+const GRID_CELLS: usize = GRID_WIDTH * GRID_HEIGHT;
+
+fn usable_luminance(value: f32) -> bool {
+    (8.0..247.0).contains(&value)
+}
+
 fn scene_grid(frame: &Frame) -> Result<Option<Vec<f32>>> {
     let gray = decode(frame)?
-        .resize_exact(32, 24, FilterType::Triangle)
+        .resize_exact(GRID_WIDTH as u32, GRID_HEIGHT as u32, FilterType::Triangle)
         .to_luma8();
-    let mean = gray.as_raw().iter().map(|v| *v as f32).sum::<f32>() / 768.0;
-    // Very dark/noisy frames are not a reliable scene-change signal.
-    Ok((mean >= 8.0).then(|| gray.as_raw().iter().map(|v| *v as f32 / mean).collect()))
+    let grid: Vec<_> = gray.as_raw().iter().map(|v| *v as f32).collect();
+    let mean = grid.iter().sum::<f32>() / GRID_CELLS as f32;
+    // Do not seed an unusable startup reference that can never be compared.
+    let usable = grid.iter().filter(|v| usable_luminance(**v)).count();
+    Ok((mean >= 8.0 && usable * 5 >= GRID_CELLS).then_some(grid))
+}
+
+fn median(values: &mut [f32]) -> f32 {
+    let middle = values.len() / 2;
+    *values.select_nth_unstable_by(middle, f32::total_cmp).1
+}
+
+/// Fit a global gain and black-level shift from matching image locations. The
+/// median pairwise slope (Theil-Sen) tolerates local foreground changes; unlike
+/// mean normalization, neither a bright patch nor an offset rescales the whole
+/// scene. Exclude clipped samples from the fit: their original values are lost.
+fn scene_changes(baseline: &[f32], grid: &[f32]) -> Option<Vec<bool>> {
+    let pairs: Vec<_> = baseline
+        .iter()
+        .zip(grid)
+        .filter(|(a, b)| usable_luminance(**a) && usable_luminance(**b))
+        .map(|(a, b)| (*a, *b))
+        .collect();
+    if pairs.len() * 5 < GRID_CELLS {
+        return None;
+    }
+    // Bound work independently of preview resolution; sample across the grid.
+    let samples: Vec<_> = (0..64).map(|i| pairs[i * pairs.len() / 64]).collect();
+    let mut slopes = Vec::new();
+    for (i, (a, b)) in samples.iter().enumerate() {
+        for (c, d) in &samples[i + 1..] {
+            if (a - c).abs() >= 24.0 {
+                slopes.push((b - d) / (a - c));
+            }
+        }
+    }
+    let slope = if slopes.is_empty() {
+        1.0
+    } else {
+        let fitted = median(&mut slopes);
+        // A flat/reversed image is not an exposure transform. Do not fit away
+        // a roof closing or an object obscuring the scene.
+        if (0.125..=8.0).contains(&fitted) {
+            fitted
+        } else {
+            1.0
+        }
+    };
+    let mut offsets: Vec<_> = pairs.iter().map(|(a, b)| b - slope * a).collect();
+    let offset = median(&mut offsets);
+    let raw: Vec<_> = baseline
+        .iter()
+        .zip(grid)
+        .map(|(a, b)| {
+            let predicted = (slope * a + offset).clamp(0.0, 255.0);
+            // A previously clipped pixel cannot be reconstructed. A newly
+            // clipped pixel can still be compared with the fitted prediction.
+            usable_luminance(*a) && (predicted - b).abs() > 16.0_f32.max(0.15 * predicted.max(*b))
+        })
+        .collect();
+    // Isolated sensor/JPEG noise is not an area of changed scene. Keep cells
+    // supported by at least two of their eight neighbors (no row wrapping).
+    Some(
+        (0..raw.len())
+            .map(|i| {
+                let x = i % GRID_WIDTH;
+                let y = i / GRID_WIDTH;
+                raw[i]
+                    && (y.saturating_sub(1)..=(y + 1).min(GRID_HEIGHT - 1))
+                        .flat_map(|row| {
+                            (x.saturating_sub(1)..=(x + 1).min(GRID_WIDTH - 1))
+                                .map(move |col| row * GRID_WIDTH + col)
+                        })
+                        .filter(|j| *j != i && raw[*j])
+                        .count()
+                        >= 2
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn scene_reference(frame: &Frame) -> Result<Option<SceneReference>> {
@@ -66,18 +150,14 @@ pub(crate) struct Detector {
     session: u64,
     sequence: u64,
     baseline: Option<Vec<f32>>,
-    exposure: Option<i64>,
-    gain: Option<i64>,
     mode: String,
     candidate_mode: String,
     candidate_since: Option<Instant>,
-    changed_frames: u8,
 }
 impl Detector {
     pub(crate) fn delivered(&mut self, reference: SceneReference) {
         if self.session == reference.session {
             self.baseline = Some(reference.grid);
-            self.changed_frames = 0;
         }
     }
 
@@ -102,7 +182,6 @@ impl Detector {
             self.mode = frame.mode.clone();
         }
         if known_mode && self.mode != frame.mode {
-            self.changed_frames = 0;
             if self.candidate_mode != frame.mode {
                 self.candidate_mode = frame.mode.clone();
                 self.candidate_since = Some(now);
@@ -120,51 +199,31 @@ impl Detector {
                     )));
                 }
             }
-            return Ok(None);
+        } else {
+            self.candidate_mode.clear();
+            self.candidate_since = None;
         }
-        self.candidate_mode.clear();
-        self.candidate_since = None;
         if !prefs.scene_changes {
             return Ok(None);
         }
-        let stable_exposure = match (self.exposure, frame.exposure_us, self.gain, frame.gain) {
-            (Some(a), Some(b), Some(g), Some(h)) if a > 0 && b > 0 => {
-                (a as f64 / b as f64 - 1.0).abs() <= 0.2 && g.abs_diff(h) <= 10
-            }
-            _ => false,
-        };
-        self.exposure = frame.exposure_us;
-        self.gain = frame.gain;
         let Some(grid) = scene_grid(frame)? else {
-            self.changed_frames = 0;
             return Ok(None);
         };
         // Seed once. Changes in exposure, mode or darkness must not silently
         // replace the last image the user actually saw reported in chat.
         if self.baseline.is_none() {
-            self.baseline = Some(grid.clone());
-        }
-        if !stable_exposure {
-            self.changed_frames = 0;
+            self.baseline = Some(grid);
             return Ok(None);
         }
         let baseline = self.baseline.as_ref().unwrap();
-        let changed = grid
-            .iter()
-            .zip(baseline)
-            .filter(|(a, b)| (*a - *b).abs() > 0.3)
-            .count();
-        if changed * 100 >= 768 * usize::from(prefs.scene_threshold_percent) {
-            self.changed_frames += 1;
-            if self.changed_frames >= 3 {
-                self.changed_frames = 0;
-                return Ok(Some((
-                    "scene_change",
-                    "Persistent scene change in the full pier-camera preview",
-                )));
-            }
-        } else {
-            self.changed_frames = 0;
+        let Some(area) = scene_changes(baseline, &grid) else {
+            return Ok(None);
+        };
+        // One completed exposure is sufficient. Never average frames or wait
+        // for confirmation exposures: a night frame may already take a minute.
+        let changed = area.iter().filter(|v| **v).count();
+        if changed * 100 >= GRID_CELLS * usize::from(prefs.scene_threshold_percent) {
+            return Ok(Some(("scene_change", "Pier-camera scene changed")));
         }
         Ok(None)
     }
@@ -192,6 +251,221 @@ mod tests {
         Preferences {
             scene_changes: true,
             ..Default::default()
+        }
+    }
+
+    fn textured(sequence: u64, transform: impl Fn(u32, u32, f32) -> f32) -> Frame {
+        // Smooth illumination plus fixed large structures, rather than a flat
+        // test image on which any brightness normalization trivially succeeds.
+        let image = RgbImage::from_fn(320, 240, |x, y| {
+            let value = 30.0
+                + x as f32 * 0.35
+                + y as f32 * 0.15
+                + if (x / 50 + y / 60) % 2 == 0 {
+                    35.0
+                } else {
+                    0.0
+                };
+            Rgb([transform(x, y, value).clamp(0.0, 255.0) as u8; 3])
+        });
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 85)
+            .encode_image(&image)
+            .unwrap();
+        Frame {
+            jpeg: jpeg.into(),
+            ..sample(sequence, 70, 70)
+        }
+    }
+
+    #[test]
+    fn exposure_gain_offsets_clipping_and_noise_do_not_report_a_static_scene() {
+        for (scale, offset) in [(1.7, 25.0), (0.4, 30.0), (1.0, 65.0), (2.8, -50.0)] {
+            let mut detector = Detector::default();
+            let now = Instant::now();
+            let prefs = preferences();
+            detector
+                .observe(&textured(1, |_, _, v| v), &prefs, now)
+                .unwrap();
+            for sequence in 2..=15 {
+                let mut frame = textured(sequence, |x, y, v| {
+                    let noise = ((x * 17 + y * 31 + sequence as u32 * 19) % 17) as f32 - 8.0;
+                    v * scale + offset + noise
+                });
+                frame.exposure_us = Some(100_000);
+                frame.gain = Some(200);
+                assert!(
+                    detector.observe(&frame, &prefs, now).unwrap().is_none(),
+                    "static scene fired for scale={scale}, offset={offset}, frame={sequence}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moderate_gamma_change_is_tolerated() {
+        for gamma in [0.75, 1.3] {
+            let mut detector = Detector::default();
+            let now = Instant::now();
+            let prefs = preferences();
+            detector
+                .observe(&textured(1, |_, _, v| v), &prefs, now)
+                .unwrap();
+            for sequence in 2..=10 {
+                let frame = textured(sequence, |_, _, v| 255.0 * (v / 255.0).powf(gamma));
+                assert!(detector.observe(&frame, &prefs, now).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn one_long_exposure_detects_occlusion_even_when_exposure_and_gain_change() {
+        for obscured in [0.0, 230.0] {
+            let mut detector = Detector::default();
+            let now = Instant::now();
+            let prefs = preferences();
+            detector
+                .observe(&textured(1, |_, _, v| v), &prefs, now)
+                .unwrap();
+            let mut frame = textured(2, |x, _, v| if x < 90 { obscured } else { v * 1.2 + 15.0 });
+            frame.exposure_us = Some(120_000_000);
+            frame.gain = Some(200);
+            assert!(
+                detector
+                    .observe(&frame, &prefs, now + Duration::from_secs(120))
+                    .unwrap()
+                    .is_some(),
+                "first completed exposure missed occlusion at brightness {obscured}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_small_exposure_or_gain_steps_do_not_report_a_static_scene() {
+        for gain_ramp in [false, true] {
+            let mut detector = Detector::default();
+            let now = Instant::now();
+            let prefs = preferences();
+            detector
+                .observe(&textured(1, |_, _, v| v), &prefs, now)
+                .unwrap();
+            for sequence in 2..=20 {
+                let mut frame = textured(sequence, |_, _, v| {
+                    v * 1.04_f32.powi(sequence as i32) + 10.0
+                });
+                if gain_ramp {
+                    frame.gain = Some(100 + sequence as i64 * 3);
+                } else {
+                    frame.exposure_us =
+                        Some((60_000_000.0 * 1.06_f64.powi(sequence as i32)) as i64);
+                }
+                assert!(detector.observe(&frame, &prefs, now).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_exposure_metadata_does_not_block_a_scene_change() {
+        let mut detector = Detector::default();
+        let now = Instant::now();
+        let prefs = preferences();
+        detector.observe(&sample(1, 70, 70), &prefs, now).unwrap();
+        let mut changed = sample(2, 220, 70);
+        changed.exposure_us = None;
+        changed.gain = None;
+        assert!(detector.observe(&changed, &prefs, now).unwrap().is_some());
+    }
+
+    #[test]
+    fn badly_clipped_frames_pause_without_replacing_the_reference() {
+        let mut detector = Detector::default();
+        let now = Instant::now();
+        let prefs = preferences();
+        detector.observe(&sample(1, 70, 70), &prefs, now).unwrap();
+        for sequence in 2..=8 {
+            assert!(
+                detector
+                    .observe(&sample(sequence, 255, 255), &prefs, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for sequence in 9..=11 {
+            assert!(
+                detector
+                    .observe(&sample(sequence, 220, 70), &prefs, now)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn unusable_startup_and_corrupt_frames_do_not_poison_reference() {
+        let mut detector = Detector::default();
+        let now = Instant::now();
+        let prefs = preferences();
+        for (sequence, value) in [(1, 0), (2, 255)] {
+            detector
+                .observe(&sample(sequence, value, value), &prefs, now)
+                .unwrap();
+            assert!(detector.baseline.is_none());
+        }
+        for sequence in 3..=7 {
+            assert!(
+                detector
+                    .observe(&sample(sequence, 70, 70), &prefs, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let corrupt = Frame {
+            jpeg: vec![0, 1, 2].into(),
+            ..sample(10, 70, 70)
+        };
+        assert!(detector.observe(&corrupt, &prefs, now).is_err());
+        for sequence in 11..=15 {
+            assert!(
+                detector
+                    .observe(&sample(sequence, 220, 70), &prefs, now)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn scattered_noise_is_removed_and_threshold_still_controls_area() {
+        let baseline = vec![70.0; GRID_CELLS];
+        let mut noisy = baseline.clone();
+        for y in (1..GRID_HEIGHT).step_by(3) {
+            for x in (1..GRID_WIDTH).step_by(3) {
+                noisy[y * GRID_WIDTH + x] = 160.0;
+            }
+        }
+        assert!(scene_changes(&baseline, &noisy).unwrap().iter().all(|v| !v));
+        for (threshold, expected) in [(10, true), (40, false)] {
+            let mut detector = Detector::default();
+            let prefs = Preferences {
+                scene_threshold_percent: threshold,
+                ..preferences()
+            };
+            let now = Instant::now();
+            detector
+                .observe(&textured(1, |_, _, v| v), &prefs, now)
+                .unwrap();
+            let mut detected = false;
+            for sequence in 2..=8 {
+                detected |= detector
+                    .observe(
+                        &textured(sequence, |x, _, v| if x < 70 { 230.0 } else { v }),
+                        &prefs,
+                        now,
+                    )
+                    .unwrap()
+                    .is_some();
+            }
+            assert_eq!(detected, expected, "threshold {threshold}");
         }
     }
 
@@ -252,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn exposure_changes_and_dark_frames_pause_without_erasing_reference() {
+    fn dark_frames_pause_without_erasing_reference_or_delaying_next_good_frame() {
         let mut detector = Detector::default();
         let prefs = preferences();
         let now = Instant::now();
@@ -260,17 +534,14 @@ mod tests {
         let mut changed = sample(2, 220, 70);
         changed.exposure_us = Some(1_000_000);
         changed.gain = Some(300);
-        assert!(detector.observe(&changed, &prefs, now).unwrap().is_none());
+        assert!(detector.observe(&changed, &prefs, now).unwrap().is_some());
         let mut dark = sample(3, 0, 0);
         dark.exposure_us = changed.exposure_us;
         dark.gain = changed.gain;
         assert!(detector.observe(&dark, &prefs, now).unwrap().is_none());
-        for sequence in 4..=6 {
+        for sequence in 4..=8 {
             changed.sequence = sequence;
-            assert_eq!(
-                detector.observe(&changed, &prefs, now).unwrap().is_some(),
-                sequence == 6
-            );
+            assert!(detector.observe(&changed, &prefs, now).unwrap().is_some());
             assert!(
                 detector.observe(&changed, &prefs, now).unwrap().is_none(),
                 "duplicate is not evidence"
@@ -294,16 +565,15 @@ mod tests {
             detector
                 .observe(&changed, &prefs, now + Duration::from_secs(30))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
-        for sequence in 4..=6 {
+        for sequence in 4..=9 {
             changed.sequence = sequence;
-            assert_eq!(
+            assert!(
                 detector
                     .observe(&changed, &prefs, now + Duration::from_secs(31))
                     .unwrap()
-                    .is_some(),
-                sequence == 6
+                    .is_some()
             );
         }
         let old_report = scene_reference(&first).unwrap().unwrap();
@@ -335,12 +605,11 @@ mod tests {
             );
         }
         for sequence in 11..=13 {
-            assert_eq!(
+            assert!(
                 detector
                     .observe(&sample(sequence, 220, 70), &prefs, now)
                     .unwrap()
-                    .is_some(),
-                sequence == 13
+                    .is_some()
             );
         }
     }

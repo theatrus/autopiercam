@@ -465,10 +465,8 @@ async fn scene_change_posts_once_and_queued_retry_is_cancelled_on_disable() {
     let fixture = Fixture::paired().await;
     let mut socket = fixture.connect(false, true).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    for sequence in 2..=4 {
-        *fixture.frames.write().unwrap() = Some(frame(sequence, true));
-        tokio::time::sleep(Duration::from_millis(180)).await;
-    }
+    // A single completed exposure must be enough, including long night frames.
+    *fixture.frames.write().unwrap() = Some(frame(2, true));
     let event = text(&mut socket).await;
     assert_eq!(event["event"]["kind"], "scene_change");
     assert!(event["event"]["request_id"].is_null());
@@ -497,10 +495,7 @@ async fn elided_ack_drops_the_image_without_retrying() {
     let fixture = Fixture::paired().await;
     let mut socket = fixture.connect(false, true).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    for sequence in 2..=4 {
-        *fixture.frames.write().unwrap() = Some(frame(sequence, true));
-        tokio::time::sleep(Duration::from_millis(180)).await;
-    }
+    *fixture.frames.write().unwrap() = Some(frame(2, true));
     let event = text(&mut socket).await;
     assert_eq!(event["event"]["kind"], "scene_change");
     socket.send(Message::Text(json!({"type":"event_ack","event_id":event["event"]["event_id"],"status":"elided","retry_after_seconds":0}).to_string().into())).await.unwrap();
@@ -655,10 +650,7 @@ async fn automatic_retry_retains_exact_payload_across_reconnect() {
     let fixture = Fixture::paired().await;
     let mut socket = fixture.connect(false, true).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    for sequence in 2..=4 {
-        *fixture.frames.write().unwrap() = Some(frame(sequence, true));
-        tokio::time::sleep(Duration::from_millis(180)).await;
-    }
+    *fixture.frames.write().unwrap() = Some(frame(2, true));
     let original = text(&mut socket).await;
     let sent = std::time::Instant::now();
     // Simulate a lost acknowledgment, not a new event.
@@ -742,7 +734,7 @@ async fn pair_redirect_is_never_followed_and_origin_cannot_change_while_paired()
 }
 
 #[test]
-fn detector_suppresses_exposure_ramps_and_requires_stable_mode_and_distinct_frames() {
+fn detector_requires_distinct_frames_and_day_night_events_still_require_stable_mode() {
     use crate::media::Detector;
     use std::time::Instant;
     let now = Instant::now();
@@ -756,7 +748,7 @@ fn detector_suppresses_exposure_ramps_and_requires_stable_mode_and_distinct_fram
     assert!(detector.observe(&initial, &prefs, now).unwrap().is_none());
     let mut ramp = frame(2, true);
     ramp.exposure_us = Some(30_000_000);
-    assert!(detector.observe(&ramp, &prefs, now).unwrap().is_none());
+    assert!(detector.observe(&ramp, &prefs, now).unwrap().is_some());
     for _ in 0..10 {
         assert!(detector.observe(&ramp, &prefs, now).unwrap().is_none());
     }

@@ -499,12 +499,12 @@ mod tests {
         };
         let mut detector = Detector::default();
         detector.observe(&frame(1, false), &prefs, now).unwrap();
-        for sequence in 2..=4 {
+        for sequence in 2..=6 {
             detector
                 .observe(&frame(sequence, true), &prefs, now)
                 .unwrap();
         }
-        let reported = frame(4, true);
+        let reported = frame(6, true);
         let mut outbound = event(
             &reported,
             "scene_change",
@@ -514,7 +514,7 @@ mod tests {
         )
         .unwrap();
         // Ordinary observations while a report waits/retries cannot move its reference.
-        for sequence in 5..=8 {
+        for sequence in 7..=10 {
             assert!(
                 detector
                     .observe(&frame(sequence, false), &prefs, now)
@@ -524,13 +524,12 @@ mod tests {
         }
         outbound.delivered(&mut detector);
         assert!(outbound.scene_reference.is_none());
-        for sequence in 9..=11 {
-            assert_eq!(
+        for sequence in 11..=13 {
+            assert!(
                 detector
                     .observe(&frame(sequence, false), &prefs, now)
                     .unwrap()
-                    .is_some(),
-                sequence == 11
+                    .is_some()
             );
         }
     }
@@ -562,13 +561,12 @@ mod tests {
             assert!(outbound.scene_reference.is_none());
             outbound.delivered(&mut detector);
         }
-        for sequence in 2..=4 {
-            assert_eq!(
+        for sequence in 2..=6 {
+            assert!(
                 detector
                     .observe(&frame(sequence, true), &prefs, now)
                     .unwrap()
-                    .is_some(),
-                sequence == 4
+                    .is_some()
             );
         }
     }
