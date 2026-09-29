@@ -158,19 +158,30 @@ are bounded by a monotonic deadline of at most 90 seconds.
 
 Automatic events are independent opt-ins:
 
-- **Scene changes:** a 32×24 grayscale grid normalized for overall brightness;
-  at least the selected percentage of cells must change materially in three
-  consecutive distinct frames. A cell changes when its normalized value differs
-  by more than 0.3. The reference is the startup image until the first delivered
+- **Scene changes:** a 32×24 grayscale grid with a robust global brightness and
+  contrast fit. This compensates for exposure/gain and black-level shifts before
+  comparing cells. A cell must differ by more than 16 grayscale levels or 15%
+  of its brightness, whichever is larger, and have two changed neighbors.
+  The selected percentage is the fraction of the **whole grid** that differs
+  in a single completed frame. There is no frame averaging or multi-frame
+  confirmation delay. It is not a confidence score or the percentage of raw
+  pixels that differ. The reference is the first
+  usable startup image until the first delivered
   scene-change report, then the image attached to the last scene-change report
   acknowledged as delivered by the Hub. Ordinary frames, coalesced detections,
   retries, rejected reports and periodic/manual/telescope images do not move it.
   This captures slow cumulative drift instead of comparing only adjacent frames.
-  Very dark frames, mode transitions, exposure changes over 20% and gain changes
-  over 10 pause detection without erasing the reference. Scene detection works
+  Exposure/gain metadata and day/night labels do not gate scene comparisons;
+  compensation uses the image itself. Dark/clipped frames pause detection without
+  erasing the reference. At least 20% of cells must be unclipped in both images
+  for a reliable comparison; previously clipped cells are excluded from evidence.
+  Scene detection works
   even when mode metadata is unknown. The full preview is the analysis region.
   The reference survives network reconnects, but capture session changes,
   pause, trigger-rule/consent changes and process restarts seed a new reference.
+  Global brightness changes alone intentionally do not trigger. Moving shadows,
+  local lighting changes and severe nonlinear camera processing can still look
+  like scene changes; this is not object recognition.
 - **Day/night transitions:** use capture-mode metadata with a 30-second dwell,
   not JPEG brightness alone. SDK auto capture now infers lighting mode from
   completed exposures too (see [exposure policy](exposure.md)); no adaptive

@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.10 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.11 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.10)](https://github.com/theatrus/autopiercam/releases/download/v0.2.10/AutoPierCam-0.2.10-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.10)
+[Download the signed Windows x64 installer (0.2.11)](https://github.com/theatrus/autopiercam/releases/download/v0.2.11/AutoPierCam-0.2.11-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.11)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -64,6 +64,12 @@ The repository now contains a hardware-validated background capture slice:
 - a separately packaged N.I.N.A. 3.2 plugin that adds a read-only **Pier
   Camera** panel to the Imaging tab.
 
+Version 0.2.11 reduces false scene-change posts with brightness/contrast
+compensation and spatial noise filtering. One completed frame can trigger;
+there is no averaging or multi-frame confirmation delay.
+The reference remains the last scene image delivered to chat, preserving slow
+drift detection. See [scene detection](docs/chatstronomy.md).
+
 Version 0.2.10 gives the Viewer a compact logo header, removes the resolution
 paragraph from Preview Details, and shortens settings and status messages.
 Capture and sharing behavior are unchanged.
@@ -97,7 +103,7 @@ repeat settling; camera and RAW-format changes still restart. The updated NINA p
 
 ## Install on Windows
 
-Version 0.2.10 includes opt-in Chatstronomy image sharing: open **Settings** in
+Version 0.2.11 includes opt-in Chatstronomy image sharing: open **Settings** in
 the Viewer and choose the **Chatstronomy** section to pair, allow snapshots, periodic images, scene/day-night posts,
 or telescope-event bursts. Chat configuration requires explicit local permission
 and an updated Hub. See the [setup and privacy guide](docs/chatstronomy.md).
