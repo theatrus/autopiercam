@@ -89,9 +89,9 @@ mock camera backend.
 
 The agent is a normal per-user background executable. On Windows its primary
 thread owns the notification icon and event loop. A supervisor owns cancellation,
-camera reconnect state, config-driven restarts, and IPC. Camera startup and
-runtime faults are retried with a bounded 1/2/5/10/30-second backoff; a healthy
-capture session resets the delay.
+camera ownership, config-driven restarts, and IPC. Camera startup and runtime
+faults stop capture until the operator restarts the agent or saves settings.
+The supervisor does not automatically reopen or rescan a faulted driver.
 
 The tray menu exposes Status, Open AutoPierCam, Pause/Resume capture, Capture
 now, and Exit. Exit attempts ordered shutdown, with an independent 30-second
@@ -420,8 +420,8 @@ Ordered shutdown:
 Preview encoding drains and the current video segment finalizes before retention
 and upload workers stop, keeping publication inside the ledger lifecycle lease.
 
-The implemented startup path validates configuration and automatically retries
-startup or runtime faults. When upload is enabled it opens and validates the
+The implemented startup path validates configuration and leaves startup or runtime
+camera faults for an operator restart. When upload is enabled it opens and validates the
 bound ledger, recovers abandoned claims, reconciles the capture directory
 against the activation watermark, and resumes due attempts. It then completes
 an initial retention sweep before opening the camera. When uploads are disabled

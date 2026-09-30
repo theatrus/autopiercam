@@ -15,13 +15,13 @@ Linux x64/ARM64, and macOS ARM64. This tests the runtime contract, not detector 
 
 ```powershell
 cargo run -p autopiercam-vision -- import `
-  --source P:/_Incoming/starfront-redcat61/captures `
-  --output datasets/starfront-redcat61 `
-  --site starfront-redcat61 --camera piercam --group initial-archive `
+  --source C:/path/to/captures `
+  --output datasets/example-site `
+  --site example-site --camera piercam --group initial-archive `
   --interval-seconds 300 --limit 200
 
-cargo run -p autopiercam-vision -- review --dataset datasets/starfront-redcat61
-cargo run -p autopiercam-vision -- check --dataset datasets/starfront-redcat61
+cargo run -p autopiercam-vision -- review --dataset datasets/example-site
+cargo run -p autopiercam-vision -- check --dataset datasets/example-site
 ```
 
 Import again to pick up files still copying. A run takes a bounded snapshot of
@@ -57,7 +57,7 @@ Changes are not automatically saved. Apply the downloaded file:
 
 ```powershell
 cargo run -p autopiercam-vision -- label `
-  --dataset datasets/starfront-redcat61 --file C:/path/to/labels.json
+  --dataset datasets/example-site --file C:/path/to/labels.json
 ```
 
 The download contains only edited images and their original labels. New imports

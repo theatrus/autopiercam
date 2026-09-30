@@ -37,8 +37,8 @@ them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Reload camera list** reads cached discovery without discarding unsaved settings.
-Discovery runs before capture starts, or on retries (up to 30 seconds) after a
-fault. It never probes other cameras during acquisition or settling, even with
+Discovery runs before capture starts. Driver faults require an operator restart
+or configuration save; they do not trigger rescans. Discovery never probes other cameras during acquisition or settling, even with
 recording paused. Restart the tray agent to discover newly connected cameras.
 A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
