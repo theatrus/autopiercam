@@ -1,7 +1,7 @@
 # Regain camera backend
 
-AutoPierCam uses Regain 0.5.0, pinned to commit
-`3011d788e2757158fba2e9945809ed499eda704c` in Cargo.toml and Cargo.lock.
+AutoPierCam uses Regain 0.5.1 (Rust 1.89 or newer), pinned to commit
+`98302af3c1c80bf64f670dc3ab70fb1851d1d062` in Cargo.toml and Cargo.lock.
 There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
 point calls the unchanged upstream drivers; `regain-core::Worker` owns the
 framed transport, deadlines and process supervision.
@@ -13,7 +13,7 @@ Settings has an explicit **Camera driver** choice:
 - **Regain · ZWO SDK** (default): supports ASI662MC and ASI676MC through the
   vendor library. The installer still includes the reviewed SDK DLL.
 - **Regain · ZWO Direct USB** (experimental): ASI676MC is supported, with a
-  maximum exposure of 30 seconds. ASI662MC is not supported yet.
+  maximum exposure of 2,000 seconds. ASI662MC is not supported yet.
 
 There is no automatic fallback. Adding ASI662MC direct support requires a
 reviewed Regain pin update and hardware validation, not a local driver.
@@ -25,7 +25,7 @@ this version does not claim support for non-ZWO or monochrome cameras.
 driver = "zwo_sdk" # or "zwo_direct", explicitly
 # serial = "exact-camera-serial"
 exposure_control = "adaptive"
-max_exposure_us = 60000000 # use <= 30000000 for ASI676MC direct
+max_exposure_us = 60000000 # ASI676MC direct supports up to 2000000000
 ```
 
 Keep the selected model filter. Backend changes clear the transient camera ID
@@ -84,7 +84,19 @@ frames, ownership, live-discovery rejection, serial mismatch, RAW16 conversion,
 in-flight edits, long-exposure cancellation, download faults, process crashes and
 hung downloads. CI runs these on Windows, Linux x64/ARM64 and macOS ARM64.
 
-Before release, validate an isolated physical camera with operator approval:
-day/night convergence, native Bayer orientation and geometry, short/30/60-second
-exposures where supported, rate limiting, live saves, USB interruption, and
-bounded quit. Simulator success is not hardware validation.
+Physical ASI676MC validation on Windows passed SDK exposures at 1, 30 and 60
+seconds, and full-frame Direct USB RAW16 exposures at 60, 120 and 2,000 seconds.
+The 2,000-second integration took 2,000.190 seconds, returned 25,233,408 bytes,
+and replayed the retained frame byte-for-byte without another exposure. The SDK
+was not loaded; no read retries or cleanup errors occurred.
+
+Both backends saved full-resolution 3552×3552 16-bit RGB PNGs. Active capture
+cancellation took 0.385 seconds through the SDK and 0.005 seconds through direct
+worker termination. A new direct capture saved successfully afterward, and all
+test workers exited. The short post-cancellation run reached its bounded settling
+deadline; it was not a convergence test. See
+[Regain PR #3](https://github.com/pulsarfab/regain/pull/3) for upstream evidence.
+
+Before release, still validate day/night convergence, native Bayer orientation,
+rate limiting, live saves and USB interruption with operator approval. Simulator
+success is not hardware validation.

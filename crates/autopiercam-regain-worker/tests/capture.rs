@@ -107,9 +107,15 @@ fn refuses_serial_mismatch_and_unsupported_direct_exposure() {
     assert!(wrong.open(wrong.cameras().unwrap().remove(0)).is_err());
     let direct = driver(CameraDriver::ZwoDirect, json!({}), None);
     let mut camera = setup(&direct);
+    // Control validation only: these simulator settings do not start an exposure.
+    for exposure_us in [60_000_000, 120_000_000, 2_000_000_000] {
+        camera
+            .set_control(ControlType::EXPOSURE, exposure_us, false)
+            .unwrap();
+    }
     assert!(
         camera
-            .set_control(ControlType::EXPOSURE, 60_000_000, false)
+            .set_control(ControlType::EXPOSURE, 2_000_000_001, false)
             .is_err()
     );
     assert!(camera.set_control(ControlType::GAIN, 200, true).is_err());

@@ -42,14 +42,15 @@ fault. It never probes other cameras during acquisition or settling, even with
 recording paused. Restart the tray agent to discover newly connected cameras.
 A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
-cameras cannot be persistently distinguished by serial number yet.
+cameras require an exact serial number for persistent selection in the development
+build.
 **Automatic (use model filter)** restores model-filter selection; ambiguous
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
 The development build uses Regain and application-controlled exposure for both
 driver choices. ASI662MC requires the SDK backend; ASI676MC direct USB has a
-30-second limit. See the [exposure guide](exposure.md) and
+2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md). Published 0.2.11 predates this change.
 
 ## What is installed

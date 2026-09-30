@@ -26,8 +26,9 @@ The SDK backend uses the camera's manual exposure range, not its SDK-auto
 ceiling. The previously tested ASI676MC SDK advertises up to 2,000 seconds.
 Actual limits come from the opened camera.
 
-The pinned Regain direct backend supports ASI676MC up to **30 seconds**.
-Set max_exposure_us to at most 30000000 before selecting direct. Higher ceilings
+The pinned Regain direct backend supports ASI676MC up to **2,000 seconds**,
+validated with a full-frame RAW16 capture. Set max_exposure_us to at most
+2000000000 (2,000,000 ms in the Viewer). Higher ceilings
 fail visibly; there is no silent direct-to-SDK fallback. ASI662MC must use
 Regain's SDK backend until upstream adds direct support.
 
