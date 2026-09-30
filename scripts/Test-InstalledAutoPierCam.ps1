@@ -821,6 +821,7 @@ function Assert-InstalledPayload(
     foreach ($relativePath in @(
         'autopiercam.exe',
         'autopiercam-tray.exe',
+        'autopiercam-vision.exe',
         'ASICamera2.dll',
         'autopiercam.example.toml',
         'installation.md',

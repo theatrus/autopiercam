@@ -4,7 +4,7 @@
 # into -StageOnly and -PackageOnly so signing can happen in the gap:
 #
 #   1. -StageOnly   build + stage + write approved-stage-manifest.json
-#   2. sign         the four executables/DLLs the user actually runs
+#   2. sign         the five executables/DLLs the user actually runs
 #   3. -PackageOnly wrap the now-signed payload into the MSI
 #   4. sign         the MSI itself
 #
@@ -15,7 +15,7 @@
 #
 # The stage manifest enforces this rather than trusting it: -PackageOnly accepts
 # a changed hash ONLY for a path in `signable_paths`, and throws for any other
-# added, removed or altered file. So signing anything outside those four paths
+# added, removed or altered file. So signing anything outside those five paths
 # turns into a build failure, not a surprise in the shipped MSI.
 name: Release
 
@@ -154,7 +154,7 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # Exactly the four installer signable paths and the separate plugin DLL.
+      # Exactly the five installer signable paths and the separate plugin DLL.
       # `files` takes a newline-separated list of absolute paths. Do not switch
       # this to files-folder: it would also sign ASICamera2.dll and the .NET
       # runtime, and -PackageOnly rejects a changed hash on any non-signable
@@ -168,6 +168,7 @@ jobs:
           files: |
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam.exe
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam-tray.exe
+            ${{ github.workspace }}\artifacts\installer\stage\autopiercam-vision.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.dll
             ${{ github.workspace }}\integrations\AutoPierCam.NINA\artifacts\nina-plugin\package\AutoPierCam\AutoPierCam.NINA.dll
@@ -210,6 +211,7 @@ jobs:
           fail=0
           for f in "$stage/autopiercam.exe" \
                    "$stage/autopiercam-tray.exe" \
+                   "$stage/autopiercam-vision.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.dll" \
                    "integrations/AutoPierCam.NINA/artifacts/nina-plugin/package/AutoPierCam/AutoPierCam.NINA.dll" \

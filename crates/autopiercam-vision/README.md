@@ -1,8 +1,9 @@
 # AutoPierCam Vision
 
 Portable Rust CPU inference and local training-image preparation. **No trained
-roof or cloud model ships yet.** This crate is not connected to capture, the
-Viewer, or Chatstronomy; it never opens cameras or sends images.
+roof or cloud model ships yet.** The Viewer can opt into experimental sky labels
+using a locally supplied model. This crate never opens cameras or sends images
+to a network service, and predictions do not control capture or Chatstronomy.
 
 Requires Rust 1.91+. Dataset tools are enabled by default. `--features onnx`
 enables tract 0.23.8's CPU backend, with transformer/GPU features disabled. There
@@ -130,10 +131,39 @@ detects a mismatched file, not a malicious graph; tract is not a sandbox. No
 models are downloaded automatically. Validate latency, memory, and false alerts
 on real held-out days/nights before integrating the worker with AutoPierCam.
 The initial inference fixture is hand-authored and synthetic, not a trained
-detector. Runtime integration, model training, calibration, and event posting
-remain separate work.
+detector. Capture/Chatstronomy integration, calibration, and event posting
+remain separate work; the opt-in Viewer path below only displays estimates.
 
 ## Experimental offline training
+
+### Use a local model in the Viewer
+
+Open **Details → Experimental sky model…**. Choose the ONNX and its matching
+model JSON, enable estimates, and apply. The installer supplies the Rust worker;
+for a source build, select `target/debug/autopiercam-vision.exe` after running:
+
+```text
+cargo build -p autopiercam-vision --features onnx
+```
+
+Use trusted local models only. The worker validates the ONNX checksum and shape
+contract. This first Viewer integration supports full-frame sky models (the
+baseline's default ROI), not custom ROI models. The model must be appropriate
+for the current camera view; no automatic roof/quality detector is available.
+
+Estimates are disabled by default and run only while the Viewer is open. Settings
+are saved separately in `%LOCALAPPDATA%/AutoPierCam/viewer-sky.json`; applying
+them does not save agent settings or restart capture. The default interval is
+10 seconds, with no backlog or averaging. A separate Rust process gets the
+Viewer's existing JPEGs; it never acquires a camera handle. Each request has a
+20-second deadline; failure stops analysis until settings are reapplied.
+
+The compact label says **experimental**. The tooltip shows the source frame's
+time and uncalibrated score. Results expire after 60 seconds and are invalidated
+on reconnect/session changes. No images leave the machine. Predictions never
+post messages, trigger captures, or control the roof/mount.
+
+### Train and validate a baseline
 
 `tools/vision/train_sky.py` trains a small three-class sky CNN from scratch and
 exports ONNX. Python is **training-only**; inference remains the Rust CPU runtime.

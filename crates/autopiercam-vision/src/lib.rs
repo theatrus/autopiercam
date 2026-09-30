@@ -6,6 +6,8 @@ pub mod model;
 pub mod preprocess;
 #[cfg(feature = "onnx")]
 pub mod runtime;
+#[cfg(feature = "onnx")]
+pub mod stream;
 
 use anyhow::{Context, Result, ensure};
 use std::{fs::File, io::Read, path::Path};

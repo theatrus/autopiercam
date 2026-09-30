@@ -221,6 +221,7 @@ version = "0.2.11"
 dependencies = [
  "anyhow",
  "clap",
+ "embed-resource",
  "fs4",
  "image",
  "prost",

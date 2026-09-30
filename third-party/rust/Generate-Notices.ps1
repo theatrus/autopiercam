@@ -36,8 +36,9 @@ try {
     }
 
     $jsonDiagnostics = @(& cargo about -L debug -c never generate `
-            --frozen `
+            --locked `
             --workspace `
+            --features autopiercam-vision/onnx `
             --fail `
             --config $configPath `
             --format json `
@@ -78,6 +79,7 @@ try {
     $treeOutput = @(& cargo tree `
             --frozen `
             --workspace `
+            --features autopiercam-vision/onnx `
             --target $targetTriple `
             --edges normal `
             --prefix none `
@@ -151,8 +153,9 @@ try {
     }
 
     $renderDiagnostics = @(& cargo about -L warn -c never generate `
-            --frozen `
+            --locked `
             --workspace `
+            --features autopiercam-vision/onnx `
             --fail `
             --config $configPath `
             --output-file $renderedPath `

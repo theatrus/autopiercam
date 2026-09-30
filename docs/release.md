@@ -77,7 +77,7 @@ The `release` job then:
 
 1. checks the tag against `Cargo.toml` and that the release notes exist;
 2. runs the Rust, N.I.N.A., Viewer, FFmpeg and license checks;
-3. stages the payload, signs the four programs and the plugin DLL through
+3. stages the payload, signs the five programs (including the vision worker) and the plugin DLL through
    Azure Trusted Signing, packages the MSI and plugin, and signs the MSI;
 4. verifies all six signatures chain to **StackFoundry LLC**;
 5. installs and tests the signed MSI;

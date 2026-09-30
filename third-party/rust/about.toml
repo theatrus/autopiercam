@@ -24,6 +24,35 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 ignore-transitive-dependencies = false
 
+# Vision runtime: preserve upstream attribution rather than generic fallbacks.
+[anymap3.clarify]
+license = "BlueOak-1.0.0 OR MIT OR Apache-2.0"
+[[anymap3.clarify.files]]
+path = "COPYING"
+license = "MIT"
+checksum = "cce3eaac7d45535f0c5421e1a7330933e816265e766f4a94f20442de9da548df"
+
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+# These crate tarballs omit their repository-root license. cargo-about uses
+# the published .cargo_vcs_info.json commit and verifies the exact text hash.
+[nom-language.clarify]
+license = "MIT"
+[[nom-language.clarify.git]]
+path = "LICENSE"
+checksum = "4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0"
+
+[tract-extra.clarify]
+license = "MIT OR Apache-2.0"
+[[tract-extra.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
 [rand.clarify]
 license = "MIT OR Apache-2.0"
 
@@ -33,6 +62,17 @@ license = "MIT"
 checksum = "209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b"
 
 [[rand.clarify.files]]
+path = "COPYRIGHT"
+license = "MIT"
+checksum = "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+
+[rand_distr.clarify]
+license = "MIT OR Apache-2.0"
+[[rand_distr.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "a771e4354f6b3ad4c92da1a5c9a239b6c291527db869632ecea4f20e24ca1135"
+[[rand_distr.clarify.files]]
 path = "COPYRIGHT"
 license = "MIT"
 checksum = "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"

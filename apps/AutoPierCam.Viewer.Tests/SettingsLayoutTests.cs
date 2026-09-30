@@ -29,7 +29,9 @@ public sealed class SettingsLayoutTests
     {
         var markup = Markup();
         var details = Named(markup, "PreviewDiagnosticsText").Parent!;
-        Assert.Equal(2, details.Elements().Count()); // heading and live data
+        Assert.Equal(3, details.Elements().Count()); // heading, live data, opt-in model settings
+        Assert.Contains(Named(markup, "SkyModelSettingsButton"), details.Elements());
+        Assert.Equal("Collapsed", (string?)Named(markup, "SkyEstimateText").Attribute("Visibility"));
         Assert.DoesNotContain(markup.Descendants().Attributes("Text"), a =>
             a.Value.Contains("1920-pixel long edge") || a.Value.Contains("full sensor by default"));
     }
