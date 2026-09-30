@@ -1,7 +1,9 @@
 import copy
+from pathlib import Path
+import tempfile
 import unittest
 
-from train_sky import LABELS, metrics, select_samples
+from train_sky import LABELS, check_rust_prediction, digest, metrics, select_samples, verify_snapshot
 
 
 class TrainingContractTests(unittest.TestCase):
@@ -57,6 +59,36 @@ class TrainingContractTests(unittest.TestCase):
         self.assertEqual(result["accepted"], 2)
         self.assertEqual(result["accepted_accuracy"], 0.5)
         self.assertIsNone(metrics([0], [1], [0.4])["accepted_accuracy"])
+
+    def test_metrics_reject_truncation_nonfinite_and_bad_indices(self):
+        for args in (([], [], []), ([0, 1], [0], [0.9]), ([0], [-1], [0.9]),
+                     ([0], [0], [float("nan")]), ([0], [0], [1.1]), ([0.5], [0], [0.9])):
+            with self.assertRaises(ValueError):
+                metrics(*args)
+
+    def test_parity_checks_labels_abstention_confidence_and_identity(self):
+        expected = [0.9, 0.05, 0.05]
+        result = {"probabilities": expected, "label": "clear", "confidence": 0.9,
+                  "task": "sky", "model_id": "test"}
+        self.assertEqual(check_rust_prediction(expected, result, "test"), 0)
+        for field, value in (("label", "overcast"), ("label", None), ("confidence", 0.5),
+                             ("confidence", float("nan")), ("model_id", "wrong"), ("task", "roof"),
+                             ("probabilities", [0.9]), ("probabilities", [float("nan"), 0.05, 0.05])):
+            with self.assertRaises(RuntimeError):
+                check_rust_prediction(expected, {**result, field: value}, "test")
+        uncertain = {**result, "probabilities": [0.4, 0.3, 0.3], "label": None, "confidence": 0.4}
+        self.assertEqual(check_rust_prediction([0.4, 0.3, 0.3], uncertain, "test"), 0)
+
+    def test_snapshot_rejects_changed_image_without_manifest_edit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "manifest.json").write_bytes(b"snapshot")
+            (root / "image.jpg").write_bytes(b"original")
+            rows = [{"id": digest(b"original"), "image": "image.jpg"}]
+            verify_snapshot(root, rows, digest(b"snapshot"))
+            (root / "image.jpg").write_bytes(b"replacement")
+            with self.assertRaisesRegex(RuntimeError, "image changed"):
+                verify_snapshot(root, rows, digest(b"snapshot"))
 
 
 if __name__ == "__main__":

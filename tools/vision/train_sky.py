@@ -6,6 +6,7 @@ and outputs stay local. This script neither downloads weights nor deploys a mode
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import platform
 import subprocess
@@ -60,6 +61,14 @@ def select_samples(manifest, split, manifest_hash):
 
 
 def metrics(truth, predicted, confidence, threshold=0.8):
+    if not truth or not len(truth) == len(predicted) == len(confidence):
+        raise ValueError("Metrics require nonempty, equally sized inputs")
+    if any(type(v) is not int or not 0 <= v < len(LABELS) for v in [*truth, *predicted]):
+        raise ValueError("Invalid class index")
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Invalid threshold")
+    if any(not math.isfinite(v) or not 0 <= v <= 1 for v in confidence):
+        raise ValueError("Invalid confidence")
     matrix = [[0] * 3 for _ in LABELS]
     for actual, guess in zip(truth, predicted):
         matrix[int(actual)][int(guess)] += 1
@@ -73,6 +82,32 @@ def metrics(truth, predicted, confidence, threshold=0.8):
             "coverage": len(accepted) / len(truth),
             "accepted_accuracy": (sum(truth[i] == predicted[i] for i in accepted) / len(accepted)
                                   if accepted else None)}
+
+
+def verify_snapshot(dataset, rows, manifest_hash):
+    if digest((dataset / "manifest.json").read_bytes()) != manifest_hash:
+        raise RuntimeError("Dataset manifest changed during training")
+    for row in rows:
+        if digest((dataset / row["image"]).read_bytes()) != row["id"]:
+            raise RuntimeError(f"Dataset image changed during training: {row['id']}")
+
+
+def check_rust_prediction(expected, result, model_id, threshold=0.8):
+    actual = result.get("probabilities", [])
+    if len(expected) != len(LABELS) or len(actual) != len(LABELS):
+        raise RuntimeError("Rust/torch parity: wrong probability shape")
+    if any(not math.isfinite(v) or not 0 <= v <= 1 for v in [*actual, *expected]):
+        raise RuntimeError("Rust/torch parity: invalid probabilities")
+    error = max(abs(a - b) for a, b in zip(actual, expected))
+    best = max(range(len(LABELS)), key=lambda i: expected[i])
+    label = LABELS[best] if expected[best] >= threshold else None
+    confidence = result.get("confidence", float("nan"))
+    if (error > 1e-5 or not math.isfinite(confidence)
+            or abs(confidence - expected[best]) > 1e-5
+            or result.get("label") != label or result.get("task") != "sky"
+            or result.get("model_id") != model_id):
+        raise RuntimeError("Rust/torch parity: prediction contract mismatch")
+    return error
 
 
 def main():
@@ -157,6 +192,8 @@ def main():
     model.eval()
     with torch.no_grad():
         probabilities = model(inputs).softmax(1).numpy()
+    if probabilities.shape != (len(rows), 3) or not np.isfinite(probabilities).all():
+        raise RuntimeError("Training produced invalid probabilities")
     model_path = output / "sky.onnx"
     # Fixed, small opset-17 graph; tract validation below is the compatibility gate.
     torch.onnx.export(model, torch.zeros(1, 3, 96, 96), str(model_path),
@@ -203,16 +240,14 @@ def main():
     metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=REPO))
     binary = Path(metadata["target_directory"]) / "debug" / ("autopiercam-vision.exe" if sys.platform == "win32" else "autopiercam-vision")
     max_error = 0.0
+    verify_snapshot(dataset, rows, digest(manifest_bytes))
     for i in test_indices:
         result = json.loads(subprocess.check_output([
             str(binary), "infer", "--model", str(model_path), "--spec", str(output / "sky.json"),
             "--image", str(dataset / rows[i]["image"]), "--roi", str(output / "roi.json")], cwd=REPO))
-        error = float(np.max(np.abs(np.asarray(result["probabilities"]) - probabilities[i])))
-        if not np.isfinite(error) or error > 1e-5:
-            raise RuntimeError(f"Rust/torch parity failure for {rows[i]['id']}: {error}")
+        error = check_rust_prediction(probabilities[i].tolist(), result, spec["model_id"], spec["min_confidence"])
         max_error = max(max_error, error)
-    if digest((dataset / "manifest.json").read_bytes()) != digest(manifest_bytes):
-        raise RuntimeError("Dataset changed during training; keep this run as an obsolete snapshot")
+    verify_snapshot(dataset, rows, digest(manifest_bytes))
     report["rust_parity"] = {"verified": True, "images": len(test_indices), "max_probability_error": max_error}
     write_json(output / "report.json", report)
     print(json.dumps({"output": str(output), "test": report["partitions"]["test"],
