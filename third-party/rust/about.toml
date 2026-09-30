@@ -24,6 +24,61 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 ignore-transitive-dependencies = false
 
+# Regain's transport includes the unmodified MPL-2.0 serialport crate.
+# Source availability is documented in the generated notice bundle.
+[serialport]
+accepted = ["MPL-2.0"]
+[serialport.clarify]
+license = "MPL-2.0"
+[[serialport.clarify.files]]
+path = "LICENSE.txt"
+checksum = "00a4d69750686b8fcd2369b17176b4389d67f275fd22b9eab6c66155b72bd4d2"
+
+[chrono.clarify]
+license = "MIT OR Apache-2.0"
+[[chrono.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831"
+
+[regain-core.clarify]
+license = "Apache-2.0"
+[[regain-core.clarify.files]]
+path = "../../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[regain-worker.clarify]
+license = "Apache-2.0"
+[[regain-worker.clarify.files]]
+path = "../../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[regain-transport.clarify]
+license = "Apache-2.0"
+[[regain-transport.clarify.files]]
+path = "../../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[regain-zwo.clarify]
+license = "Apache-2.0"
+[[regain-zwo.clarify.files]]
+path = "../../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[windows-targets.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-targets.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_x86_64_msvc.clarify]
+license = "MIT OR Apache-2.0"
+[[windows_x86_64_msvc.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
 # Vision runtime: preserve upstream attribution rather than generic fallbacks.
 [anymap3.clarify]
 license = "BlueOak-1.0.0 OR MIT OR Apache-2.0"

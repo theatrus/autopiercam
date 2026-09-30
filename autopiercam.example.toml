@@ -1,4 +1,8 @@
 [camera]
+# Both backends run in the isolated Regain worker. No automatic SDK fallback.
+driver = "zwo_sdk"
+# driver = "zwo_direct" # Experimental; ASI662MC not yet supported, ASI676MC max 30 s.
+# serial = "exact-camera-serial" # Required to distinguish identical models.
 # camera_id = 0
 # name_contains = "ASI676MC"
 bin = 1
@@ -6,8 +10,8 @@ min_exposure_us = 100
 # Auto exposure adapts up to 60 seconds; the effective cap depends on the camera.
 max_exposure_us = 60000000
 max_gain = 300
-# Application control enables a gain floor and gain-first exposure adjustment.
-# exposure_control = "adaptive"
+# Regain always uses AutoPierCam's application exposure controller.
+exposure_control = "adaptive"
 # min_gain = 200
 # prefer_short_exposures = true
 # Set min_gain = max_gain for fixed gain with automatic exposure.

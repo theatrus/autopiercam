@@ -1,0 +1,27 @@
+[package]
+name = "autopiercam-regain-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "regain-device"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+regain-zwo.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[dev-dependencies]
+autopiercam = { path = "../autopiercam" }
+autopiercam-camera = { path = "../autopiercam-camera", features = ["simulator"] }
+autopiercam-core = { path = "../autopiercam-core" }
+serde_json.workspace = true
+tempfile.workspace = true
+toml.workspace = true

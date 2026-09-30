@@ -50,3 +50,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p autopiercam-vision --features onnx --locked
       - run: cargo clippy -p autopiercam-vision --all-targets --features onnx --locked -- -D warnings
+      - name: Regain camera simulator tests (no hardware)
+        run: cargo test -p autopiercam-camera -p autopiercam-regain-worker --locked

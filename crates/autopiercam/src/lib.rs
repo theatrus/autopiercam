@@ -1,12 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
-use autopiercam_asi::{
-    BayerPattern as AsiBayerPattern, Camera, CameraInfo, ControlCaps, ControlType, FrameMeta,
-    ImageType, Roi, Sdk,
+use autopiercam_camera::{
+    BayerPattern as AsiBayerPattern, Camera, CameraInfo, ControlCaps, ControlType, Driver,
+    FrameMeta, ImageType, Roi,
 };
-use autopiercam_core::{
-    config::ExposureControl,
-    exposure::{AdaptiveExposure, ExposureSetting, LightMode},
-};
+#[cfg(test)]
+use autopiercam_core::config::ExposureControl;
+use autopiercam_core::exposure::{AdaptiveExposure, ExposureSetting, LightMode};
 use autopiercam_core::{
     config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
@@ -34,8 +33,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-#[cfg(test)]
-mod auto_limits_tests;
 mod exposure;
 mod ledger_maintenance;
 mod preview;
@@ -414,7 +411,7 @@ impl AgentMonitor {
         };
     }
 
-    fn scan_cameras(&self, sdk: &Sdk) -> Result<Vec<CameraInfo>> {
+    fn scan_cameras(&self, sdk: &Driver) -> Result<Vec<CameraInfo>> {
         let result = sdk.cameras();
         self.report_camera_inventory(
             result
@@ -431,7 +428,7 @@ impl AgentMonitor {
                 })
                 .map_err(ToString::to_string),
         );
-        Ok(result?)
+        result
     }
 
     /// Publish a host-level startup or transport failure before camera setup.
@@ -627,7 +624,7 @@ impl AgentMonitor {
     }
 }
 
-pub fn list_cameras(sdk: &Arc<Sdk>, as_json: bool) -> Result<()> {
+pub fn list_cameras(sdk: &Arc<Driver>, as_json: bool) -> Result<()> {
     let cameras = sdk.cameras()?;
     if as_json {
         let value = cameras.iter().map(camera_json).collect::<Vec<_>>();
@@ -653,10 +650,11 @@ pub fn list_cameras(sdk: &Arc<Sdk>, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn probe_camera(sdk: &Arc<Sdk>, camera_id: Option<i32>) -> Result<()> {
+pub fn probe_camera(sdk: &Arc<Driver>, camera_id: Option<i32>) -> Result<()> {
     let info = select_camera(sdk, camera_id)?;
     println!("Opening {} (id {})", info.name, info.camera_id);
     let camera = sdk.open(info)?;
+    println!("Serial: {}", camera.serial());
     println!("Current ROI: {:?}", camera.roi()?);
     for caps in camera.controls()? {
         match camera.control_value(caps.control_type) {
@@ -683,7 +681,7 @@ pub fn probe_camera(sdk: &Arc<Sdk>, camera_id: Option<i32>) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     camera_id: Option<i32>,
     output: &Path,
     settle_frames: u32,
@@ -699,13 +697,13 @@ pub fn snapshot(
     let bayer = core_bayer(info.bayer_pattern)?;
     let mut camera = sdk.open(info.clone())?;
     let controls = camera.controls()?;
-    let auto_limits = configure_sdk_auto(
-        &mut camera,
-        &controls,
+    let snapshot_config = CameraConfig {
         max_exposure_us,
         max_gain,
         target_brightness,
-    )?;
+        ..CameraConfig::default()
+    };
+    let auto_limits = configure_adaptive(&mut camera, &controls, &snapshot_config)?;
 
     camera.set_roi(Roi {
         width: info.max_width,
@@ -713,9 +711,12 @@ pub fn snapshot(
         bin: 1,
         image_type: ImageType::Raw8,
     })?;
-    camera.start_video()?;
+    camera.start_capture()?;
     let mut progress = CaptureProgress::new(&camera, auto_limits, 0, settle_frames);
     let mut observer = CaptureObserver::new(bayer, None, None);
+    let mut state = CaptureLoopState::default();
+    state.configure_exposure(&snapshot_config, auto_limits);
+    observer.adaptive = state.adaptive;
     let frame = wait_for_auto_settle(
         &mut camera,
         settle_frames,
@@ -725,7 +726,7 @@ pub fn snapshot(
         &mut observer,
     )?
     .context("snapshot was cancelled while automatic exposure was settling")?;
-    camera.stop_video()?;
+    camera.stop_capture()?;
     let meta = frame.meta;
     let rgb = match meta.image_type {
         ImageType::Raw8 => demosaic_bilinear(&frame.data, meta.width, meta.height, bayer)?,
@@ -881,7 +882,7 @@ impl CaptureProgress {
         }
         // Sleeping while the video stream runs only drops frames: the camera
         // and USB transfer stay busy. Retain the handle and application AE state.
-        camera.stop_video()?;
+        camera.stop_capture()?;
         loop {
             // Settling cannot apply reloads yet; do not let a pending save
             // disable pacing for the rest of startup.
@@ -965,12 +966,12 @@ impl<'a> CaptureObserver<'a> {
         if next == current {
             return Ok(false);
         }
-        // Discard the SDK pipeline before changing manual controls, so the next
-        // sample cannot drive feedback using a queued image with old settings.
-        camera.stop_video()?;
+        // Controls change only after this frame has downloaded. Regain has no
+        // video backlog; the next exposure uses the new settings.
+        camera.stop_capture()?;
         camera.set_control(ControlType::EXPOSURE, next.exposure_us, false)?;
         camera.set_control(ControlType::GAIN, next.gain, false)?;
-        camera.start_video()?;
+        camera.start_capture()?;
         info!(exposure_us = next.exposure_us, gain = next.gain, mode = ?controller.mode(), "adaptive exposure updated");
         Ok(true)
     }
@@ -1010,7 +1011,7 @@ impl<'a> CaptureObserver<'a> {
     }
 }
 
-pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) -> Result<()> {
+pub fn run_agent(sdk: &Arc<Driver>, config_path: &Path, max_frames: Option<u64>) -> Result<()> {
     let control = AgentControl::new();
     let handler_control = control.clone();
     ctrlc::set_handler(move || handler_control.shutdown()).context("installing Ctrl-C handler")?;
@@ -1022,7 +1023,7 @@ pub fn run_agent(sdk: &Arc<Sdk>, config_path: &Path, max_frames: Option<u64>) ->
 /// Unlike [`run_agent`], this function does not install a process-wide Ctrl-C
 /// handler, so GUI hosts can own their shutdown policy and event loop.
 pub fn run_agent_with_control(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     config_path: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1032,7 +1033,7 @@ pub fn run_agent_with_control(
 
 /// Run the worker while publishing snapshots for the tray and local clients.
 pub fn run_agent_with_monitor(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     config_path: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1070,7 +1071,7 @@ pub fn run_agent_with_monitor(
 
 /// Run the worker while publishing bounded, latest-only preview frames.
 pub fn run_agent_with_monitor_and_preview(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     config_path: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1088,7 +1089,7 @@ pub fn run_agent_with_monitor_and_preview(
 }
 
 fn run_agent_with_optional_preview(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     config_path: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1110,7 +1111,7 @@ fn publish_attempt_result(result: &Result<()>, control: &AgentControl, monitor: 
 }
 
 fn run_agent_inner(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     config_path: &Path,
     max_frames: Option<u64>,
     control: &AgentControl,
@@ -1136,21 +1137,12 @@ fn run_agent_inner(
             info.name
         );
     }
-    monitor.set_camera(&info);
     let bayer = core_bayer(info.bayer_pattern)?;
     let mut camera = sdk.open(info.clone())?;
+    monitor.set_camera(camera.info());
+    info!(serial = camera.serial(), "Regain camera identity verified");
     let controls = camera.controls()?;
-    let mut auto_limits = if config.camera.exposure_control == ExposureControl::Adaptive {
-        configure_adaptive(&mut camera, &controls, &config.camera)?
-    } else {
-        configure_sdk_auto(
-            &mut camera,
-            &controls,
-            config.camera.max_exposure_us,
-            config.camera.max_gain,
-            config.camera.target_brightness,
-        )?
-    };
+    let mut auto_limits = configure_adaptive(&mut camera, &controls, &config.camera)?;
     CaptureProgress::new(
         &camera,
         auto_limits,
@@ -1201,7 +1193,7 @@ fn run_agent_inner(
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
     let mut state = CaptureLoopState::default();
     state.configure_exposure(&config.camera, auto_limits);
-    camera.start_video()?;
+    camera.start_capture()?;
     let result = (|| {
         loop {
             if !run_recording_epoch(
@@ -1227,17 +1219,7 @@ fn run_agent_inner(
                 bail!("camera layout changed; capture must restart");
             }
             if config.camera != next.camera {
-                auto_limits = if next.camera.exposure_control == ExposureControl::Adaptive {
-                    configure_adaptive(&mut camera, &controls, &next.camera)?
-                } else {
-                    configure_sdk_auto(
-                        &mut camera,
-                        &controls,
-                        next.camera.max_exposure_us,
-                        next.camera.max_gain,
-                        next.camera.target_brightness,
-                    )?
-                };
+                auto_limits = configure_adaptive(&mut camera, &controls, &next.camera)?;
                 state.configure_exposure(&next.camera, auto_limits);
             }
             if config.capture.interval_ms != next.capture.interval_ms {
@@ -1249,7 +1231,7 @@ fn run_agent_inner(
         }
         Ok(())
     })();
-    let stop_result = camera.stop_video().map_err(Into::into);
+    let stop_result = camera.stop_capture();
     let preview_result = preview_encoder
         .map(PreviewEncoder::stop_and_join)
         .unwrap_or(Ok(()));
@@ -1441,9 +1423,7 @@ impl Default for CaptureLoopState {
 
 impl CaptureLoopState {
     fn configure_exposure(&mut self, config: &CameraConfig, limits: AutoLimits) {
-        if config.exposure_control == ExposureControl::Adaptive
-            && let Some(controller) = &mut self.adaptive
-        {
+        if let Some(controller) = &mut self.adaptive {
             controller.update_limits(
                 limits.min_exposure_us,
                 limits.max_exposure_us,
@@ -1454,7 +1434,7 @@ impl CaptureLoopState {
             controller.set_prefer_short_exposures(config.prefer_short_exposures);
             return;
         }
-        self.adaptive = (config.exposure_control == ExposureControl::Adaptive).then(|| {
+        self.adaptive = Some({
             let mut controller = AdaptiveExposure::new(
                 limits.min_exposure_us,
                 limits.max_exposure_us,
@@ -1591,7 +1571,7 @@ fn capture_loop(
                 if control.reload_pending.load(Ordering::Acquire) {
                     continue;
                 }
-                camera.start_video()?;
+                camera.start_capture()?;
                 progress.refresh(camera, *auto_limits);
                 progress.publish(&observer);
                 if progress.wait.expired(progress.started.elapsed()) {
@@ -1600,7 +1580,7 @@ fn capture_loop(
                         duration_millis(progress.wait.timeout())
                     );
                 }
-                let result = camera.next_video_frame_into(
+                let result = camera.poll_frame(
                     &mut frame_buffer,
                     poll_timeout_ms(progress.status.exposure_us),
                 );
@@ -1711,7 +1691,7 @@ fn wait_for_auto_settle(
         if control.is_some_and(AgentControl::is_shutdown) {
             return Ok(None);
         }
-        camera.start_video()?;
+        camera.start_capture()?;
         progress.refresh(camera, limits);
         progress.publish(observer);
         match settling.decision(
@@ -1735,7 +1715,7 @@ fn wait_for_auto_settle(
             }
             WaitDecision::Continue => {}
         }
-        let result = camera.next_video_frame_into(
+        let result = camera.poll_frame(
             &mut frame_buffer,
             poll_timeout_ms(progress.status.exposure_us),
         );
@@ -2003,26 +1983,24 @@ fn unix_time_millis() -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn select_camera(sdk: &Arc<Sdk>, camera_id: Option<i32>) -> Result<CameraInfo> {
-    let cameras = sdk.cameras()?;
-    if let Some(camera_id) = camera_id {
-        return cameras
-            .into_iter()
-            .find(|camera| camera.camera_id == camera_id)
-            .ok_or_else(|| anyhow!("camera id {camera_id} is not connected"));
-    }
-    match cameras.len() {
-        0 => bail!("no ZWO ASI camera is connected"),
-        1 => Ok(cameras.into_iter().next().expect("length checked")),
-        count => bail!("{count} cameras are connected; select one with --camera-id"),
-    }
+fn select_camera(sdk: &Arc<Driver>, camera_id: Option<i32>) -> Result<CameraInfo> {
+    select_configured_camera(
+        sdk.cameras()?,
+        &CameraConfig {
+            camera_id,
+            serial: sdk.selected_serial().map(str::to_owned),
+            ..CameraConfig::default()
+        },
+    )
 }
 
 fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> Result<CameraInfo> {
+    let inventory = cameras.clone();
     let mut cameras = cameras.into_iter().filter(|camera| {
-        config
-            .camera_id
-            .is_none_or(|camera_id| camera.camera_id == camera_id)
+        (config.serial.is_some()
+            || config
+                .camera_id
+                .is_none_or(|camera_id| camera.camera_id == camera_id))
             && config.name_contains.as_ref().is_none_or(|needle| {
                 camera
                     .name
@@ -2033,7 +2011,13 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
     let selected = cameras
         .next()
         .ok_or_else(|| anyhow!("no connected camera matches the configuration"))?;
-    if cameras.next().is_some() {
+    if config.serial.is_none() && inventory.iter().filter(|c| c.name == selected.name).count() > 1 {
+        bail!("several cameras have this model; enter the exact camera serial in Settings");
+    }
+    // Regain direct inventory uses one model descriptor for identical units.
+    // An explicit serial selects the physical device in the worker; this only
+    // selects equivalent metadata. Without a serial, ambiguity is an error.
+    if cameras.any(|other| config.serial.is_none() || other.name != selected.name) {
         bail!(
             "more than one connected camera matches the configuration; choose a camera in the Viewer and save settings"
         );
@@ -2043,17 +2027,7 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
 
 fn reconfigure_exposure(camera: &mut Camera, config: &CameraConfig) -> Result<AutoLimits> {
     let controls = camera.controls()?;
-    if config.exposure_control == ExposureControl::Adaptive {
-        configure_adaptive(camera, &controls, config)
-    } else {
-        configure_sdk_auto(
-            camera,
-            &controls,
-            config.max_exposure_us,
-            config.max_gain,
-            config.target_brightness,
-        )
-    }
+    configure_adaptive(camera, &controls, config)
 }
 
 fn configure_adaptive(
@@ -2067,6 +2041,13 @@ fn configure_adaptive(
     let gain = control(controls, ControlType::GAIN)
         .filter(|c| c.writable)
         .context("camera needs a writable manual gain control")?;
+    if camera.is_direct() && config.max_exposure_us > exposure.max_value {
+        bail!(
+            "Requested maximum exposure {} us exceeds Regain direct limit {} us; lower the limit or explicitly select the SDK backend",
+            config.max_exposure_us,
+            exposure.max_value
+        );
+    }
     let max_exposure_us = config
         .max_exposure_us
         .clamp(exposure.min_value.max(1), exposure.max_value);
@@ -2124,123 +2105,6 @@ fn adaptive_gain_limits(config: &CameraConfig, caps: &ControlCaps) -> Result<(i6
     Ok((min, max))
 }
 
-fn configure_sdk_auto(
-    camera: &mut Camera,
-    controls: &[ControlCaps],
-    max_exposure_us: i64,
-    max_gain: i64,
-    target_brightness: i64,
-) -> Result<AutoLimits> {
-    if max_exposure_us <= 0 || max_gain < 0 {
-        bail!("maximum exposure must be positive and maximum gain non-negative");
-    }
-    let exposure_caps =
-        control(controls, ControlType::EXPOSURE).context("camera has no exposure control")?;
-    let gain_caps = control(controls, ControlType::GAIN).context("camera has no gain control")?;
-    if !exposure_caps.writable || !exposure_caps.auto_supported {
-        bail!("camera exposure control does not support automatic video mode");
-    }
-    if !gain_caps.writable || !gain_caps.auto_supported {
-        bail!("camera gain control does not support automatic video mode");
-    }
-
-    // SDK documentation calls control 11 microseconds, while current cameras
-    // expose AutoExpMaxExpMS. Honor the runtime capability name.
-    let auto_max_exposure_caps = control(controls, ControlType::AUTO_MAX_EXPOSURE)
-        .filter(|caps| caps.writable)
-        .context("camera has no writable automatic exposure ceiling; bounded SDK auto mode is unavailable")?;
-    let auto_max_exposure = auto_exposure_limit_value(
-        auto_max_exposure_caps,
-        max_exposure_us.clamp(exposure_caps.min_value, exposure_caps.max_value),
-    )
-    .clamp(
-        auto_max_exposure_caps.min_value,
-        auto_max_exposure_caps.max_value,
-    );
-    set_if_available(
-        camera,
-        controls,
-        ControlType::AUTO_MAX_EXPOSURE,
-        auto_max_exposure,
-        false,
-    )?;
-    let readback = camera
-        .control_value(ControlType::AUTO_MAX_EXPOSURE)
-        .context("reading back the SDK automatic exposure ceiling")?;
-    if !(auto_max_exposure_caps.min_value..=auto_max_exposure_caps.max_value)
-        .contains(&readback.value)
-    {
-        bail!("SDK returned an automatic exposure ceiling outside its advertised limits");
-    }
-    let effective_max_exposure_us = auto_exposure_limit_us(auto_max_exposure_caps, readback.value)
-        .clamp(exposure_caps.min_value, exposure_caps.max_value);
-    if effective_max_exposure_us <= 0 {
-        bail!("SDK returned a non-positive automatic exposure ceiling");
-    }
-    if effective_max_exposure_us != max_exposure_us {
-        warn!(
-            requested_max_exposure_us = max_exposure_us,
-            effective_max_exposure_us, "camera adjusted the requested automatic exposure ceiling"
-        );
-    }
-    info!(
-        requested_max_exposure_us = max_exposure_us,
-        effective_max_exposure_us,
-        sdk_auto_max_exposure_us =
-            auto_exposure_limit_us(auto_max_exposure_caps, auto_max_exposure_caps.max_value),
-        "configured automatic exposure limits"
-    );
-
-    let effective_max_gain = control(controls, ControlType::AUTO_MAX_GAIN)
-        .map(|caps| max_gain.clamp(caps.min_value, caps.max_value))
-        .unwrap_or(max_gain)
-        .clamp(gain_caps.min_value, gain_caps.max_value);
-    set_if_available(
-        camera,
-        controls,
-        ControlType::AUTO_MAX_GAIN,
-        effective_max_gain,
-        false,
-    )?;
-    let effective_target = control(controls, ControlType::AUTO_TARGET_BRIGHTNESS)
-        .map(|caps| target_brightness.clamp(caps.min_value, caps.max_value))
-        .unwrap_or(target_brightness);
-    set_if_available(
-        camera,
-        controls,
-        ControlType::AUTO_TARGET_BRIGHTNESS,
-        effective_target,
-        false,
-    )?;
-    set_if_available(camera, controls, ControlType::FLIP, 0, false)?;
-    let exposure = camera
-        .control_value(ControlType::EXPOSURE)
-        .map(|value| value.value)
-        .ok()
-        .or_else(|| control(controls, ControlType::EXPOSURE).map(|caps| caps.default_value))
-        .context("camera has no exposure control")?;
-    // A camera can retain an exposure from a previous application/session.
-    // Seed auto mode within the newly confirmed ceiling, including on restart
-    // after the operator lowers the maximum for daylight.
-    let exposure = exposure.clamp(exposure_caps.min_value, effective_max_exposure_us);
-    set_if_available(camera, controls, ControlType::EXPOSURE, exposure, true)?;
-    let gain = camera
-        .control_value(ControlType::GAIN)
-        .map(|value| value.value)
-        .ok()
-        .or_else(|| control(controls, ControlType::GAIN).map(|caps| caps.default_value))
-        .context("camera has no gain control")?;
-    let gain = gain.clamp(gain_caps.min_value, effective_max_gain);
-    set_if_available(camera, controls, ControlType::GAIN, gain, true)?;
-    Ok(AutoLimits {
-        min_exposure_us: exposure_caps.min_value,
-        max_exposure_us: effective_max_exposure_us,
-        min_gain: gain_caps.min_value,
-        max_gain: effective_max_gain,
-        target_brightness: effective_target,
-    })
-}
-
 fn set_if_available(
     camera: &mut Camera,
     controls: &[ControlCaps],
@@ -2270,22 +2134,6 @@ fn control(controls: &[ControlCaps], control_type: ControlType) -> Option<&Contr
     controls
         .iter()
         .find(|caps| caps.control_type == control_type)
-}
-
-fn auto_exposure_limit_value(caps: &ControlCaps, exposure_us: i64) -> i64 {
-    if caps.name.to_ascii_lowercase().contains("ms") {
-        exposure_us.saturating_add(999) / 1_000
-    } else {
-        exposure_us
-    }
-}
-
-fn auto_exposure_limit_us(caps: &ControlCaps, sdk_value: i64) -> i64 {
-    if caps.name.to_ascii_lowercase().contains("ms") {
-        sdk_value.saturating_mul(1_000)
-    } else {
-        sdk_value
-    }
 }
 
 fn core_bayer(pattern: AsiBayerPattern) -> Result<BayerPattern> {
@@ -2608,22 +2456,25 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_models_can_be_selected_by_id() {
+    fn duplicate_models_require_serial_and_ignore_stale_ids_when_serial_is_explicit() {
         let cameras = vec![
             detected_camera(3, "ASI676MC"),
             detected_camera(7, "ASI676MC"),
         ];
-        let config = CameraConfig {
+        let mut config = CameraConfig {
             camera_id: Some(7),
             name_contains: Some("ASI676MC".into()),
             ..CameraConfig::default()
         };
-        assert_eq!(
-            select_configured_camera(cameras, &config)
-                .unwrap()
-                .camera_id,
-            7
+        assert!(
+            select_configured_camera(cameras.clone(), &config)
+                .unwrap_err()
+                .to_string()
+                .contains("serial")
         );
+        config.serial = Some("explicit-selection".into());
+        config.camera_id = Some(99);
+        assert!(select_configured_camera(cameras, &config).is_ok());
     }
 
     #[test]

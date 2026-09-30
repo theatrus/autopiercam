@@ -33,54 +33,43 @@ The intended process and data flow is:
                     |           |
              safe retention   durable upload queue
 
-Only the camera thread calls ASICamera2. The UI never loads the vendor DLL or
-opens a camera.
+Only the capture-owner thread commands Regain. The Viewer and IPC paths do
+not load the SDK or open camera handles. The owner starts a supervised
+regain-device child and uses start/status/download requests to acquire frames.
 
 ### Acquisition pacing
 
-`capture.preview_max_fps` is a live-reloadable integer from 1–30, default 2.
-Preview publication is independently rate-limited using a monotonic clock, even
-when explicit still requests or a faster still schedule require more frames.
-For short exposures the capture thread stops the **video stream**, waits for
-the next acquisition slot, and starts it again on the same camera handle. A
-sleep with the stream left running would merely discard frames while leaving
-the camera and USB busy. No camera enumeration or close/open occurs during
-pacing. Exposure/gain controls and application settling/adaptive history are
-retained. Long exposures at least as long as the preview period are not stopped
-for pacing, and no catch-up burst is accumulated after slow processing.
+capture.preview_max_fps is live-reloadable (1–30, default 2). Individual
+exposures start only when the next preview or still is due. Long exposures are
+not interrupted for pacing; there is no queued video stream to drain.
 
-The idle wait checks shutdown, pending live reload, and explicit still requests
-every 25 ms (reloads/requests are applied after startup settling). A rate save
-alone does not drain recording services or restart settling. Paused recording
-and storage pressure keep the preview cadence without acquiring extra scheduled
-stills. Security video and Chatstronomy sample the capped shared preview.
+Exposure/gain edits during a frame are queued until its completion. Ordinary
+saves preserve controller history and settling. Backend, serial, camera or
+image-layout changes restart the session. Paused recording keeps previews
+running without acquiring extra scheduled stills.
 
-This is host-side pacing, not a firmware FPS setting: SDK pipeline buffering and
-stop/start overhead can make actual frame rates lower or cause extra sensor
-frames. The bundled SDK has no documented frame-rate-limit control. Validate
-SDK auto-exposure convergence and sustained day/night stream stop/start on the
-target hardware before relying on this for unattended operation; unit tests do
-not exercise physical cameras.
+### Regain adapter
 
-## Components
+autopiercam-camera wraps regain-core's supervised worker transport. The
+camera-only autopiercam-regain-worker entry point calls the pinned upstream
+drivers without duplicating SDK bindings. Regain SDK and experimental direct
+USB are explicit choices; unsupported direct settings fail without fallback.
 
-### ZWO adapter
+    Closed -> Discover -> Open -> Configure -> Expose -> Download
+                            ^                     |          |
+                            +----- next frame ----+----------+
+                            |
+                          Close
+    Any fault -> Kill worker -> wait for operator restart
 
-autopiercam-asi loads an application-controlled absolute DLL path, resolves the
-documented C ABI, and retains the module for every function pointer and camera
-handle. It represents vendor enums as open Rust values so a future SDK cannot
-create undefined behavior by returning a new value.
+The adapter validates identity, capabilities and frame layout, caches controls
+while exposing, and rejects live discovery while a camera is owned. It keeps
+RAW16 samples for PNG stills or derives RAW8 from their high bytes. Regain calls
+have deadlines; AutoPierCam separately enforces frame-progress deadlines.
+Unexpected capture exits latch a fault rather than rescan/reopen automatically.
 
-The lifecycle is enforced as:
-
-    Disconnected -> Open -> Initialized -> Configured -> Streaming
-          ^                                            |
-          +------------ Stop -> Close -----------------+
-
-Reconfiguration always transitions through Stopped. Hot-unplug errors trigger
-best-effort stop/close, re-enumeration, and exponential reconnect backoff.
-Persisted selection will use the camera serial number rather than the transient
-SDK camera index.
+See [Regain backend](regain-backend.md) for selection, exact dependency pin,
+current camera support and required hardware validation.
 
 ### Portable core
 

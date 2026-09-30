@@ -418,6 +418,7 @@ try {
         'autopiercam-tray.exe',
         'autopiercam.exe',
         'autopiercam-vision.exe',
+        'regain-device.exe',
         'autopiercam.example.toml',
         'installation.md',
         'LICENSE-AutoPierCam.txt',
@@ -609,6 +610,13 @@ try {
     ) {
         throw 'Packaged capture CLI does not expose the MSI graceful-stop command contract.'
     }
+
+    $regainPath = Join-Path $installImage 'regain-device.exe'
+    Assert-AutoPierCamStaticCrt -Path $regainPath -Description 'Packaged Regain worker'
+    Assert-AutoPierCamVersionResource -Path $regainPath -Version $Version `
+        -FileDescription 'AutoPierCam Regain camera worker' -OriginalFilename 'regain-device.exe'
+    Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
+    Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Packaged Regain worker'
 
     $visionPath = Join-Path $installImage 'autopiercam-vision.exe'
     Assert-AutoPierCamStaticCrt -Path $visionPath -Description 'Packaged vision worker'

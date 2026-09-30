@@ -807,6 +807,14 @@ internal sealed record AgentConfiguration
 
 internal sealed record AgentCameraConfiguration
 {
+    [JsonPropertyName("driver")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Driver { get; init; }
+
+    [JsonPropertyName("serial")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Serial { get; init; }
+
     [JsonPropertyName("exposure_control")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ExposureControl { get; init; }

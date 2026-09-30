@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/autopiercam",
-    "crates/autopiercam-asi",
+    "crates/autopiercam-camera",
+    "crates/autopiercam-regain-worker",
     "crates/autopiercam-chatstronomy",
     "crates/autopiercam-core",
     "crates/autopiercam-protocol",
@@ -22,6 +23,8 @@ repository = "https://github.com/theatrus/autopiercam"
 rust-version = "1.88"
 
 [workspace.dependencies]
+regain-core = { git = "https://github.com/pulsarfab/regain", rev = "3011d788e2757158fba2e9945809ed499eda704c" }
+regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "3011d788e2757158fba2e9945809ed499eda704c", default-features = false, features = ["asi-sdk", "asi-direct"] }
 anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["derive", "env"] }
 ctrlc = "3.5.2"

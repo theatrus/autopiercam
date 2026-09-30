@@ -25,10 +25,11 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-The repository now contains a hardware-validated background capture slice:
+The development branch uses [Regain camera drivers](docs/regain-backend.md).
+This migration has simulator coverage; physical-camera validation is still required.
+The published 0.2.11 release predates it.
 
-- dynamic loading of the bundled ZWO ASI SDK 1.41;
-- checked C ABI layouts and safe camera lifecycle/control wrappers;
+- pinned Regain drivers in an isolated worker, with explicit SDK or direct USB selection;
 - camera enumeration and capability probing without capture or exposure/gain
   changes (opening normalizes the SDK's persisted dark-subtraction flag);
 - bounded full-resolution RAW8 and RAW16 capture from the attached ASI676MC;
@@ -36,13 +37,12 @@ The repository now contains a hardware-validated background capture slice:
 - a validated, forward-looking TOML configuration model;
 - a continuous camera drain loop with auto-exposure settling and a bounded
   still-writer queue;
-- minute-long SDK auto-exposure limits, startup previews, exposure progress,
+- exposure-aware limits, startup previews, exposure progress,
   and exposure-aware stale-frame detection in both viewers;
-- opt-in application-controlled exposure beyond 60 seconds, lossless 16-bit PNG
+- application-controlled exposure beyond 60 seconds where supported, lossless 16-bit PNG
   stills, and bounded preview-resolution MP4 recording; see
   [exposure](docs/exposure.md) and [video](docs/video.md);
-- a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
-  backoff;
+- a restartable camera supervisor; faults require an explicit restart or settings save;
 - a Windows notification-area host that owns and supervises the camera worker;
 - per-user Windows installer packaging with optional start-at-sign-in,
   self-contained Viewer deployment, orderly upgrade shutdown, and retained
@@ -195,7 +195,8 @@ troubleshooting, development, and package details.
 
 ## Workspace
 
-- crates/autopiercam-asi: dynamically loaded ASICamera2 wrapper.
+- crates/autopiercam-camera: capture-owner adapter to Regain's supervised worker.
+- crates/autopiercam-regain-worker: camera-only entry point for pinned upstream drivers.
 - crates/autopiercam-core: portable configuration and image processing.
 - crates/autopiercam-protocol: control envelopes plus bounded preview-v1 framing.
 - crates/autopiercam: reusable capture engine plus diagnostic CLI.

@@ -1,94 +1,90 @@
-# Regain direct-driver migration
+# Regain camera backend
 
-Decision (2026-09-26): prefer the SDK-free Regain camera backend for AutoPierCam
-once ASI662MC support and pier-camera requirements are validated. Do not change
-the installed backend or silently fall back between SDK and Direct USB today.
+AutoPierCam uses Regain 0.5.0, pinned to commit
+`3011d788e2757158fba2e9945809ed499eda704c` in Cargo.toml and Cargo.lock.
+There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
+point calls the unchanged upstream drivers; `regain-core::Worker` owns the
+framed transport, deadlines and process supervision.
 
-## Why
+## Selection
 
-The incident investigated in [PR #12](https://github.com/theatrus/autopiercam/pull/12)
-stalled acquisition inside SDK 1.41's camera-property lookup, which internally
-opened a different camera during periodic discovery. The operator also reported
-other ZWO cameras stopped working on the same system. The dump proves the
-user-space SDK loop; it does not establish whether the wider failure was in a
-USB controller, kernel driver, firmware, or another shared component.
+Settings has an explicit **Camera driver** choice:
 
-No live SDK inventory polling is allowed during acquisition, settling, or paused
-recording. Worker process isolation contains a hung process but does not guarantee
-hardware or system-wide USB recovery. Recovery must not reset unrelated cameras,
-hubs or controllers, or repeatedly enumerate them after a fault.
+- **Regain · ZWO SDK** (default): supports ASI662MC and ASI676MC through the
+  vendor library. The installer still includes the reviewed SDK DLL.
+- **Regain · ZWO Direct USB** (experimental): ASI676MC is supported, with a
+  maximum exposure of 30 seconds. ASI662MC is not supported yet.
 
-## Current support gate
+There is no automatic fallback. Adding ASI662MC direct support requires a
+reviewed Regain pin update and hardware validation, not a local driver.
+Other camera vendors can be added behind the adapter as Regain implements them;
+this version does not claim support for non-ZWO or monochrome cameras.
 
-Inspected [pulsarfab/regain](https://github.com/pulsarfab/regain) at
-`00e042dd9309b95bacefacc13a03209d920119ee`:
+```toml
+[camera]
+driver = "zwo_sdk" # or "zwo_direct", explicitly
+# serial = "exact-camera-serial"
+exposure_control = "adaptive"
+max_exposure_us = 60000000 # use <= 30000000 for ASI676MC direct
+```
 
-- Direct capture includes ASI676MC, not ASI662MC. Do not alias these models or
-  infer register compatibility from similar sensors/resolution.
-- The ASI676MC direct settings currently enforce 32 microseconds through
-  **30 seconds**, RAW16 and bin 1. This is not yet a drop-in replacement for
-  AutoPierCam's 60-second-and-longer night exposures.
-- `regain-core::Session` supervises per-camera worker processes, and
-  `regain-device zwo camera-direct --serve` provides the framed worker protocol.
-  Reuse these ownership/recovery boundaries, rather than loading another native
-  camera implementation into the tray/UI process.
-- Regain's SDK mode still loads ZWO's SDK. It may improve process containment,
-  but switching to it is not the requested SDK-free migration.
+Keep the selected model filter. Backend changes clear the transient camera ID
+in the Viewer and restart capture. A saved serial is verified on open.
+Identical models require an exact serial; an ambiguous selection never silently
+opens the first camera. SDK IDs remain useful for selecting distinct models
+but are not durable USB identity.
 
-Recheck capabilities on the exact pinned version before implementation. No new
-runtime dependency, backend selector, or claim of ASI662MC support is added by
-this design decision.
+## Capture and safety
 
-## Integration boundary
+Only the capture owner starts or commands a worker. Discovery runs before open,
+never while acquiring, settling or paused. IPC and the Viewer use cached
+inventory and previews; they do not open camera handles.
 
-Introduce a capture-provider boundary where the current ASI-specific acquisition
-loop produces completed frames. Keep camera handles and register I/O in the
-selected worker; keep debayering, preview, stills/video, storage, sharing and
-configuration in AutoPierCam.
+Frames use Regain's start/status/download API, paced to the configured preview
+rate and still schedule. RAW16 is acquired for both output modes; RAW8 is
+derived from the high byte locally. The adapter validates dimensions, byte
+length, ROI alignment, RAW16 support and Bayer phase. Cleanup errors reject
+the frame.
 
-The provider contract must supply:
+AutoPierCam's application exposure/gain controller is always active, including
+for legacy configurations whose exposure_control is omitted or sdk. Existing
+limits and gain preferences remain unchanged. SDK auto exposure is not used.
+Edits during exposure wait for the next frame, without resetting settling.
+A direct-backend exposure ceiling above its capabilities faults visibly rather
+than silently shortening night exposures.
 
-- Explicit, stable model/serial selection and a cached discovery snapshot.
-  Translate existing ID/model selection only with operator confirmation; USB
-  enumeration indexes are not stable identity. No first-match fallback.
-- Actual RAW16 layout, Bayer pattern, ROI, dimensions, exposure/gain bounds and
-  effective applied settings. Preserve full-resolution stills and full-HD previews.
-- One completed frame with its capture timestamp, sequence and worker generation.
-  Regain's still-oriented start/status/download workflow needs paced successive
-  captures, not an assumption that it implements the ASI video API.
-- Cancellation and operation deadlines enforced by the parent process. Report
-  distinct capture, transfer and worker-stall phases; transport responsiveness
-  alone cannot renew the frame-progress clock.
-- Bounded worker teardown and verified exit before reopening the same identity.
-  Stop automatic retries and ask for operator intervention when recovery fails;
-  no automatic USB hub/controller reset.
+Regain calls have parent-enforced deadlines (15 s open, 5 s controls/start,
+2 s status/stop/close, 10 s download); frame progress retains AutoPierCam's
+exposure-aware deadline. A poll reporting 'exposing' is not a completed frame.
+Faults terminate the worker. The tray stops automatic retries: restart from the
+tray or save corrected settings to try again. No USB reset, port cycle, controller
+reset, background rescan, or cross-backend recovery is performed.
 
-Use AutoPierCam's application-controlled exposure/gain loop for direct capture;
-there is no ZWO SDK auto-exposure engine in this mode. Keep its day/night state,
-settling state, scene-change reference and pause intent through ordinary settings
-saves. Reject unsupported exposure requests visibly; never silently cap a night
-configuration to 30 seconds or fall back to SDK discovery.
+Process isolation bounds a hung user-space call. It does not guarantee recovery
+from a wedged kernel driver, USB controller, firmware or another application's
+camera ownership. The earlier SDK discovery incident and shared hardening are
+recorded in [AutoPierCam PR #12](https://github.com/theatrus/autopiercam/pull/12)
+and [Regain PR #1](https://github.com/pulsarfab/regain/pull/1).
 
-## Acceptance before enabling ASI662MC
+## Build and validation
 
-1. Regain implements and identifies ASI662MC directly, with tested frame parsing,
-   Bayer phase, ROI and manual controls. Unsupported models fail before register I/O.
-2. Capabilities expose the validated exposure ceiling; validate 30/60-second and
-   longer exposures required by the installation rather than assuming SDK parity.
-3. Simulated/fixture tests cover stuck list/open/control/read/close, stale status,
-   malformed frames, clock changes, reconnect identity and quit during every phase.
-4. Operator-approved isolated-hardware tests cover sustained night/day transitions,
-   USB interruption and long-running acquisition. No discovery during multi-camera
-   imaging. Confirm other cameras are unaffected; simulator success is not evidence.
-5. Ship a pinned worker with licensing, installer lifecycle handling and release
-   tests. Continue publishing every released AutoPierCam NINA plugin through the
-   shared registry, not only as a GitHub ZIP.
+```powershell
+cargo build -p autopiercam -p autopiercam-tray -p autopiercam-regain-worker
+cargo test -p autopiercam-camera -p autopiercam-regain-worker
+```
 
-## Shared hardening
+Keep regain-device beside the capture executable. For development only,
+AUTOPIERCAM_REGAIN_DIRECTORY may point to its directory. SDK paths are resolved
+before worker launch; direct mode never loads the SDK DLL. The installer stages,
+validates and signs the worker with the other programs. Driver source and
+dependency licensing are included in the generated notice bundle.
 
-[Regain PR #1](https://github.com/pulsarfab/regain/pull/1) shares a connected-worker
-SDK discovery guard, simulator/fixture tests and malformed-descriptor regressions.
-Its `docs/sdk-lifecycle.md` carries the sanitized incident findings, the
-per-worker no-live-discovery rule, the limits of process isolation, and remaining
-cross-process discovery risk. Share code/tests at that boundary; do not publish
-the full-memory dump, private log paths, credentials or observatory images.
+Tests use Regain's --simulate backend, never hardware. They cover SDK and direct
+frames, ownership, live-discovery rejection, serial mismatch, RAW16 conversion,
+in-flight edits, long-exposure cancellation, download faults, process crashes and
+hung downloads. CI runs these on Windows, Linux x64/ARM64 and macOS ARM64.
+
+Before release, validate an isolated physical camera with operator approval:
+day/night convergence, native Bayer orientation and geometry, short/30/60-second
+exposures where supported, rate limiting, live saves, USB interruption, and
+bounded quit. Simulator success is not hardware validation.

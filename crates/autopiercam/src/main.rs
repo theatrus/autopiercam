@@ -2,7 +2,7 @@ use anyhow::Result;
 use autopiercam::{
     archive_upload_ledger, list_cameras, migrate_upload_ledger, probe_camera, run_agent, snapshot,
 };
-use autopiercam_asi::Sdk;
+use autopiercam_camera::Driver;
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, sync::Arc};
 use tracing::info;
@@ -17,6 +17,14 @@ struct Cli {
     /// Explicit path to ASICamera2.dll (or the platform equivalent).
     #[arg(long, global = true, env = "AUTOPIERCAM_ASI_SDK_PATH")]
     sdk: Option<PathBuf>,
+
+    /// Regain backend for list, probe and snapshot (run uses camera.driver in TOML).
+    #[arg(long, global = true, default_value = "zwo_sdk", value_parser = ["zwo_sdk", "zwo_direct"])]
+    driver: String,
+
+    /// Exact camera serial, required when several cameras have the same model.
+    #[arg(long, global = true)]
+    serial: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -160,11 +168,21 @@ fn main() -> Result<()> {
         }
         command => command,
     };
-    let sdk = Arc::new(match cli.sdk {
-        Some(path) => Sdk::load(path)?,
-        None => Sdk::load_default()?,
-    });
-    info!(version = %sdk.version(), path = %sdk.path().display(), "loaded ZWO ASI SDK");
+    let (backend, serial) = if let Command::Run { config, .. } = &command {
+        let config = autopiercam_core::config::Config::load(config)?;
+        (config.camera.driver, config.camera.serial)
+    } else {
+        (
+            if cli.driver == "zwo_direct" {
+                autopiercam_core::config::CameraDriver::ZwoDirect
+            } else {
+                autopiercam_core::config::CameraDriver::ZwoSdk
+            },
+            cli.serial,
+        )
+    };
+    let sdk = Arc::new(Driver::new(cli.sdk.as_deref(), backend, serial)?);
+    info!(version = %sdk.version(), path = %sdk.path().display(), "using Regain camera worker");
 
     match command {
         Command::List { json } => list_cameras(&sdk, json),

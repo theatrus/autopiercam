@@ -169,6 +169,7 @@ jobs:
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam.exe
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam-tray.exe
             ${{ github.workspace }}\artifacts\installer\stage\autopiercam-vision.exe
+            ${{ github.workspace }}\artifacts\installer\stage\regain-device.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.exe
             ${{ github.workspace }}\artifacts\installer\stage\Viewer\AutoPierCam.Viewer.dll
             ${{ github.workspace }}\integrations\AutoPierCam.NINA\artifacts\nina-plugin\package\AutoPierCam\AutoPierCam.NINA.dll
@@ -212,6 +213,7 @@ jobs:
           for f in "$stage/autopiercam.exe" \
                    "$stage/autopiercam-tray.exe" \
                    "$stage/autopiercam-vision.exe" \
+                   "$stage/regain-device.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.exe" \
                    "$stage/Viewer/AutoPierCam.Viewer.dll" \
                    "integrations/AutoPierCam.NINA/artifacts/nina-plugin/package/AutoPierCam/AutoPierCam.NINA.dll" \

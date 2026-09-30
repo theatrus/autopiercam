@@ -6,6 +6,8 @@ namespace AutoPierCam.Viewer;
 // Canonical numbers make localized formatting and trailing zeros immaterial.
 internal sealed record SettingsFormValues
 {
+    internal string Driver { get; init; } = "zwo_sdk";
+    internal string Serial { get; init; } = "";
     internal string MaxExposure { get; init; } = "";
     internal string MaxGain { get; init; } = "";
     internal string MinGain { get; init; } = "";
@@ -33,6 +35,7 @@ internal sealed record SettingsFormValues
     }
 
     internal static SettingsFormValues FromConfiguration(AgentConfiguration config) => new() {
+        Driver = config.Camera.Driver ?? "zwo_sdk", Serial = Text(config.Camera.Serial),
         MaxExposure = Number(config.Camera.MaxExposureUs / 1000d), MaxGain = Number(config.Camera.MaxGain),
         MinGain = Number(config.Camera.MinGain ?? 0), PreferShortExposures = config.Camera.PreferShortExposures == true,
         Interval = Number(config.Capture.IntervalMs / 1000d),
@@ -40,7 +43,7 @@ internal sealed record SettingsFormValues
         RetentionMax = Number(config.Capture.RetentionMaxBytes is ulong max ? max / (1024d * 1024d) : double.NaN),
         RetentionFree = Number(config.Capture.RetentionMinFreeBytes is ulong free ? free / (1024d * 1024d) : double.NaN),
         CameraId = config.Camera.CameraId, CameraFilter = Text(config.Camera.NameContains),
-        Adaptive = config.Camera.ExposureControl == "adaptive", Raw16 = config.Camera.Raw16 == true,
+        Adaptive = true, Raw16 = config.Camera.Raw16 == true,
         Upload = config.Upload.Enabled, Endpoint = Text(config.Upload.Endpoint),
         Video = config.Video.Enabled, Ffmpeg = Text(config.Video.FfmpegPath)
     };

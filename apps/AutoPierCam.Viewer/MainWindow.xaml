@@ -207,6 +207,13 @@
                                   HorizontalContentAlignment="Stretch" Padding="0,4,20,12">
                     <StackPanel Spacing="16">
                         <StackPanel Spacing="6">
+                            <ComboBox x:Name="CameraDriverComboBox" Header="Camera driver" HorizontalAlignment="Stretch" IsEnabled="False">
+                                <ComboBoxItem Content="Regain · ZWO SDK" Tag="zwo_sdk" />
+                                <ComboBoxItem Content="Regain · ZWO Direct USB (experimental)" Tag="zwo_direct" />
+                            </ComboBox>
+                            <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional)" IsEnabled="False" />
+                            <TextBlock Text="Direct USB requires a supported camera. ASI662MC: use SDK. ASI676MC direct: maximum 30 s. Changing drivers restarts capture."
+                                       FontSize="12" TextWrapping="Wrap" />
                             <TextBlock Text="Camera" />
                             <ComboBox
                                 x:Name="CameraComboBox"
@@ -379,7 +386,8 @@
                             Text="30,000 ms = 30 s · 60,000 ms = 1 min"
                             TextWrapping="Wrap" />
                         <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
-                                      IsEnabled="False" Toggled="ExposureControl_Changed" />
+                                      IsEnabled="False" IsOn="True" Visibility="Collapsed" Toggled="ExposureControl_Changed" />
+                        <TextBlock Text="AutoPierCam controls exposure and gain through Regain." FontSize="12" TextWrapping="Wrap" />
                         <StackPanel Spacing="8">
                             <NumberBox x:Name="MinGainNumberBox" Header="Minimum gain · application control only"
                                        Minimum="0" Maximum="600" Value="0" SmallChange="10"
@@ -391,8 +399,8 @@
                             <TextBlock FontSize="12" TextWrapping="Wrap"
                                        Text="Equal gain limits hold gain fixed. Shorter exposures raises gain first, increasing noise." />
                         </StackPanel>
-                        <ToggleSwitch x:Name="Raw16Toggle" Header="RAW16 capture · lossless 16-bit PNG stills" IsEnabled="False" />
-                        <TextBlock Text="Application control allows exposures over 60 s. RAW16 saves larger PNGs."
+                        <ToggleSwitch x:Name="Raw16Toggle" Header="Save lossless 16-bit PNG stills" IsEnabled="False" />
+                        <TextBlock Text="16-bit PNGs use more storage than JPEGs. Exposure limits depend on the selected driver."
                                    FontSize="12" TextWrapping="Wrap" />
                         <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"
                                  IsEnabled="False" />

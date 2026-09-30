@@ -822,6 +822,7 @@ function Assert-InstalledPayload(
         'autopiercam.exe',
         'autopiercam-tray.exe',
         'autopiercam-vision.exe',
+        'regain-device.exe',
         'ASICamera2.dll',
         'autopiercam.example.toml',
         'installation.md',
