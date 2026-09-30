@@ -50,6 +50,8 @@ $rustReleaseRoot = Join-Path $repositoryRoot "target\$rustTarget\release"
 $signableStagePaths = @(
     'autopiercam.exe',
     'autopiercam-tray.exe',
+    'autopiercam-vision.exe',
+    'regain-device.exe',
     'Viewer\AutoPierCam.Viewer.dll',
     'Viewer\AutoPierCam.Viewer.exe'
 )
@@ -349,6 +351,8 @@ function Assert-StagedPayload {
         'ASICamera2.dll',
         'autopiercam-tray.exe',
         'autopiercam.exe',
+        'autopiercam-vision.exe',
+        'regain-device.exe',
         'autopiercam.example.toml',
         'installation.md',
         'LICENSE-AutoPierCam.txt',
@@ -501,6 +505,32 @@ function Assert-StagedPayload {
         -not $shutdownHelp.Contains('--timeout-seconds')
     ) {
         throw 'Staged capture CLI does not expose the graceful shutdown-agent contract required by the MSI.'
+    }
+
+    $regainPath = Join-Path $stageRoot 'regain-device.exe'
+    Assert-AutoPierCamStaticCrt -Path $regainPath -Description 'Regain camera worker'
+    Assert-AutoPierCamVersionResource -Path $regainPath -Version $Version `
+        -FileDescription 'AutoPierCam Regain camera worker' -OriginalFilename 'regain-device.exe'
+    Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
+    Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Regain camera worker'
+    $regainVersion = (& $regainPath --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $regainVersion -cne "autopiercam-regain-worker $Version (Regain 98302af3c1c8)") {
+        throw 'Regain worker version mismatch.'
+    }
+
+    $visionPath = Join-Path $stageRoot 'autopiercam-vision.exe'
+    Assert-AutoPierCamStaticCrt -Path $visionPath -Description 'Staged vision worker'
+    Assert-AutoPierCamVersionResource -Path $visionPath -Version $Version `
+        -FileDescription 'AutoPierCam experimental local image analysis' -OriginalFilename 'autopiercam-vision.exe'
+    Assert-AutoPierCamApplicationManifest -Path $visionPath -Version $Version -AssemblyName 'AutoPierCam.Vision'
+    Assert-AutoPierCamIconResource -Path $visionPath -ResourceId 1 -Description 'Staged vision worker'
+    $visionVersion = (& $visionPath --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $visionVersion -cne "autopiercam-vision $Version") {
+        throw 'Vision worker version mismatch.'
+    }
+    $visionHelp = (& $visionPath experimental-stream --help 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $visionHelp.Contains('--model') -or -not $visionHelp.Contains('--spec')) {
+        throw 'Vision worker was built without the ONNX streaming feature.'
     }
 
     $trayPath = Join-Path $stageRoot 'autopiercam-tray.exe'
@@ -785,7 +815,10 @@ try {
             --release `
             --target $rustTarget `
             -p autopiercam `
-            -p autopiercam-tray
+            -p autopiercam-tray `
+            -p autopiercam-vision `
+            -p autopiercam-regain-worker `
+            --features autopiercam-vision/onnx
         if ($LASTEXITCODE -ne 0) {
             throw "Rust release build failed with exit code $LASTEXITCODE"
         }
@@ -824,7 +857,11 @@ try {
         Copy-RequiredFile `
             (Join-Path $rustReleaseRoot 'autopiercam-tray.exe') `
             (Join-Path $stageRoot 'autopiercam-tray.exe')
+        Copy-RequiredFile (Join-Path $rustReleaseRoot 'regain-device.exe') (Join-Path $stageRoot 'regain-device.exe')
         Copy-RequiredFile $sdkSource (Join-Path $stageRoot 'ASICamera2.dll')
+        Copy-RequiredFile `
+            (Join-Path $rustReleaseRoot 'autopiercam-vision.exe') `
+            (Join-Path $stageRoot 'autopiercam-vision.exe')
         Copy-RequiredFile `
             (Join-Path $repositoryRoot 'autopiercam.example.toml') `
             (Join-Path $stageRoot 'autopiercam.example.toml')

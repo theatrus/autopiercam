@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/autopiercam",
-    "crates/autopiercam-asi",
+    "crates/autopiercam-camera",
+    "crates/autopiercam-regain-worker",
     "crates/autopiercam-chatstronomy",
     "crates/autopiercam-core",
     "crates/autopiercam-protocol",
@@ -11,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 authors = ["Yann Ramin"]
 description = "Unattended capture, monitoring, and upload tools for ZWO ASI planetary cameras"
@@ -19,9 +20,11 @@ homepage = "https://github.com/theatrus/autopiercam"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/theatrus/autopiercam"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
+regain-core = { git = "https://github.com/pulsarfab/regain", rev = "98302af3c1c80bf64f670dc3ab70fb1851d1d062" }
+regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "98302af3c1c80bf64f670dc3ab70fb1851d1d062", default-features = false, features = ["asi-sdk", "asi-direct"] }
 anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["derive", "env"] }
 ctrlc = "3.5.2"

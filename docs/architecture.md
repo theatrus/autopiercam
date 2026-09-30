@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.11. Yann
+The product name is AutoPierCam and the current release line is 0.2.12. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
@@ -33,54 +33,43 @@ The intended process and data flow is:
                     |           |
              safe retention   durable upload queue
 
-Only the camera thread calls ASICamera2. The UI never loads the vendor DLL or
-opens a camera.
+Only the capture-owner thread commands Regain. The Viewer and IPC paths do
+not load the SDK or open camera handles. The owner starts a supervised
+regain-device child and uses start/status/download requests to acquire frames.
 
 ### Acquisition pacing
 
-`capture.preview_max_fps` is a live-reloadable integer from 1–30, default 2.
-Preview publication is independently rate-limited using a monotonic clock, even
-when explicit still requests or a faster still schedule require more frames.
-For short exposures the capture thread stops the **video stream**, waits for
-the next acquisition slot, and starts it again on the same camera handle. A
-sleep with the stream left running would merely discard frames while leaving
-the camera and USB busy. No camera enumeration or close/open occurs during
-pacing. Exposure/gain controls and application settling/adaptive history are
-retained. Long exposures at least as long as the preview period are not stopped
-for pacing, and no catch-up burst is accumulated after slow processing.
+capture.preview_max_fps is live-reloadable (1–30, default 2). Individual
+exposures start only when the next preview or still is due. Long exposures are
+not interrupted for pacing; there is no queued video stream to drain.
 
-The idle wait checks shutdown, pending live reload, and explicit still requests
-every 25 ms (reloads/requests are applied after startup settling). A rate save
-alone does not drain recording services or restart settling. Paused recording
-and storage pressure keep the preview cadence without acquiring extra scheduled
-stills. Security video and Chatstronomy sample the capped shared preview.
+Exposure/gain edits during a frame are queued until its completion. Ordinary
+saves preserve controller history and settling. Backend, serial, camera or
+image-layout changes restart the session. Paused recording keeps previews
+running without acquiring extra scheduled stills.
 
-This is host-side pacing, not a firmware FPS setting: SDK pipeline buffering and
-stop/start overhead can make actual frame rates lower or cause extra sensor
-frames. The bundled SDK has no documented frame-rate-limit control. Validate
-SDK auto-exposure convergence and sustained day/night stream stop/start on the
-target hardware before relying on this for unattended operation; unit tests do
-not exercise physical cameras.
+### Regain adapter
 
-## Components
+autopiercam-camera wraps regain-core's supervised worker transport. The
+camera-only autopiercam-regain-worker entry point calls the pinned upstream
+drivers without duplicating SDK bindings. Regain SDK and experimental direct
+USB are explicit choices; unsupported direct settings fail without fallback.
 
-### ZWO adapter
+    Closed -> Discover -> Open -> Configure -> Expose -> Download
+                            ^                     |          |
+                            +----- next frame ----+----------+
+                            |
+                          Close
+    Any fault -> Kill worker -> wait for operator restart
 
-autopiercam-asi loads an application-controlled absolute DLL path, resolves the
-documented C ABI, and retains the module for every function pointer and camera
-handle. It represents vendor enums as open Rust values so a future SDK cannot
-create undefined behavior by returning a new value.
+The adapter validates identity, capabilities and frame layout, caches controls
+while exposing, and rejects live discovery while a camera is owned. It keeps
+RAW16 samples for PNG stills or derives RAW8 from their high bytes. Regain calls
+have deadlines; AutoPierCam separately enforces frame-progress deadlines.
+Unexpected capture exits latch a fault rather than rescan/reopen automatically.
 
-The lifecycle is enforced as:
-
-    Disconnected -> Open -> Initialized -> Configured -> Streaming
-          ^                                            |
-          +------------ Stop -> Close -----------------+
-
-Reconfiguration always transitions through Stopped. Hot-unplug errors trigger
-best-effort stop/close, re-enumeration, and exponential reconnect backoff.
-Persisted selection will use the camera serial number rather than the transient
-SDK camera index.
+See [Regain backend](regain-backend.md) for selection, exact dependency pin,
+current camera support and required hardware validation.
 
 ### Portable core
 
@@ -100,9 +89,9 @@ mock camera backend.
 
 The agent is a normal per-user background executable. On Windows its primary
 thread owns the notification icon and event loop. A supervisor owns cancellation,
-camera reconnect state, config-driven restarts, and IPC. Camera startup and
-runtime faults are retried with a bounded 1/2/5/10/30-second backoff; a healthy
-capture session resets the delay.
+camera ownership, config-driven restarts, and IPC. Camera startup and runtime
+faults stop capture until the operator restarts the agent or saves settings.
+The supervisor does not automatically reopen or rescan a faulted driver.
 
 The tray menu exposes Status, Open AutoPierCam, Pause/Resume capture, Capture
 now, and Exit. Exit attempts ordered shutdown, with an independent 30-second
@@ -431,8 +420,8 @@ Ordered shutdown:
 Preview encoding drains and the current video segment finalizes before retention
 and upload workers stop, keeping publication inside the ledger lifecycle lease.
 
-The implemented startup path validates configuration and automatically retries
-startup or runtime faults. When upload is enabled it opens and validates the
+The implemented startup path validates configuration and leaves startup or runtime
+camera faults for an operator restart. When upload is enabled it opens and validates the
 bound ledger, recovers abandoned claims, reconciles the capture directory
 against the activation watermark, and resumes due attempts. It then completes
 an initial retention sweep before opening the camera. When uploads are disabled

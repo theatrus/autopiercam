@@ -418,10 +418,10 @@ mod tests {
         let mut observer =
             crate::CaptureObserver::new(BayerPattern::Rg, Some(&monitor), Some(&sink));
         let frame = crate::CompletedFrame {
-            meta: autopiercam_asi::FrameMeta {
+            meta: autopiercam_camera::FrameMeta {
                 width: 4,
                 height: 4,
-                image_type: autopiercam_asi::ImageType::Raw8,
+                image_type: autopiercam_camera::ImageType::Raw8,
             },
             data: vec![100; 16],
             captured_at_unix_ms: 1000,

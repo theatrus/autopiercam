@@ -20,7 +20,7 @@ the ZWO camera driver; that is installed separately.
 
 ## Rust dependencies
 
-The AutoPierCam command-line and tray executables contain Rust dependencies
+The AutoPierCam command-line, tray, and vision executables contain Rust dependencies
 from the locked Windows x64 normal/runtime dependency graph. Their complete
 selected license and copyright texts are generated deterministically at:
 

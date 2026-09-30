@@ -35,7 +35,7 @@ public sealed partial class MainWindow
         CameraHelpText.Text = scan + (inventory.Error is not null
             ? $"Discovery failed: {inventory.Error}. "
             : inventory.Cameras.Any(camera => camera.IsColor) ? string.Empty : "No supported color cameras detected. ") +
-            "Cached during capture. Restart the agent after connecting a camera. After a fault, discovery retries within 30 s. USB reconnects may change IDs.";
+            "Cached during capture. Restart the agent after connecting a camera or after a driver fault. USB reconnects may change IDs.";
     }
 
     private async void RefreshCamerasButton_Click(object sender, RoutedEventArgs args)

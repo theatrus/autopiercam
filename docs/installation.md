@@ -37,19 +37,20 @@ them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Reload camera list** reads cached discovery without discarding unsaved settings.
-Discovery runs before capture starts, or on retries (up to 30 seconds) after a
-fault. It never probes other cameras during acquisition or settling, even with
+Discovery runs before capture starts. Driver faults require an operator restart
+or configuration save; they do not trigger rescans. Discovery never probes other cameras during acquisition or settling, even with
 recording paused. Restart the tray agent to discover newly connected cameras.
 A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
-cameras cannot be persistently distinguished by serial number yet.
+cameras require an exact serial number for persistent selection.
 **Automatic (use model filter)** restores model-filter selection; ambiguous
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-For exposures beyond the
-SDK's automatic ceiling, enable application-controlled exposure; see the
-[exposure guide](exposure.md).
+Version 0.2.12 uses Regain and application-controlled exposure for both
+driver choices. ASI662MC requires the SDK backend; ASI676MC direct USB has a
+2,000-second limit. See the [exposure guide](exposure.md) and
+[Regain migration](regain-backend.md).
 
 ## What is installed
 
@@ -65,7 +66,7 @@ Application files are installed for the current user at:
 %LOCALAPPDATA%\Programs\AutoPierCam
 ```
 
-`autopiercam.exe`, `autopiercam-tray.exe`, and the pinned ZWO
+`autopiercam.exe`, `autopiercam-tray.exe`, `regain-device.exe`, and the pinned ZWO
 `ASICamera2.dll` are adjacent in that directory. The complete self-contained
 WinUI application is under `Viewer\`; no separate .NET runtime installation is
 required. Apache and third-party license material is included with the payload.
@@ -139,7 +140,9 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 If capture stops progressing, the agent reports a camera-worker fault independently
 of the Viewer connection. Restarting the Viewer does not restart capture. Quit
 the tray agent and relaunch it. Quit allows 30 seconds for graceful cleanup, then
-terminates its own process if a native SDK call or cleanup is stuck. Unfinished
+terminates its own process if cleanup is stuck. The Regain build first enforces
+deadlines on the isolated camera process and waits for an operator restart after
+a fault; it does not automatically rescan. Unfinished
 stills/video or uploads may be interrupted; already finalized files remain.
 Restart requests never open a second camera handle while the original worker is
 still running. An unresponsive restart asks the operator to quit and relaunch.
@@ -147,19 +150,19 @@ still running. An unresponsive restart asks the operator to quit and relaunch.
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.11-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.12-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.11-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.12-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.11-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.12-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

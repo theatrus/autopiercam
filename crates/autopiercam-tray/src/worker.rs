@@ -12,7 +12,7 @@ use std::{
 };
 
 use autopiercam::{AgentControl, AgentMonitor, PreviewHub, run_agent_with_monitor_and_preview};
-use autopiercam_asi::Sdk;
+use autopiercam_camera::Driver;
 use autopiercam_protocol::{AgentState, AgentStatus};
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -325,6 +325,7 @@ fn supervise_camera<F>(
                 signals.restart_pending.store(false, Ordering::Release);
             } else {
                 report_unexpected_exit(monitor, outcome);
+                intent.faulted = true;
             }
             publish_status_if_changed(monitor, emit, last_status);
             if reached_capturing {
@@ -366,7 +367,7 @@ fn supervise_camera<F>(
             Err(TryRecvError::Empty) => {}
         }
 
-        if session.is_none() && Instant::now() >= retry_at {
+        if session.is_none() && !intent.faulted && Instant::now() >= retry_at {
             let _admission = signals
                 .start_admission
                 .lock()
@@ -377,6 +378,7 @@ fn supervise_camera<F>(
             match CameraSession::start(&options, monitor, preview, intent.paused) {
                 Ok(camera) => session = Some(camera),
                 Err(error) => {
+                    intent.faulted = true;
                     monitor.report_fault(format!("failed to start camera thread: {error}"));
                     publish_status_if_changed(monitor, emit, last_status);
                     retry_at = Instant::now() + backoff.next_delay();
@@ -385,14 +387,18 @@ fn supervise_camera<F>(
             continue;
         }
 
-        let wait = session
-            .as_ref()
-            .map(|_| SUPERVISOR_POLL_INTERVAL)
-            .unwrap_or_else(|| {
-                retry_at
-                    .saturating_duration_since(Instant::now())
-                    .min(SUPERVISOR_POLL_INTERVAL)
-            });
+        let wait = if intent.faulted {
+            SUPERVISOR_POLL_INTERVAL
+        } else {
+            session
+                .as_ref()
+                .map(|_| SUPERVISOR_POLL_INTERVAL)
+                .unwrap_or_else(|| {
+                    retry_at
+                        .saturating_duration_since(Instant::now())
+                        .min(SUPERVISOR_POLL_INTERVAL)
+                })
+        };
         match commands.recv_timeout(wait) {
             Ok(command) => {
                 if handle_command(
@@ -725,6 +731,7 @@ enum LifecycleRequest {
 
 #[derive(Debug)]
 struct SupervisorIntent {
+    faulted: bool,
     paused: bool,
     pending_captures: u64,
 }
@@ -732,6 +739,7 @@ struct SupervisorIntent {
 impl SupervisorIntent {
     fn new(paused: bool) -> Self {
         Self {
+            faulted: false,
             paused,
             pending_captures: 0,
         }
@@ -749,8 +757,15 @@ impl SupervisorIntent {
                 }
                 LifecycleRequest::None
             }
+            TrayCommand::ReloadConfiguration if self.faulted => {
+                self.faulted = false;
+                LifecycleRequest::Restart
+            }
             TrayCommand::ReloadConfiguration => LifecycleRequest::None,
-            TrayCommand::Restart => LifecycleRequest::Restart,
+            TrayCommand::Restart => {
+                self.faulted = false;
+                LifecycleRequest::Restart
+            }
             TrayCommand::Shutdown => LifecycleRequest::Shutdown,
         }
     }
@@ -790,13 +805,16 @@ fn run_camera(
     // Starting an attempt clears any image from the previous camera session,
     // even if SDK loading or enumeration fails before capture begins.
     let preview_session = preview.begin_session();
-    let sdk = match options.sdk_path {
-        Some(path) => Sdk::load(&path),
-        None => Sdk::load_default(),
-    }
+    let config = autopiercam_core::config::Config::load(&options.config_path)
+        .map_err(|e| format!("loading camera configuration: {e}"))?;
+    let sdk = Driver::new(
+        options.sdk_path.as_deref(),
+        config.camera.driver,
+        config.camera.serial,
+    )
     .map(Arc::new)
     .map_err(|error| {
-        let message = format!("loading ZWO ASI SDK: {error}");
+        let message = format!("loading Regain camera driver: {error}");
         monitor.report_camera_inventory(Err(message.clone()));
         message
     })?;
@@ -815,6 +833,27 @@ fn run_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fault_requires_an_operator_restart_or_configuration_save() {
+        let mut intent = SupervisorIntent::new(false);
+        intent.faulted = true;
+        for command in [TrayCommand::CaptureNow, TrayCommand::SetPaused(false)] {
+            assert_eq!(intent.accept(command, false), LifecycleRequest::None);
+            assert!(intent.faulted);
+        }
+        assert_eq!(
+            intent.accept(TrayCommand::Restart, false),
+            LifecycleRequest::Restart
+        );
+        assert!(!intent.faulted);
+        intent.faulted = true;
+        assert_eq!(
+            intent.accept(TrayCommand::ReloadConfiguration, false),
+            LifecycleRequest::Restart
+        );
+        assert!(!intent.faulted);
+    }
 
     #[test]
     fn quit_watchdog_uses_injected_process_exit_and_stops_without_owner() {

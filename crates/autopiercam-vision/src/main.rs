@@ -64,6 +64,14 @@ enum Command {
         #[arg(long)]
         roi: Option<PathBuf>,
     },
+    #[cfg(feature = "onnx")]
+    /// Display-only sky worker: bounded JPEG requests on stdin, JSON lines on stdout.
+    ExperimentalStream {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        spec: PathBuf,
+    },
 }
 fn main() -> Result<()> {
     match Args::parse().command {
@@ -100,6 +108,39 @@ fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&dataset::check(&dataset)?)?
         ),
+        #[cfg(feature = "onnx")]
+        Command::ExperimentalStream { model, spec } => {
+            use autopiercam_vision::{
+                model::{ModelSpec, Task},
+                read_bounded,
+                runtime::Classifier,
+                stream,
+            };
+            let spec: ModelSpec = serde_json::from_slice(&read_bounded(&spec, 64 * 1024)?)?;
+            anyhow::ensure!(
+                spec.task == Task::Sky,
+                "Experimental Viewer requires a sky model"
+            );
+            let model_id = spec.model_id.clone();
+            let classifier = Classifier::load(&model, spec)?;
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            stream::write_response(
+                &mut output,
+                &serde_json::json!({
+                    "ready": true, "protocol": 1, "task": "sky", "model_id": model_id,
+                }),
+            )?;
+            while let Some(bytes) = stream::read_frame(&mut input)? {
+                match classifier.predict(&bytes, Default::default()) {
+                    Ok(prediction) => stream::write_response(&mut output, &prediction)?,
+                    Err(error) => stream::write_response(
+                        &mut output,
+                        &serde_json::json!({"error": error.to_string()}),
+                    )?,
+                }
+            }
+        }
         #[cfg(feature = "onnx")]
         Command::Infer {
             model,

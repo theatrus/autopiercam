@@ -46,6 +46,7 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         TrackSettingsEdits();
         InitializeSharingSection();
+        InitializeSkyModel();
         Title = "AutoPierCam";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "autopiercam.ico"));
         _previewFreshnessTimer = DispatcherQueue.CreateTimer();
@@ -276,10 +277,12 @@ public sealed partial class MainWindow : Window
                 frame.Metadata.SessionGeneration,
                 frame.Metadata.Sequence);
             _lastPreviewExposureUs = frame.Metadata.ExposureUs;
+            if (_lastPreviewSessionGeneration != frame.Metadata.SessionGeneration) InvalidateSkyEstimate();
             _lastPreviewSessionGeneration = frame.Metadata.SessionGeneration;
             _hasPreviewFrame = true;
             _previewFrameError = false;
             UpdatePreviewPresentation();
+            TryAnalyzeSky(frame);
         }
         catch (Exception exception)
         {
@@ -293,6 +296,7 @@ public sealed partial class MainWindow : Window
     private void PreviewFreshnessTimer_Tick(DispatcherQueueTimer sender, object args)
     {
         UpdatePreviewPresentation();
+        UpdateSkyPresentation();
     }
 
     private void UpdatePreviewPresentation()
@@ -382,6 +386,7 @@ public sealed partial class MainWindow : Window
         }
 
         _previewFrameError = true;
+        InvalidateSkyEstimate();
         SetCaptureSummary(null, null, null);
         PreviewStatusText.Text = "FRAME ERROR";
         PreviewImage.Opacity = 0.45;
@@ -390,6 +395,7 @@ public sealed partial class MainWindow : Window
 
     private void ClearPreviewImage()
     {
+        InvalidateSkyEstimate();
         PreviewImage.Source = null;
         PreviewImage.Visibility = Visibility.Collapsed;
         PreviewImage.Opacity = 1;
@@ -1098,7 +1104,9 @@ public sealed partial class MainWindow : Window
         }
 
         AgentConfiguration configuration = snapshot.Config;
-        AdaptiveExposureToggle.IsOn = configuration.Camera.ExposureControl == "adaptive";
+        AdaptiveExposureToggle.IsOn = true;
+        CameraDriverComboBox.SelectedIndex = configuration.Camera.Driver == "zwo_direct" ? 1 : 0;
+        CameraSerialTextBox.Text = configuration.Camera.Serial ?? string.Empty;
         Raw16Toggle.IsOn = configuration.Camera.Raw16 == true;
         CameraNameFilterTextBox.Text = configuration.Camera.NameContains ?? string.Empty;
         double maxExposureMs = configuration.Camera.MaxExposureUs / 1000.0;
@@ -1238,6 +1246,8 @@ public sealed partial class MainWindow : Window
         {
             Camera = original.Camera with
             {
+                Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",
+                Serial = NormalizeOptionalText(CameraSerialTextBox.Text),
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
                 MinGain = minGain,
@@ -1248,7 +1258,8 @@ public sealed partial class MainWindow : Window
                     ? Raw16Toggle.IsOn ? true : null : original.Camera.Raw16,
                 NameContains = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice { Id: not null } choice
                     ? choice.NameFilter : NormalizeOptionalText(CameraNameFilterTextBox.Text),
-                CameraId = _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice selection
+                CameraId = (original.Camera.Driver ?? "zwo_sdk") != (CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk")
+                    ? null : _cameraInventoryLoaded && CameraComboBox.SelectedItem is CameraChoice selection
                     ? selection.Id : string.Equals(original.Camera.NameContains ?? string.Empty, CameraNameFilterTextBox.Text.Trim(), StringComparison.Ordinal)
                         ? original.Camera.CameraId : null,
             },
@@ -1607,7 +1618,8 @@ public sealed partial class MainWindow : Window
         MaxExposureNumberBox.IsEnabled = configurationControlsEnabled;
         MaxGainNumberBox.IsEnabled = configurationControlsEnabled;
         UpdateGainControlAvailability(configurationControlsEnabled);
-        AdaptiveExposureToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.adaptive_exposure") == true;
+        AdaptiveExposureToggle.IsEnabled = false;
+        CameraDriverComboBox.IsEnabled = CameraSerialTextBox.IsEnabled = configurationControlsEnabled;
         Raw16Toggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("camera.raw16") == true;
         CameraNameFilterTextBox.IsEnabled = configurationControlsEnabled &&
             (!_cameraInventoryLoaded || CameraComboBox.SelectedItem is not CameraChoice { Id: not null });
@@ -1844,12 +1856,14 @@ public sealed partial class MainWindow : Window
         _closed = true;
         _previewFreshnessTimer.Stop();
         _lifetime.Cancel();
+        _skyModel?.Dispose();
         try
         {
             // Join every loop even if one encounters an error during shutdown.
             await Task.WhenAll(
                     _previewTask ?? Task.CompletedTask,
-                    _progressTask ?? Task.CompletedTask)
+                    _progressTask ?? Task.CompletedTask,
+                    _skyTask ?? Task.CompletedTask)
                 .ConfigureAwait(false);
         }
         catch

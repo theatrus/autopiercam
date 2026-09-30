@@ -1,8 +1,9 @@
 # AutoPierCam Vision
 
 Portable Rust CPU inference and local training-image preparation. **No trained
-roof or cloud model ships yet.** This crate is not connected to capture, the
-Viewer, or Chatstronomy; it never opens cameras or sends images.
+roof or cloud model ships yet.** The Viewer can opt into experimental sky labels
+using a locally supplied model. This crate never opens cameras or sends images
+to a network service, and predictions do not control capture or Chatstronomy.
 
 Requires Rust 1.91+. Dataset tools are enabled by default. `--features onnx`
 enables tract 0.23.8's CPU backend, with transformer/GPU features disabled. There
@@ -14,13 +15,13 @@ Linux x64/ARM64, and macOS ARM64. This tests the runtime contract, not detector 
 
 ```powershell
 cargo run -p autopiercam-vision -- import `
-  --source P:/_Incoming/starfront-redcat61/captures `
-  --output datasets/starfront-redcat61 `
-  --site starfront-redcat61 --camera piercam --group initial-archive `
+  --source C:/path/to/captures `
+  --output datasets/example-site `
+  --site example-site --camera piercam --group initial-archive `
   --interval-seconds 300 --limit 200
 
-cargo run -p autopiercam-vision -- review --dataset datasets/starfront-redcat61
-cargo run -p autopiercam-vision -- check --dataset datasets/starfront-redcat61
+cargo run -p autopiercam-vision -- review --dataset datasets/example-site
+cargo run -p autopiercam-vision -- check --dataset datasets/example-site
 ```
 
 Import again to pick up files still copying. A run takes a bounded snapshot of
@@ -56,7 +57,7 @@ Changes are not automatically saved. Apply the downloaded file:
 
 ```powershell
 cargo run -p autopiercam-vision -- label `
-  --dataset datasets/starfront-redcat61 --file C:/path/to/labels.json
+  --dataset datasets/example-site --file C:/path/to/labels.json
 ```
 
 The download contains only edited images and their original labels. New imports
@@ -130,12 +131,102 @@ detects a mismatched file, not a malicious graph; tract is not a sandbox. No
 models are downloaded automatically. Validate latency, memory, and false alerts
 on real held-out days/nights before integrating the worker with AutoPierCam.
 The initial inference fixture is hand-authored and synthetic, not a trained
-detector. Runtime integration, model training, calibration, and event posting
-remain separate work.
+detector. Capture/Chatstronomy integration, calibration, and event posting
+remain separate work; the opt-in Viewer path below only displays estimates.
+
+## Experimental offline training
+
+### Use a local model in the Viewer
+
+Open **Details → Experimental sky model…**. Choose the ONNX and its matching
+model JSON, enable estimates, and apply. The installer supplies the Rust worker;
+for a source build, select `target/debug/autopiercam-vision.exe` after running:
+
+```text
+cargo build -p autopiercam-vision --features onnx
+```
+
+Use trusted local models only. The worker validates the ONNX checksum and shape
+contract. This first Viewer integration supports full-frame sky models (the
+baseline's default ROI), not custom ROI models. The model must be appropriate
+for the current camera view; no automatic roof/quality detector is available.
+
+Estimates are disabled by default and run only while the Viewer is open. Settings
+are saved separately in `%LOCALAPPDATA%/AutoPierCam/viewer-sky.json`; applying
+them does not save agent settings or restart capture. The default interval is
+10 seconds, with no backlog or averaging. A separate Rust process gets the
+Viewer's existing JPEGs; it never acquires a camera handle. Each request has a
+20-second deadline; failure stops analysis until settings are reapplied.
+
+The compact label says **experimental**. The tooltip shows the source frame's
+time and uncalibrated score. Results expire after 60 seconds and are invalidated
+on reconnect/session changes. No images leave the machine. Predictions never
+post messages, trigger captures, or control the roof/mount.
+
+### Train and validate a baseline
+
+`tools/vision/train_sky.py` trains a small three-class sky CNN from scratch and
+exports ONNX. Python is **training-only**; inference remains the Rust CPU runtime.
+No pretrained weights, private images, or trained model are downloaded or shipped.
+The final fixed epoch is evaluated once; do not tune against the held-out night.
+
+Use a separate training environment (example for Windows):
+
+```powershell
+uv venv artifacts/vision-training-venv
+uv pip install --python artifacts/vision-training-venv/Scripts/python.exe torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python artifacts/vision-training-venv/Scripts/python.exe -r tools/vision/requirements.txt
+artifacts/vision-training-venv/Scripts/python.exe tools/vision/train_sky.py --dataset datasets/example --split datasets/example/sky-split.json --output artifacts/vision/sky-run-1
+```
+
+On Linux/macOS use `bin/python` in place of `Scripts/python.exe`. A Rust toolchain
+is required. Outputs must go in a **new** directory. Keep artifacts local until
+their privacy and quality have been reviewed.
+
+The split JSON is a separate, reviewed assignment of image hashes to whole
+observing sessions. It pins the dataset manifest's SHA256; it does not edit its
+labels or groups. For archives initially imported as one group, curate session
+boundaries from timestamps and record the method before training. Example shape:
+
+```json
+{
+  "schema_version": 1,
+  "dataset_sha256": "<SHA256 of manifest.json bytes>",
+  "label_source": "Describe human or AI-assisted label provenance",
+  "session_method": "Describe reviewed observing-session boundaries",
+  "samples": {
+    "<image SHA256>": {"session": "night-1", "split": "train"},
+    "<another image SHA256>": {"session": "night-2", "split": "test"}
+  }
+}
+```
+
+Only `open` roof, `usable` quality, and explicit clear/partly-cloudy/overcast labels
+qualify. Every qualifying image requires an assignment. A session cannot occur in
+both partitions; all three classes must be represented in both. These checks do
+not verify the correctness of hand-assigned session boundaries or labels.
+
+The Rust `training_export` example verifies image hashes and creates exactly the
+same float tensors used by inference. Training uses balanced class sampling and
+brightness/gamma/channel augmentation, with a fixed seed and epoch count. The
+96×96 full-frame baseline can still learn lighting or telescope shortcuts.
+
+Each run saves the ONNX, checksum-pinned model manifest, ROI, split, and report.
+The report includes class counts, confusion matrix, majority baseline, threshold
+coverage, per-image predictions, dependencies, source hashes, and limitations.
+Every held-out image is also inferred through Rust; probabilities must agree with
+PyTorch within `1e-5`. A failed parity check leaves the report marked unverified.
+
+AI-assisted labels and a few correlated nights support an experiment, not a
+production accuracy claim. Human review, more clear/overcast nights, different
+lighting, and new held-out sessions are needed before deployment. Roof and
+quality classifiers still need missing-class examples; this script only trains
+sky. No capture, Chatstronomy, or equipment control is enabled by training.
 
 ## Tests
 
 ```text
 cargo test -p autopiercam-vision --features onnx
 cargo clippy -p autopiercam-vision --all-targets --features onnx -- -D warnings
+python -m unittest discover -s tools/vision -p "test_*.py"
 ```

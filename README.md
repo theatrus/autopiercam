@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.11 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.12 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.11)](https://github.com/theatrus/autopiercam/releases/download/v0.2.11/AutoPierCam-0.2.11-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.11)
+[Download the signed Windows x64 installer (0.2.12)](https://github.com/theatrus/autopiercam/releases/download/v0.2.12/AutoPierCam-0.2.12-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.12)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,24 +25,25 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-The repository now contains a hardware-validated background capture slice:
+Version 0.2.12 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+worker. ASI662MC uses the SDK backend; ASI676MC also supports experimental Direct
+USB, tested at full resolution up to 2,000 seconds. Optional Viewer sky estimates
+use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-- dynamic loading of the bundled ZWO ASI SDK 1.41;
-- checked C ABI layouts and safe camera lifecycle/control wrappers;
+- pinned Regain drivers in an isolated worker, with explicit SDK or direct USB selection;
 - camera enumeration and capability probing without capture or exposure/gain
   changes (opening normalizes the SDK's persisted dark-subtraction flag);
 - bounded full-resolution RAW8 and RAW16 capture from the attached ASI676MC;
 - bilinear RG/BG/GR/GB debayering, JPEG/PNG output, and luminance statistics;
 - a validated, forward-looking TOML configuration model;
-- a continuous camera drain loop with auto-exposure settling and a bounded
+- paced individual exposures with application-controlled settling and a bounded
   still-writer queue;
-- minute-long SDK auto-exposure limits, startup previews, exposure progress,
+- exposure-aware limits, startup previews, exposure progress,
   and exposure-aware stale-frame detection in both viewers;
-- opt-in application-controlled exposure beyond 60 seconds, lossless 16-bit PNG
+- application-controlled exposure beyond 60 seconds where supported, lossless 16-bit PNG
   stills, and bounded preview-resolution MP4 recording; see
   [exposure](docs/exposure.md) and [video](docs/video.md);
-- a restartable camera supervisor with automatic 1/2/5/10/30-second reconnect
-  backoff;
+- a restartable camera supervisor; faults require an explicit restart or settings save;
 - a Windows notification-area host that owns and supervises the camera worker;
 - per-user Windows installer packaging with optional start-at-sign-in,
   self-contained Viewer deployment, orderly upgrade shutdown, and retained
@@ -195,7 +196,8 @@ troubleshooting, development, and package details.
 
 ## Workspace
 
-- crates/autopiercam-asi: dynamically loaded ASICamera2 wrapper.
+- crates/autopiercam-camera: capture-owner adapter to Regain's supervised worker.
+- crates/autopiercam-regain-worker: camera-only entry point for pinned upstream drivers.
 - crates/autopiercam-core: portable configuration and image processing.
 - crates/autopiercam-protocol: control envelopes plus bounded preview-v1 framing.
 - crates/autopiercam: reusable capture engine plus diagnostic CLI.

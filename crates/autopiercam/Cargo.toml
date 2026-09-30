@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-autopiercam-asi = { path = "../autopiercam-asi" }
+autopiercam-camera = { path = "../autopiercam-camera" }
 autopiercam-chatstronomy = { path = "../autopiercam-chatstronomy" }
 autopiercam-core = { path = "../autopiercam-core" }
 autopiercam-protocol = { path = "../autopiercam-protocol" }

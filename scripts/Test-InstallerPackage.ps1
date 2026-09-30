@@ -417,6 +417,8 @@ try {
         'ASICamera2.dll',
         'autopiercam-tray.exe',
         'autopiercam.exe',
+        'autopiercam-vision.exe',
+        'regain-device.exe',
         'autopiercam.example.toml',
         'installation.md',
         'LICENSE-AutoPierCam.txt',
@@ -607,6 +609,28 @@ try {
         -not $shutdownHelp.Contains('--timeout-seconds')
     ) {
         throw 'Packaged capture CLI does not expose the MSI graceful-stop command contract.'
+    }
+
+    $regainPath = Join-Path $installImage 'regain-device.exe'
+    Assert-AutoPierCamStaticCrt -Path $regainPath -Description 'Packaged Regain worker'
+    Assert-AutoPierCamVersionResource -Path $regainPath -Version $Version `
+        -FileDescription 'AutoPierCam Regain camera worker' -OriginalFilename 'regain-device.exe'
+    Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
+    Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Packaged Regain worker'
+
+    $visionPath = Join-Path $installImage 'autopiercam-vision.exe'
+    Assert-AutoPierCamStaticCrt -Path $visionPath -Description 'Packaged vision worker'
+    Assert-AutoPierCamVersionResource -Path $visionPath -Version $productVersion `
+        -FileDescription 'AutoPierCam experimental local image analysis' -OriginalFilename 'autopiercam-vision.exe'
+    Assert-AutoPierCamApplicationManifest -Path $visionPath -Version $productVersion -AssemblyName 'AutoPierCam.Vision'
+    Assert-AutoPierCamIconResource -Path $visionPath -ResourceId 1 -Description 'Packaged vision worker'
+    $visionVersion = (& $visionPath --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $visionVersion -cne "autopiercam-vision $productVersion") {
+        throw 'Vision worker version mismatch.'
+    }
+    $visionHelp = (& $visionPath experimental-stream --help 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $visionHelp.Contains('--model') -or -not $visionHelp.Contains('--spec')) {
+        throw 'Vision worker was built without the ONNX streaming feature.'
     }
 
     $trayPath = Join-Path $installImage 'autopiercam-tray.exe'

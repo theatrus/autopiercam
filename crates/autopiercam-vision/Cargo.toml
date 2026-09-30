@@ -28,3 +28,6 @@ tract-onnx = { version = "=0.23.8", default-features = false, optional = true }
 
 [dev-dependencies]
 prost = "0.14"
+
+[build-dependencies]
+embed-resource.workspace = true

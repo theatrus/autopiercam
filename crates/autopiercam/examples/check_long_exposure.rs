@@ -1,10 +1,11 @@
 //! Opt-in hardware diagnostic. Close camera-owning applications before running.
-//! Both modes restore the affected controls and ROI format after success,
-//! cancellation, or failure. The SDK wrapper recenters a restored ROI; it cannot
-//! restore a previous off-center ROI origin.
+//! Both modes restore the manual settings observed through Regain. Opening
+//! disables SDK auto gain; this diagnostic cannot restore a previous auto-mode
+//! flag, off-center ROI or settings changed outside this Regain session.
+//! Direct USB cancellation terminates its worker and cannot restore controls.
 use anyhow::{Context, Result, bail, ensure};
 use autopiercam::{AgentControl, AgentMonitor, PreviewHub, run_agent_with_monitor_and_preview};
-use autopiercam_asi::{Camera, CameraInfo, ControlType, ControlValue, ImageType, Roi, Sdk};
+use autopiercam_camera::{Camera, CameraInfo, ControlType, ControlValue, Driver, ImageType, Roi};
 use autopiercam_core::{ConfigStore, image::raw8_stats};
 use clap::{Parser, Subcommand};
 use std::{
@@ -16,6 +17,10 @@ use std::{
 #[derive(Parser)]
 #[command(about = "Opt-in long-exposure camera and production-worker diagnostic")]
 struct Options {
+    #[arg(long, default_value = "zwo_sdk", value_parser = ["zwo_sdk", "zwo_direct"])]
+    driver: String,
+    #[arg(long)]
+    serial: Option<String>,
     #[arg(long, default_value_t = 0)]
     camera_id: i32,
     #[command(subcommand)]
@@ -24,8 +29,9 @@ struct Options {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Verify real exposure cadence through short video-read polls, then cancel.
-    Sdk {
+    /// Verify real exposure cadence through short frame-ready polls, then cancel.
+    #[command(name = "sdk", alias = "driver")]
+    Driver {
         #[arg(long, value_delimiter = ',', default_value = "30,60")]
         seconds: Vec<u32>,
         #[arg(long)]
@@ -53,12 +59,20 @@ enum Mode {
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let options = Options::parse();
-    let sdk = Arc::new(Sdk::load_default()?);
+    let sdk = Arc::new(Driver::new(
+        None,
+        if options.driver == "zwo_direct" {
+            autopiercam_core::config::CameraDriver::ZwoDirect
+        } else {
+            autopiercam_core::config::CameraDriver::ZwoSdk
+        },
+        options.serial,
+    )?);
     let control = AgentControl::new();
     let cancel = control.clone();
     ctrlc::set_handler(move || cancel.shutdown())?;
     match options.mode {
-        Mode::Sdk { seconds, raw16 } => {
+        Mode::Driver { seconds, raw16 } => {
             check_sdk(&sdk, options.camera_id, &seconds, raw16, &control)
         }
         Mode::Agent {
@@ -112,7 +126,7 @@ impl SavedCameraSettings {
 
     fn restore(&self, camera: &mut Camera) -> Result<()> {
         let mut failures = Vec::new();
-        if let Err(error) = camera.stop_video() {
+        if let Err(error) = camera.stop_capture() {
             failures.push(format!("stopping video: {error}"));
         }
         if let Err(error) = camera.set_roi(self.roi) {
@@ -131,7 +145,7 @@ impl SavedCameraSettings {
         Ok(())
     }
 
-    fn restore_after_worker(&self, sdk: &Arc<Sdk>, info: CameraInfo) -> Result<()> {
+    fn restore_after_worker(&self, sdk: &Arc<Driver>, info: CameraInfo) -> Result<()> {
         // The worker has been joined and its Camera dropped before this handle
         // is opened. Two handles never compete for the same physical camera.
         let mut camera = sdk
@@ -152,7 +166,7 @@ fn diagnostic_result(result: Result<()>, restoration: Result<()>) -> Result<()> 
 }
 
 fn check_sdk(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     camera_id: i32,
     seconds: &[u32],
     raw16: bool,
@@ -170,6 +184,7 @@ fn check_sdk(
     println!("Testing {} with SDK {}", info.name, sdk.version());
     let mut camera = sdk.open(info.clone())?;
     let previous = SavedCameraSettings::read(&camera, &[ControlType::EXPOSURE, ControlType::GAIN])?;
+    let mut terminate_direct = false;
     let result = (|| -> Result<()> {
         camera.set_roi(Roi {
             width: info.max_width,
@@ -193,7 +208,7 @@ fn check_sdk(
                 !readback.automatic && readback.value.abs_diff(exposure_us) < 10_000,
                 "camera did not accept {seconds}s manual exposure: {readback:?}"
             );
-            camera.start_video()?;
+            camera.start_capture()?;
             let mut buffer = Vec::new();
             // Drain one frame, then measure a complete subsequent sensor interval.
             if receive_frame(&mut camera, &mut buffer, seconds, control)?.is_none() {
@@ -232,23 +247,29 @@ fn check_sdk(
                 elapsed >= Duration::from_millis(u64::from(seconds) * 900),
                 "received a frame too quickly to verify a full {seconds}s exposure"
             );
-            camera.stop_video()?;
+            camera.stop_capture()?;
         }
         if control.is_shutdown() {
             return Ok(());
         }
         let longest = *seconds.iter().max().unwrap();
         camera.set_control(ControlType::EXPOSURE, i64::from(longest) * 1_000_000, false)?;
-        camera.start_video()?;
+        camera.start_capture()?;
         let mut buffer = Vec::new();
         // One bounded poll leaves a long exposure in flight.
-        match camera.next_video_frame_into(&mut buffer, 2_000) {
+        match camera.poll_frame(&mut buffer, 2_000) {
             Ok(_) => {}
             Err(error) if error.is_timeout() => {}
             Err(error) => return Err(error.into()),
         }
+        if camera.is_direct() {
+            // Regain direct explicitly requires host termination for an active
+            // exposure. Do not reopen the camera just to restore controls.
+            terminate_direct = true;
+            return Ok(());
+        }
         let stopping = Instant::now();
-        camera.stop_video()?;
+        camera.stop_capture()?;
         let elapsed = stopping.elapsed();
         println!(
             "SDK stop during {longest}s exposure completed in {:.3}s",
@@ -260,6 +281,20 @@ fn check_sdk(
         );
         Ok(())
     })();
+    if terminate_direct {
+        let stopping = Instant::now();
+        drop(camera);
+        let elapsed = stopping.elapsed();
+        println!(
+            "Direct worker cancellation completed in {:.3}s",
+            elapsed.as_secs_f64()
+        );
+        ensure!(
+            elapsed < Duration::from_secs(5),
+            "Direct cancellation exceeded five seconds"
+        );
+        return result;
+    }
     // Attempt all restoration steps, even when a diagnostic failed.
     let restoration = previous.restore(&mut camera);
     if control.is_shutdown() {
@@ -281,7 +316,7 @@ fn receive_frame(
         if control.is_shutdown() {
             return Ok(None);
         }
-        let result = camera.next_video_frame_into(buffer, 2_000);
+        let result = camera.poll_frame(buffer, 2_000);
         if control.is_shutdown() {
             return Ok(None);
         }
@@ -295,7 +330,7 @@ fn receive_frame(
 
 #[allow(clippy::too_many_arguments)]
 fn check_agent(
-    sdk: &Arc<Sdk>,
+    sdk: &Arc<Driver>,
     camera_id: i32,
     max_seconds: u32,
     stop_after_seconds: u32,
@@ -318,11 +353,7 @@ fn check_agent(
     let snapshot = store.snapshot()?;
     let mut config = snapshot.config;
     config.camera.camera_id = Some(camera_id);
-    config.camera.exposure_control = if adaptive {
-        autopiercam_core::config::ExposureControl::Adaptive
-    } else {
-        autopiercam_core::config::ExposureControl::Sdk
-    };
+    config.camera.exposure_control = autopiercam_core::config::ExposureControl::Adaptive;
     config.camera.raw16 = raw16;
     config.camera.max_exposure_us = i64::from(max_seconds) * 1_000_000;
     config.capture.interval_ms = 1;

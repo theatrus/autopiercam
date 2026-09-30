@@ -6,6 +6,21 @@ using Xunit;
 public sealed class SettingsFormValuesTests
 {
     [Fact]
+    public void RegainDefaultsAreCleanAndDriverOrSerialEditsAreDirty()
+    {
+        var baseline = SettingsFormValues.FromConfiguration(Config);
+        Assert.True(baseline.Adaptive);
+        Assert.Equal(baseline, SettingsFormValues.FromConfiguration(Config with {
+            Camera = Config.Camera with { Driver = "zwo_sdk", ExposureControl = "adaptive", Serial = " " }
+        }));
+        Assert.NotEqual(baseline, baseline with { Driver = "zwo_direct" });
+        Assert.NotEqual(baseline, baseline with { Serial = "selected-camera" });
+        var config = Config with { Camera = Config.Camera with { Driver = "zwo_direct", Serial = "selected-camera" } };
+        var restored = JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!;
+        Assert.Equal("zwo_direct", restored.Camera.Driver);
+        Assert.Equal("selected-camera", restored.Camera.Serial);
+    }
+    [Fact]
     public void GainDefaultsAreCleanAndGainEditsCanBeReverted()
     {
         var baseline = SettingsFormValues.FromConfiguration(Config);

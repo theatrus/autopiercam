@@ -26,7 +26,9 @@ impl Config {
     pub fn requires_camera_restart(&self, next: &Self) -> bool {
         let a = &self.camera;
         let b = &next.camera;
-        a.camera_id != b.camera_id
+        a.driver != b.driver
+            || a.serial != b.serial
+            || a.camera_id != b.camera_id
             || a.name_contains != b.name_contains
             || a.width != b.width
             || a.height != b.height
@@ -50,6 +52,16 @@ impl Config {
                 "camera.bin must be 1 until color binning is characterized",
             ));
         }
+        if self
+            .camera
+            .serial
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s != s.trim())
+        {
+            return Err(ConfigError::Validation(
+                "camera.serial must be nonempty without surrounding whitespace",
+            ));
+        }
         if self.camera.min_exposure_us < 0 || self.camera.max_exposure_us <= 0 {
             return Err(ConfigError::Validation(
                 "camera exposure limits must be non-negative with a positive maximum",
@@ -63,13 +75,6 @@ impl Config {
         if self.camera.min_gain < 0 || self.camera.max_gain < self.camera.min_gain {
             return Err(ConfigError::Validation(
                 "camera gain limits must satisfy 0 <= min_gain <= max_gain",
-            ));
-        }
-        if self.camera.exposure_control != ExposureControl::Adaptive
-            && (self.camera.min_gain > 0 || self.camera.prefer_short_exposures)
-        {
-            return Err(ConfigError::Validation(
-                "minimum gain and shorter-exposure preference require camera.exposure_control = adaptive",
             ));
         }
         if !(1..=250).contains(&self.camera.target_brightness) {
@@ -198,7 +203,11 @@ pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
-    /// Opt-in application control uses the sensor's manual exposure limits.
+    #[serde(skip_serializing_if = "CameraDriver::is_sdk")]
+    pub driver: CameraDriver,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// Legacy SDK selection remains readable; Regain always uses application control.
     #[serde(skip_serializing_if = "ExposureControl::is_sdk")]
     pub exposure_control: ExposureControl,
     /// Preserve the SDK's full 16-bit Bayer samples in debayered PNG stills.
@@ -211,7 +220,7 @@ pub struct CameraConfig {
     pub bin: i32,
     pub min_exposure_us: i64,
     pub max_exposure_us: i64,
-    /// Application-controlled gain floor; SDK auto has no minimum-gain control.
+    /// Application-controlled gain floor.
     #[serde(skip_serializing_if = "is_zero")]
     pub min_gain: i64,
     pub max_gain: i64,
@@ -225,6 +234,8 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
+            driver: CameraDriver::ZwoSdk,
+            serial: None,
             exposure_control: ExposureControl::Sdk,
             raw16: false,
             camera_id: None,
@@ -240,6 +251,19 @@ impl Default for CameraConfig {
             target_brightness: 100,
             settle_frames: 6,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraDriver {
+    #[default]
+    ZwoSdk,
+    ZwoDirect,
+}
+impl CameraDriver {
+    fn is_sdk(&self) -> bool {
+        *self == Self::ZwoSdk
     }
 }
 
@@ -406,9 +430,10 @@ mod tests {
         }
         next.camera.min_gain = 200;
         next.camera.exposure_control = ExposureControl::Sdk;
-        assert!(next.validate().is_err());
+        // Legacy mode is accepted, but Regain always runs application control.
+        next.validate().unwrap();
         next.camera.min_gain = 0;
-        assert!(next.validate().is_err());
+        next.validate().unwrap();
         next.camera.prefer_short_exposures = false;
         next.validate().unwrap();
     }
@@ -452,6 +477,8 @@ mod tests {
         assert!(!original.requires_camera_restart(&next));
         assert!(original.requires_recording_reload(&next));
         for change in [
+            |c: &mut Config| c.camera.driver = CameraDriver::ZwoDirect,
+            |c: &mut Config| c.camera.serial = Some("selected-serial".into()),
             |c: &mut Config| c.camera.camera_id = Some(1),
             |c: &mut Config| c.camera.name_contains = Some("ASI662MC".into()),
             |c: &mut Config| c.camera.raw16 = true,

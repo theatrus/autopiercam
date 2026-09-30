@@ -36,8 +36,9 @@ try {
     }
 
     $jsonDiagnostics = @(& cargo about -L debug -c never generate `
-            --frozen `
+            --locked `
             --workspace `
+            --features autopiercam-vision/onnx `
             --fail `
             --config $configPath `
             --format json `
@@ -60,7 +61,7 @@ try {
     $unexpectedFallbacks = @($jsonDiagnostics | Where-Object {
             $line = $_.ToString()
             $line -match 'falling back to canonical text' -and
-            $line -notmatch "crate 'autopiercam(?:-(?:asi|chatstronomy|core|protocol|tray|vision))? [^']+'"
+            $line -notmatch "crate 'autopiercam(?:-(?:camera|regain-worker|chatstronomy|core|protocol|tray|vision))? [^']+'"
         })
     if ($unexpectedFallbacks.Count -ne 0) {
         throw "A third-party crate fell back to generic license text:`n$(Format-Diagnostics $unexpectedFallbacks)"
@@ -78,6 +79,7 @@ try {
     $treeOutput = @(& cargo tree `
             --frozen `
             --workspace `
+            --features autopiercam-vision/onnx `
             --target $targetTriple `
             --edges normal `
             --prefix none `
@@ -151,8 +153,9 @@ try {
     }
 
     $renderDiagnostics = @(& cargo about -L warn -c never generate `
-            --frozen `
+            --locked `
             --workspace `
+            --features autopiercam-vision/onnx `
             --fail `
             --config $configPath `
             --output-file $renderedPath `

@@ -33,6 +33,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - name: Offline training split and metrics tests (synthetic data only)
+        run: python3 -B -m unittest discover -s tools/vision -p 'test_*.py'
       - run: cargo test -p autopiercam-chatstronomy -p autopiercam-core -p autopiercam-protocol --locked
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
@@ -48,3 +50,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p autopiercam-vision --features onnx --locked
       - run: cargo clippy -p autopiercam-vision --all-targets --features onnx --locked -- -D warnings
+      - name: Regain camera simulator tests (no hardware)
+        run: cargo test -p autopiercam-camera -p autopiercam-regain-worker --locked

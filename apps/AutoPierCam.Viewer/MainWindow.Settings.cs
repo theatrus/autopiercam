@@ -23,10 +23,11 @@ public sealed partial class MainWindow
             // Save available during editing, not only after tabbing away.
             input.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => MarkSettingsEdited());
         }
-        foreach (TextBox input in new[] { CameraNameFilterTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
+        foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
         foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
+        CameraDriverComboBox.SelectionChanged += (_, _) => MarkSettingsEdited();
 
     }
 
@@ -91,6 +92,8 @@ public sealed partial class MainWindow
             return SettingsFormValues.Number(box.Value);
         }
         return new() {
+            Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",
+            Serial = SettingsFormValues.Text(CameraSerialTextBox.Text),
             MaxExposure = Number(MaxExposureNumberBox), MaxGain = Number(MaxGainNumberBox),
             MinGain = Number(MinGainNumberBox), PreferShortExposures = PreferShortExposuresToggle.IsOn,
             Interval = Number(StillIntervalNumberBox), RetentionMax = Number(RetentionMaxMiBNumberBox),
