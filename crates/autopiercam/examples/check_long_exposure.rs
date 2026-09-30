@@ -2,6 +2,7 @@
 //! Both modes restore the manual settings observed through Regain. Opening
 //! disables SDK auto gain; this diagnostic cannot restore a previous auto-mode
 //! flag, off-center ROI or settings changed outside this Regain session.
+//! Direct USB cancellation terminates its worker and cannot restore controls.
 use anyhow::{Context, Result, bail, ensure};
 use autopiercam::{AgentControl, AgentMonitor, PreviewHub, run_agent_with_monitor_and_preview};
 use autopiercam_camera::{Camera, CameraInfo, ControlType, ControlValue, Driver, ImageType, Roi};
@@ -16,6 +17,10 @@ use std::{
 #[derive(Parser)]
 #[command(about = "Opt-in long-exposure camera and production-worker diagnostic")]
 struct Options {
+    #[arg(long, default_value = "zwo_sdk", value_parser = ["zwo_sdk", "zwo_direct"])]
+    driver: String,
+    #[arg(long)]
+    serial: Option<String>,
     #[arg(long, default_value_t = 0)]
     camera_id: i32,
     #[command(subcommand)]
@@ -56,8 +61,12 @@ fn main() -> Result<()> {
     let options = Options::parse();
     let sdk = Arc::new(Driver::new(
         None,
-        autopiercam_core::config::CameraDriver::ZwoSdk,
-        None,
+        if options.driver == "zwo_direct" {
+            autopiercam_core::config::CameraDriver::ZwoDirect
+        } else {
+            autopiercam_core::config::CameraDriver::ZwoSdk
+        },
+        options.serial,
     )?);
     let control = AgentControl::new();
     let cancel = control.clone();
@@ -175,6 +184,7 @@ fn check_sdk(
     println!("Testing {} with SDK {}", info.name, sdk.version());
     let mut camera = sdk.open(info.clone())?;
     let previous = SavedCameraSettings::read(&camera, &[ControlType::EXPOSURE, ControlType::GAIN])?;
+    let mut terminate_direct = false;
     let result = (|| -> Result<()> {
         camera.set_roi(Roi {
             width: info.max_width,
@@ -252,6 +262,12 @@ fn check_sdk(
             Err(error) if error.is_timeout() => {}
             Err(error) => return Err(error.into()),
         }
+        if camera.is_direct() {
+            // Regain direct explicitly requires host termination for an active
+            // exposure. Do not reopen the camera just to restore controls.
+            terminate_direct = true;
+            return Ok(());
+        }
         let stopping = Instant::now();
         camera.stop_capture()?;
         let elapsed = stopping.elapsed();
@@ -265,6 +281,20 @@ fn check_sdk(
         );
         Ok(())
     })();
+    if terminate_direct {
+        let stopping = Instant::now();
+        drop(camera);
+        let elapsed = stopping.elapsed();
+        println!(
+            "Direct worker cancellation completed in {:.3}s",
+            elapsed.as_secs_f64()
+        );
+        ensure!(
+            elapsed < Duration::from_secs(5),
+            "Direct cancellation exceeded five seconds"
+        );
+        return result;
+    }
     // Attempt all restoration steps, even when a diagnostic failed.
     let restoration = previous.restore(&mut camera);
     if control.is_shutdown() {
