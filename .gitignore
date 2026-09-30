@@ -1,6 +1,7 @@
 /target/
 /artifacts/
 /captures/
+/datasets/
 /autopiercam.toml
 /ASI_Camera_SDK/
 **/.DS_Store

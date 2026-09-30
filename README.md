@@ -101,6 +101,10 @@ repeat settling; camera and RAW-format changes still restart. The updated NINA p
 [theatr.us registry](https://nina-plugins.psf-guard.com/), also served at
 [nina-plugins.pulsarfab.com](https://nina-plugins.pulsarfab.com/).
 
+An offline [Rust vision crate](crates/autopiercam-vision/README.md) provides
+incremental local datasets, a labeling page, and opt-in CPU ONNX inference.
+Roof/cloud models are not trained or connected to capture yet.
+
 ## Install on Windows
 
 Version 0.2.11 includes opt-in Chatstronomy image sharing: open **Settings** in

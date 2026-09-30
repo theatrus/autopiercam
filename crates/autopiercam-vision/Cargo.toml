@@ -1,0 +1,30 @@
+[package]
+name = "autopiercam-vision"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+rust-version = "1.91"
+description = "Offline pier-camera datasets and portable CPU image classification"
+publish = false
+
+[features]
+default = []
+onnx = ["dep:tract-onnx"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+fs4.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tract-onnx = { version = "=0.23.8", default-features = false, optional = true }
+
+[dev-dependencies]
+prost = "0.14"
