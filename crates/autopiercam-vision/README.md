@@ -133,9 +133,70 @@ The initial inference fixture is hand-authored and synthetic, not a trained
 detector. Runtime integration, model training, calibration, and event posting
 remain separate work.
 
+## Experimental offline training
+
+`tools/vision/train_sky.py` trains a small three-class sky CNN from scratch and
+exports ONNX. Python is **training-only**; inference remains the Rust CPU runtime.
+No pretrained weights, private images, or trained model are downloaded or shipped.
+The final fixed epoch is evaluated once; do not tune against the held-out night.
+
+Use a separate training environment (example for Windows):
+
+```powershell
+uv venv artifacts/vision-training-venv
+uv pip install --python artifacts/vision-training-venv/Scripts/python.exe torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python artifacts/vision-training-venv/Scripts/python.exe -r tools/vision/requirements.txt
+artifacts/vision-training-venv/Scripts/python.exe tools/vision/train_sky.py --dataset datasets/example --split datasets/example/sky-split.json --output artifacts/vision/sky-run-1
+```
+
+On Linux/macOS use `bin/python` in place of `Scripts/python.exe`. A Rust toolchain
+is required. Outputs must go in a **new** directory. Keep artifacts local until
+their privacy and quality have been reviewed.
+
+The split JSON is a separate, reviewed assignment of image hashes to whole
+observing sessions. It pins the dataset manifest's SHA256; it does not edit its
+labels or groups. For archives initially imported as one group, curate session
+boundaries from timestamps and record the method before training. Example shape:
+
+```json
+{
+  "schema_version": 1,
+  "dataset_sha256": "<SHA256 of manifest.json bytes>",
+  "label_source": "Describe human or AI-assisted label provenance",
+  "session_method": "Describe reviewed observing-session boundaries",
+  "samples": {
+    "<image SHA256>": {"session": "night-1", "split": "train"},
+    "<another image SHA256>": {"session": "night-2", "split": "test"}
+  }
+}
+```
+
+Only `open` roof, `usable` quality, and explicit clear/partly-cloudy/overcast labels
+qualify. Every qualifying image requires an assignment. A session cannot occur in
+both partitions; all three classes must be represented in both. These checks do
+not verify the correctness of hand-assigned session boundaries or labels.
+
+The Rust `training_export` example verifies image hashes and creates exactly the
+same float tensors used by inference. Training uses balanced class sampling and
+brightness/gamma/channel augmentation, with a fixed seed and epoch count. The
+96×96 full-frame baseline can still learn lighting or telescope shortcuts.
+
+Each run saves the ONNX, checksum-pinned model manifest, ROI, split, and report.
+The report includes class counts, confusion matrix, majority baseline, threshold
+coverage, per-image predictions, dependencies, source hashes, and limitations.
+Every held-out image is also inferred through Rust; probabilities must agree with
+PyTorch within `1e-5`. A failed parity check leaves the report marked unverified.
+
+AI-assisted labels and a few correlated nights support an experiment, not a
+production accuracy claim. Human review, more clear/overcast nights, different
+lighting, and new held-out sessions are needed before deployment. Roof and
+quality classifiers still need missing-class examples; this script only trains
+sky. No capture, Chatstronomy, or equipment control is enabled by training.
+
 ## Tests
 
 ```text
 cargo test -p autopiercam-vision --features onnx
 cargo clippy -p autopiercam-vision --all-targets --features onnx -- -D warnings
+python -m unittest discover -s tools/vision -p "test_*.py"
 ```
