@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AutoPierCam dataset review</title>
+<style>
+body{font:15px system-ui;background:#151b22;color:#e9eef5;margin:24px}header{position:sticky;top:0;background:#151b22;padding:8px 0;z-index:1}h1{font-size:22px;margin:0 0 8px}button,select{font:inherit;padding:8px;background:#253345;color:#fff;border:1px solid #58708d;border-radius:5px}button{cursor:pointer}#grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}article{background:#202b38;padding:12px;border-radius:8px}img{width:100%;height:260px;object-fit:contain;background:#080c10}label{display:flex;justify-content:space-between;align-items:center;margin:8px 0}small{display:block;overflow-wrap:anywhere;color:#b9c9db}p{max-width:1000px}
+</style>
+<header><h1>AutoPierCam · training image review</h1><button id="download">Download labels.json</button> <span id="count"></span></header>
+<p>Images stay on this computer. Blank means unlabeled; “uncertain” means reviewed but ambiguous. Label the visible sky only; use “not_visible” for a closed roof. Download labels before closing this page—edits are not saved automatically. The CLI merges your edits even if new images have been imported.</p>
+<main id="grid"></main>
+<script>
+const dataset = /*DATASET_JSON*/;
+const choices={roof:['open','partial','closed','uncertain'],sky:['clear','partly_cloudy','overcast','not_visible','uncertain'],quality:['usable','too_dark','saturated','obscured','uncertain']};
+const labels={};
+const entries=Object.entries(dataset.samples).sort((a,b)=>(a[1].captured_unix_ms??0)-(b[1].captured_unix_ms??0));
+for(const [id,sample] of entries){
+ labels[id]={...sample.labels};
+ const card=document.createElement('article');
+ const img=document.createElement('img');img.src=sample.image;img.loading='lazy';img.alt='Unclassified pier-camera capture';card.append(img);
+ const details=document.createElement('small');details.textContent=`${sample.site} · ${sample.camera} · ${sample.group}\n${sample.captured_unix_ms?new Date(sample.captured_unix_ms).toISOString():'Unknown capture time'} · ${id.slice(0,12)}`;card.append(details);
+ for(const [task,values] of Object.entries(choices)){
+  const row=document.createElement('label');row.append(document.createTextNode(task));const select=document.createElement('select');
+  for(const value of ['',...values]){const option=document.createElement('option');option.value=value;option.textContent=value||'Unlabeled';select.append(option);}
+  select.value=labels[id][task]??'';select.onchange=()=>{labels[id][task]=select.value||null;};row.append(select);card.append(row);
+ }
+ document.getElementById('grid').append(card);
+}
+document.getElementById('count').textContent=`${entries.length} images · no predictions or automatic labels`;
+document.getElementById('download').onclick=()=>{
+ for(const [id,label] of Object.entries(labels)){if(label.roof==='closed'&&label.sky&&!['not_visible','uncertain'].includes(label.sky)){alert(`Closed roof needs sky=not_visible or uncertain: ${id.slice(0,12)}`);return;}}
+ const edits={};for(const [id,after] of Object.entries(labels)){const before=dataset.samples[id].labels;if(Object.keys(choices).some(task=>before[task]!==after[task])){edits[id]={before,after};}}
+ const blob=new Blob([JSON.stringify({schema_version:1,edits},null,2)],{type:'application/json'});
+ const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='labels.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+</script></html>
