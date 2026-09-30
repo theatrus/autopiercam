@@ -61,7 +61,7 @@ minimum N.I.N.A. version.
 
 ## 3. Merge through a pull request
 
-Open a PR named `Release AutoPierCam X.Y.Z`. Wait for both CI jobs, including
+Open a PR named `Release AutoPierCam X.Y.Z`. Wait for every CI job, including
 **Windows capture, sharing and Viewer**, which runs the N.I.N.A. and Viewer
 tests. Squash-merge it.
 
