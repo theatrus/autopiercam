@@ -613,9 +613,9 @@ try {
 
     $regainPath = Join-Path $installImage 'regain-device.exe'
     Assert-AutoPierCamStaticCrt -Path $regainPath -Description 'Packaged Regain worker'
-    Assert-AutoPierCamVersionResource -Path $regainPath -Version $Version `
+    Assert-AutoPierCamVersionResource -Path $regainPath -Version $productVersion `
         -FileDescription 'AutoPierCam Regain camera worker' -OriginalFilename 'regain-device.exe'
-    Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
+    Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $productVersion -AssemblyName 'AutoPierCam.Regain'
     Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Packaged Regain worker'
 
     $visionPath = Join-Path $installImage 'autopiercam-vision.exe'
