@@ -1,9 +1,8 @@
 # Regain camera backend
 
-Current source uses Regain 0.5.2 (Rust 1.89 or newer), pinned to release commit
+AutoPierCam 0.2.13 uses Regain 0.5.2 (Rust 1.89 or newer), pinned to release commit
 `a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06` in Cargo.toml and Cargo.lock.
-The published AutoPierCam 0.2.12 installer uses the earlier Regain 0.5.1 pin;
-ASI662MC Direct USB requires a build with the updated pin.
+ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
 There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
 point calls the unchanged upstream drivers; `regain-core::Worker` owns the
 framed transport, deadlines and process supervision.
