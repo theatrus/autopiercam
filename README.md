@@ -30,6 +30,10 @@ worker. ASI662MC uses the SDK backend; ASI676MC also supports experimental Direc
 USB, tested at full resolution up to 2,000 seconds. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
+Current source updates Regain to 0.5.2 and adds experimental ASI662MC Direct USB
+(RAW16, bin 1). SDK remains the default. This is not included in the 0.2.12
+download above; see [driver limits and validation](docs/regain-backend.md).
+
 - pinned Regain drivers in an isolated worker, with explicit SDK or direct USB selection;
 - camera enumeration and capability probing without capture or exposure/gain
   changes (opening normalizes the SDK's persisted dark-subtraction flag);

@@ -52,6 +52,10 @@ driver choices. ASI662MC requires the SDK backend; ASI676MC direct USB has a
 2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md).
 
+Current source adds ASI662MC Direct USB through Regain 0.5.2; the 0.2.12 installer
+does not include it. SDK remains the default. Select Direct USB explicitly in
+Settings, then reselect the camera and save. Both direct models require bin 1.
+
 ## What is installed
 
 The NINA plugin is also published to the shared theatr.us plugin source:
