@@ -209,7 +209,7 @@ impl Driver {
         self.serial.as_deref()
     }
     pub fn version(&self) -> String {
-        format!("Regain 0.5.1 / {:?}", self.backend)
+        format!("Regain 0.5.2 / {:?}", self.backend)
     }
     pub fn is_direct(&self) -> bool {
         self.backend == CameraDriver::ZwoDirect
@@ -437,6 +437,7 @@ impl Camera {
             .max(2);
         let align_y = self.descriptor["originAlignmentY"]
             .as_u64()
+            .or_else(|| self.descriptor["originAlignment"].as_u64())
             .unwrap_or(2)
             .max(2);
         let centered = |sensor: u32, size: u32, alignment: u64| -> u32 {

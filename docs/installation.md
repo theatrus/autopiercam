@@ -47,10 +47,14 @@ cameras require an exact serial number for persistent selection.
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-Version 0.2.12 uses Regain and application-controlled exposure for both
-driver choices. ASI662MC requires the SDK backend; ASI676MC direct USB has a
+Version 0.2.13 uses Regain and application-controlled exposure for both
+driver choices. ASI662MC and ASI676MC direct USB have a
 2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md).
+
+Version 0.2.13 adds ASI662MC Direct USB through Regain 0.5.2. SDK remains the
+default. Select Direct USB explicitly in
+Settings, then reselect the camera and save. Both direct models require bin 1.
 
 ## What is installed
 
@@ -150,19 +154,19 @@ still running. An unresponsive restart asks the operator to quit and relaunch.
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.12-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.13-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.12-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.13-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.12-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.13-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

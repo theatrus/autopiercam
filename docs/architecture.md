@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.12. Yann
+The product name is AutoPierCam and the current release line is 0.2.13. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
@@ -364,9 +364,10 @@ Windows builds will use Credential Manager or DPAPI.
 
 ## Shutdown and recovery
 
-Future camera backend direction: [Regain Direct USB migration](regain-backend.md).
-ASI662MC support is a prerequisite; the current ASI676MC direct exposure ceiling
-also needs consideration before replacing AutoPierCam's long-night capture path.
+Capture uses an isolated [Regain worker](regain-backend.md). SDK is the default;
+Direct USB is an explicit choice for ASI662MC and ASI676MC in current source.
+The direct drivers advertise a 2,000-second ceiling; the application validates
+configured exposure limits against the selected camera's capabilities.
 
 Camera inventory is cached per capture attempt. Enumeration runs before opening
 the selected camera, never from acquisition or settling. ZWO SDK 1.41 property

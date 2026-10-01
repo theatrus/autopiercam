@@ -1,7 +1,8 @@
 # Regain camera backend
 
-AutoPierCam uses Regain 0.5.1 (Rust 1.89 or newer), pinned to commit
-`98302af3c1c80bf64f670dc3ab70fb1851d1d062` in Cargo.toml and Cargo.lock.
+AutoPierCam 0.2.13 uses Regain 0.5.2 (Rust 1.89 or newer), pinned to release commit
+`a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06` in Cargo.toml and Cargo.lock.
+ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
 There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
 point calls the unchanged upstream drivers; `regain-core::Worker` owns the
 framed transport, deadlines and process supervision.
@@ -12,11 +13,11 @@ Settings has an explicit **Camera driver** choice:
 
 - **Regain · ZWO SDK** (default): supports ASI662MC and ASI676MC through the
   vendor library. The installer still includes the reviewed SDK DLL.
-- **Regain · ZWO Direct USB** (experimental): ASI676MC is supported, with a
-  maximum exposure of 2,000 seconds. ASI662MC is not supported yet.
+- **Regain · ZWO Direct USB** (experimental): ASI662MC and ASI676MC support
+  RAW16, bin 1, and exposures from 32 microseconds to 2,000 seconds.
 
-There is no automatic fallback. Adding ASI662MC direct support requires a
-reviewed Regain pin update and hardware validation, not a local driver.
+SDK remains the default; existing configurations do not switch drivers.
+There is no automatic fallback.
 Other camera vendors can be added behind the adapter as Regain implements them;
 this version does not claim support for non-ZWO or monochrome cameras.
 
@@ -25,7 +26,7 @@ this version does not claim support for non-ZWO or monochrome cameras.
 driver = "zwo_sdk" # or "zwo_direct", explicitly
 # serial = "exact-camera-serial"
 exposure_control = "adaptive"
-max_exposure_us = 60000000 # ASI676MC direct supports up to 2000000000
+max_exposure_us = 60000000 # Both direct models support up to 2000000000
 ```
 
 Keep the selected model filter. Backend changes clear the transient camera ID
@@ -33,6 +34,12 @@ in the Viewer and restart capture. A saved serial is verified on open.
 Identical models require an exact serial; an ambiguous selection never silently
 opens the first camera. SDK IDs remain useful for selecting distinct models
 but are not durable USB identity.
+
+ASI662MC Direct USB provides 1920×1080 RGGB frames, gain 0–600, and an
+approximately 100 ms minimum frame interval for short exposures. AutoPierCam's
+preview-rate cap still applies. Centered ROI origins are aligned to 8 pixels
+on both axes. Bin 2 is not supported. Direct mode uses the installed ZWO USB
+driver on Windows but does not load the ZWO SDK.
 
 ## Capture and safety
 
@@ -96,6 +103,14 @@ worker termination. A new direct capture saved successfully afterward, and all
 test workers exited. The short post-cancellation run reached its bounded settling
 deadline; it was not a convergence test. See
 [Regain PR #3](https://github.com/pulsarfab/regain/pull/3) for upstream evidence.
+
+For ASI662MC, [Regain's upstream validation](https://github.com/pulsarfab/regain/blob/a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06/docs/asi662mc.md)
+covers Windows captures from 32 microseconds through 600 seconds, retained-frame
+replay, interrupted reads and bounded cancellation. Its advertised 2,000-second
+limit has not been hardware-validated on the 662. Cold startup, optical accuracy
+and Linux/macOS hardware also remain unvalidated. AutoPierCam's pin-update tests
+use simulated ASI662MC full frames, centered ROIs, controls and the save pipeline;
+they are not additional physical-camera validation.
 
 Before release, still validate day/night convergence, native Bayer orientation,
 rate limiting, live saves and USB interruption with operator approval. Simulator

@@ -1,7 +1,7 @@
 [camera]
 # Both backends run in the isolated Regain worker. No automatic SDK fallback.
 driver = "zwo_sdk"
-# driver = "zwo_direct" # Experimental; ASI662MC not yet supported, ASI676MC max 2,000 s.
+# driver = "zwo_direct" # Experimental; ASI662MC/ASI676MC, bin 1, max 2,000 s.
 # serial = "exact-camera-serial" # Required to distinguish identical models.
 # camera_id = 0
 # name_contains = "ASI676MC"

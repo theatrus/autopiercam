@@ -82,6 +82,98 @@ fn sdk_and_direct_capture_without_discovery_while_owned() {
         assert!(!driver.cameras().unwrap().is_empty());
     }
 }
+
+#[test]
+fn asi662_direct_full_frame_and_centered_roi() {
+    let driver = driver(CameraDriver::ZwoDirect, json!({}), None);
+    let info = driver
+        .cameras()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name == "ZWO ASI662MC")
+        .expect("pinned Regain must advertise ASI662MC Direct USB");
+    assert_eq!((info.max_width, info.max_height), (1920, 1080));
+    assert!(info.is_color);
+    assert_eq!(info.bayer_pattern, autopiercam_camera::BayerPattern::Rg);
+    assert_eq!(info.supported_bins, vec![1]);
+    let mut camera = driver.open(info).unwrap();
+    let caps = camera.controls().unwrap();
+    let exposure = caps
+        .iter()
+        .find(|c| c.control_type == ControlType::EXPOSURE)
+        .unwrap();
+    assert_eq!(
+        (exposure.min_value, exposure.max_value),
+        (32, 2_000_000_000)
+    );
+    let gain = caps
+        .iter()
+        .find(|c| c.control_type == ControlType::GAIN)
+        .unwrap();
+    assert_eq!((gain.min_value, gain.max_value), (0, 600));
+    // Validate the ceiling without waiting for a long simulated exposure.
+    camera
+        .set_control(ControlType::EXPOSURE, 2_000_000_000, false)
+        .unwrap();
+    assert!(
+        camera
+            .set_control(ControlType::EXPOSURE, 2_000_000_001, false)
+            .is_err()
+    );
+    camera
+        .set_control(ControlType::EXPOSURE, 32, false)
+        .unwrap();
+    camera.set_control(ControlType::GAIN, 200, false).unwrap();
+    assert!(camera.set_control(ControlType::GAIN, 601, false).is_err());
+    assert!(
+        camera
+            .set_roi(Roi {
+                width: 960,
+                height: 540,
+                bin: 2,
+                image_type: ImageType::Raw16
+            })
+            .is_err()
+    );
+
+    for (width, height, image_type) in [
+        (1920, 1080, ImageType::Raw16),
+        // Center y=508 is even but NOT 8-aligned; the adapter must round to 504.
+        (64, 64, ImageType::Raw16),
+        (64, 64, ImageType::Raw8),
+    ] {
+        camera
+            .set_roi(Roi {
+                width,
+                height,
+                bin: 1,
+                image_type,
+            })
+            .unwrap();
+        camera.start_capture().unwrap();
+        assert!(driver.cameras().is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pixels = Vec::new();
+        loop {
+            match camera.poll_frame(&mut pixels, 50) {
+                Ok(meta) => {
+                    assert_eq!(
+                        (meta.width, meta.height, meta.image_type),
+                        (width, height, image_type)
+                    );
+                    assert_eq!(
+                        pixels.len(),
+                        width as usize * height as usize * image_type.bytes_per_pixel().unwrap()
+                    );
+                    break;
+                }
+                Err(e) if e.is_timeout() => assert!(Instant::now() < deadline),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        camera.stop_capture().unwrap();
+    }
+}
 #[test]
 fn pending_frames_keep_metadata_and_apply_edits_to_next_exposure() {
     let driver = driver(CameraDriver::ZwoSdk, json!({}), None);
@@ -197,4 +289,36 @@ fn production_pipeline_settles_and_saves_a_simulated_frame() {
     let saved = monitor.snapshot().last_artifact.unwrap();
     assert!(Path::new(&saved).is_file());
     assert_eq!(Path::new(&saved).extension().unwrap(), "jpg");
+}
+
+#[test]
+fn asi662_direct_pipeline_settles_and_saves_without_network() {
+    let driver = driver(CameraDriver::ZwoDirect, json!({}), None);
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = autopiercam_core::config::Config::default();
+    config.camera.driver = CameraDriver::ZwoDirect;
+    config.camera.name_contains = Some("ASI662MC".into());
+    config.camera.min_exposure_us = 1000;
+    config.camera.max_exposure_us = 1000;
+    config.camera.min_gain = 200;
+    config.camera.max_gain = 200;
+    config.camera.settle_frames = 1;
+    config.capture.preview_max_fps = 30;
+    config.capture.interval_ms = 1;
+    config.capture.directory = temp.path().join("captures");
+    assert!(!config.upload.enabled && !config.video.enabled);
+    let path = temp.path().join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let monitor = autopiercam::AgentMonitor::new();
+    autopiercam::run_agent_with_monitor_and_preview(
+        &driver,
+        &path,
+        Some(1),
+        &autopiercam::AgentControl::new(),
+        &monitor,
+        &autopiercam::PreviewHub::new().begin_session(),
+    )
+    .unwrap();
+    assert_eq!(monitor.snapshot().frames_saved, 1);
+    assert!(Path::new(&monitor.snapshot().last_artifact.unwrap()).is_file());
 }
