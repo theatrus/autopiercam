@@ -18,13 +18,7 @@ use autopiercam_protocol::{AgentState, AgentStatus};
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const MAX_CAPTURE_REQUESTS_PER_POLL: u64 = 1_024;
-const RETRY_DELAYS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-];
+const FAULT_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerOptions {
@@ -295,9 +289,38 @@ fn supervise_camera<F>(
 ) where
     F: Fn(WorkerEvent),
 {
+    supervise_camera_with(
+        options,
+        commands,
+        signals,
+        monitor,
+        preview,
+        emit,
+        last_status,
+        FAULT_RETRY_DELAY,
+        CameraSession::start,
+    );
+}
+
+// Inject session creation and the delay so lifecycle tests never access hardware
+// or wait thirty seconds. The production entry point always uses the fixed delay.
+#[allow(clippy::too_many_arguments)]
+fn supervise_camera_with<F, S>(
+    options: WorkerOptions,
+    commands: Receiver<TrayCommand>,
+    signals: &WorkerSignals,
+    monitor: &AgentMonitor,
+    preview: &PreviewHub,
+    emit: &F,
+    last_status: &mut Option<AgentStatus>,
+    retry_delay: Duration,
+    mut start_session: S,
+) where
+    F: Fn(WorkerEvent),
+    S: FnMut(&WorkerOptions, &AgentMonitor, &PreviewHub, bool) -> std::io::Result<CameraSession>,
+{
     let mut session = None;
     let mut intent = SupervisorIntent::new(false);
-    let mut backoff = RetryBackoff::default();
     let mut retry_at = Instant::now();
 
     loop {
@@ -305,18 +328,10 @@ fn supervise_camera<F>(
             orderly_shutdown(&mut session, monitor, emit, last_status);
             return;
         }
-        observe_session_status(
-            monitor,
-            emit,
-            last_status,
-            &mut session,
-            &mut intent,
-            &mut backoff,
-        );
+        observe_session_status(monitor, emit, last_status, &mut session, &mut intent);
 
         if session.as_ref().is_some_and(CameraSession::is_finished) {
             let finished = session.take().expect("finished session was present");
-            let reached_capturing = finished.reached_capturing;
             let restarting = finished.stop_requested_at.is_some();
             let outcome = finished.join_finished();
             if restarting {
@@ -324,18 +339,15 @@ fn supervise_camera<F>(
                 monitor.mark_stopping();
                 signals.restart_pending.store(false, Ordering::Release);
             } else {
-                report_unexpected_exit(monitor, outcome);
+                report_unexpected_exit(monitor, outcome, retry_delay);
                 intent.faulted = true;
             }
             publish_status_if_changed(monitor, emit, last_status);
-            if reached_capturing {
-                backoff.reset();
-            }
             retry_at = Instant::now()
                 + if restarting {
                     Duration::ZERO
                 } else {
-                    backoff.next_delay()
+                    retry_delay
                 };
             continue;
         }
@@ -348,7 +360,6 @@ fn supervise_camera<F>(
                     command,
                     &mut session,
                     &mut intent,
-                    &mut backoff,
                     &mut retry_at,
                     &signals.restart_pending,
                     monitor,
@@ -367,7 +378,7 @@ fn supervise_camera<F>(
             Err(TryRecvError::Empty) => {}
         }
 
-        if session.is_none() && !intent.faulted && Instant::now() >= retry_at {
+        if session.is_none() && Instant::now() >= retry_at {
             let _admission = signals
                 .start_admission
                 .lock()
@@ -375,13 +386,18 @@ fn supervise_camera<F>(
             if signals.stopping.load(Ordering::Acquire) {
                 continue;
             }
-            match CameraSession::start(&options, monitor, preview, intent.paused) {
+            intent.faulted = false;
+            match start_session(&options, monitor, preview, intent.paused) {
                 Ok(camera) => session = Some(camera),
                 Err(error) => {
                     intent.faulted = true;
-                    monitor.report_fault(format!("failed to start camera thread: {error}"));
+                    report_retryable_fault(
+                        monitor,
+                        format!("failed to start camera thread: {error}"),
+                        retry_delay,
+                    );
                     publish_status_if_changed(monitor, emit, last_status);
-                    retry_at = Instant::now() + backoff.next_delay();
+                    retry_at = Instant::now() + retry_delay;
                 }
             }
             continue;
@@ -405,7 +421,6 @@ fn supervise_camera<F>(
                     command,
                     &mut session,
                     &mut intent,
-                    &mut backoff,
                     &mut retry_at,
                     &signals.restart_pending,
                     monitor,
@@ -430,7 +445,6 @@ fn handle_command<F>(
     command: TrayCommand,
     session: &mut Option<CameraSession>,
     intent: &mut SupervisorIntent,
-    backoff: &mut RetryBackoff,
     retry_at: &mut Instant,
     restart_pending: &AtomicBool,
     monitor: &AgentMonitor,
@@ -475,7 +489,6 @@ where
             if session.is_none() {
                 restart_pending.store(false, Ordering::Release);
             }
-            backoff.reset();
             *retry_at = Instant::now();
             false
         }
@@ -492,7 +505,6 @@ fn observe_session_status<F>(
     last_status: &mut Option<AgentStatus>,
     session: &mut Option<CameraSession>,
     intent: &mut SupervisorIntent,
-    backoff: &mut RetryBackoff,
 ) where
     F: Fn(WorkerEvent),
 {
@@ -509,10 +521,6 @@ fn observe_session_status<F>(
     }
     let status = monitor.snapshot();
     if let Some(camera) = session {
-        if monitor.capturing_generation() != camera.started_capturing_generation {
-            camera.reached_capturing = true;
-            backoff.reset();
-        }
         match status.state {
             AgentState::Capturing => {
                 camera.ready = true;
@@ -565,12 +573,20 @@ fn orderly_shutdown<F>(
     publish_status_if_changed(monitor, emit, last_status);
 }
 
-fn report_unexpected_exit(monitor: &AgentMonitor, outcome: SessionExit) {
-    match outcome {
-        SessionExit::Completed => monitor.report_fault("camera session stopped unexpectedly"),
-        SessionExit::Failed(error) => monitor.report_fault(error),
-        SessionExit::Panicked => monitor.report_fault("camera owner thread panicked"),
-    }
+fn report_unexpected_exit(monitor: &AgentMonitor, outcome: SessionExit, retry_delay: Duration) {
+    let message = match outcome {
+        SessionExit::Completed => "camera session stopped unexpectedly".to_owned(),
+        SessionExit::Failed(error) => error,
+        SessionExit::Panicked => "camera owner thread panicked".to_owned(),
+    };
+    report_retryable_fault(monitor, message, retry_delay);
+}
+
+fn report_retryable_fault(monitor: &AgentMonitor, message: String, retry_delay: Duration) {
+    monitor.report_fault(format!(
+        "{message}. Automatic capture retry in {} seconds.",
+        retry_delay.as_secs()
+    ));
 }
 
 fn report_controlled_exit(monitor: &AgentMonitor, outcome: SessionExit) {
@@ -619,8 +635,6 @@ struct CameraSession {
     control: AgentControl,
     thread: Option<JoinHandle<Result<(), String>>>,
     ready: bool,
-    reached_capturing: bool,
-    started_capturing_generation: u64,
     stop_requested_at: Option<Instant>,
 }
 
@@ -639,7 +653,6 @@ impl CameraSession {
         let camera_control = control.clone();
         let camera_monitor = monitor.clone();
         let camera_preview = preview.clone();
-        let started_capturing_generation = monitor.capturing_generation();
         let thread = thread::Builder::new()
             .name("autopiercam-camera".to_owned())
             .spawn(move || {
@@ -654,8 +667,6 @@ impl CameraSession {
             control,
             thread: Some(thread),
             ready: false,
-            reached_capturing: false,
-            started_capturing_generation,
             stop_requested_at: None,
         })
     }
@@ -777,25 +788,6 @@ impl SupervisorIntent {
     }
 }
 
-#[derive(Debug, Default)]
-struct RetryBackoff {
-    next_index: usize,
-}
-
-impl RetryBackoff {
-    fn next_delay(&mut self) -> Duration {
-        let index = self.next_index.min(RETRY_DELAYS.len() - 1);
-        if self.next_index < RETRY_DELAYS.len() {
-            self.next_index += 1;
-        }
-        RETRY_DELAYS[index]
-    }
-
-    fn reset(&mut self) {
-        self.next_index = 0;
-    }
-}
-
 fn run_camera(
     options: WorkerOptions,
     control: &AgentControl,
@@ -833,9 +825,212 @@ fn run_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    fn synthetic_options() -> WorkerOptions {
+        WorkerOptions {
+            config_path: PathBuf::from("unused-in-synthetic-test.toml"),
+            sdk_path: None,
+        }
+    }
 
     #[test]
-    fn fault_requires_an_operator_restart_or_configuration_save() {
+    fn automatic_retry_recovers_after_start_and_capture_failures_without_overlapping_owners() {
+        let (sender, receiver) = mpsc::channel();
+        let attempts = Cell::new(0);
+        let last_fault = RefCell::new(None::<Instant>);
+        let delay = Duration::from_millis(20);
+        let live_owner = Arc::new(AtomicBool::new(false));
+        let monitor = AgentMonitor::new();
+        supervise_camera_with(
+            synthetic_options(),
+            receiver,
+            &WorkerSignals::default(),
+            &monitor,
+            &PreviewHub::new(),
+            &|event| {
+                if matches!(event, WorkerEvent::StatusChanged(ref status) if status.state == AgentState::Faulted)
+                {
+                    *last_fault.borrow_mut() = Some(Instant::now());
+                    sender.send(TrayCommand::SetPaused(true)).unwrap();
+                    sender.send(TrayCommand::CaptureNow).unwrap();
+                }
+            },
+            &mut None,
+            delay,
+            |_, _, _, paused| {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt > 1 {
+                    assert!(last_fault.borrow().unwrap().elapsed() >= delay);
+                    assert!(paused, "recording pause must survive automatic retry");
+                }
+                assert!(
+                    !live_owner.load(Ordering::Acquire),
+                    "previous owner must exit before retry"
+                );
+                if attempt == 1 {
+                    return Err(std::io::Error::other("synthetic thread-start failure"));
+                }
+                assert!(attempt <= 3);
+                let control = AgentControl::new();
+                if paused {
+                    control.pause();
+                }
+                let thread_control = control.clone();
+                let owner = live_owner.clone();
+                owner.store(true, Ordering::Release);
+                let thread = thread::spawn(move || {
+                    if attempt == 3 {
+                        let started = Instant::now();
+                        while !thread_control.is_shutdown()
+                            && started.elapsed() < Duration::from_secs(2)
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        assert!(thread_control.is_shutdown());
+                    }
+                    owner.store(false, Ordering::Release);
+                    if attempt == 2 {
+                        Err("synthetic Regain download failure".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if attempt == 3 {
+                    sender.send(TrayCommand::Shutdown).unwrap();
+                }
+                Ok(CameraSession {
+                    control,
+                    thread: Some(thread),
+                    ready: false,
+                    stop_requested_at: None,
+                })
+            },
+        );
+        assert_eq!(attempts.get(), 3);
+        assert!(!live_owner.load(Ordering::Acquire));
+        assert_eq!(monitor.snapshot().state, AgentState::Stopping);
+    }
+
+    #[test]
+    fn queued_shutdown_prevents_even_an_immediately_due_retry() {
+        let (sender, receiver) = mpsc::channel();
+        let attempts = Cell::new(0);
+        supervise_camera_with(
+            synthetic_options(),
+            receiver,
+            &WorkerSignals::default(),
+            &AgentMonitor::new(),
+            &PreviewHub::new(),
+            &|event| {
+                if matches!(event, WorkerEvent::StatusChanged(ref status) if status.state == AgentState::Faulted)
+                {
+                    sender.send(TrayCommand::Shutdown).unwrap();
+                }
+            },
+            &mut None,
+            Duration::ZERO,
+            |_, _, _, _| {
+                attempts.set(attempts.get() + 1);
+                assert_eq!(attempts.get(), 1, "shutdown must beat a due retry");
+                Err(std::io::Error::other("synthetic startup failure"))
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn restart_and_configuration_save_bypass_fault_delay() {
+        for command in [TrayCommand::Restart, TrayCommand::ReloadConfiguration] {
+            let (sender, receiver) = mpsc::channel();
+            let attempts = Cell::new(0);
+            let started = Instant::now();
+            supervise_camera_with(
+                synthetic_options(),
+                receiver,
+                &WorkerSignals::default(),
+                &AgentMonitor::new(),
+                &PreviewHub::new(),
+                &|event| {
+                    if matches!(event, WorkerEvent::StatusChanged(ref status) if status.state == AgentState::Faulted)
+                    {
+                        sender
+                            .send(if attempts.get() == 1 {
+                                command
+                            } else {
+                                TrayCommand::Shutdown
+                            })
+                            .unwrap();
+                    }
+                },
+                &mut None,
+                FAULT_RETRY_DELAY,
+                |_, _, _, _| {
+                    attempts.set(attempts.get() + 1);
+                    assert!(attempts.get() <= 2);
+                    Err(std::io::Error::other(format!(
+                        "synthetic failure {}",
+                        attempts.get()
+                    )))
+                },
+            );
+            assert_eq!(attempts.get(), 2);
+            assert!(started.elapsed() < FAULT_RETRY_DELAY);
+        }
+    }
+
+    #[test]
+    fn faulted_but_live_owner_is_not_replaced_by_automatic_retry() {
+        let (sender, receiver) = mpsc::channel();
+        let attempts = Cell::new(0);
+        let monitor = AgentMonitor::new();
+        supervise_camera_with(
+            synthetic_options(),
+            receiver,
+            &WorkerSignals::default(),
+            &monitor,
+            &PreviewHub::new(),
+            &|_| {},
+            &mut None,
+            Duration::ZERO,
+            |_, monitor, _, _| {
+                attempts.set(attempts.get() + 1);
+                assert_eq!(
+                    attempts.get(),
+                    1,
+                    "live camera owner must fence all retries"
+                );
+                monitor.report_fault("synthetic cleanup still running");
+                let control = AgentControl::new();
+                let thread_control = control.clone();
+                let sender = sender.clone();
+                let thread = thread::spawn(move || {
+                    // Several supervisor polls with a visible fault and an already-due retry.
+                    thread::sleep(SUPERVISOR_POLL_INTERVAL * 3);
+                    sender.send(TrayCommand::Shutdown).unwrap();
+                    let started = Instant::now();
+                    while !thread_control.is_shutdown()
+                        && started.elapsed() < Duration::from_secs(2)
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(thread_control.is_shutdown());
+                    Ok(())
+                });
+                Ok(CameraSession {
+                    control,
+                    thread: Some(thread),
+                    ready: false,
+                    stop_requested_at: None,
+                })
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn fault_wait_preserves_commands_and_allows_manual_restart_or_configuration_save() {
         let mut intent = SupervisorIntent::new(false);
         intent.faulted = true;
         for command in [TrayCommand::CaptureNow, TrayCommand::SetPaused(false)] {
@@ -917,8 +1112,6 @@ mod tests {
                 Ok(())
             })),
             ready: true,
-            reached_capturing: true,
-            started_capturing_generation: 0,
             stop_requested_at: None,
         });
         let monitor = AgentMonitor::new();
@@ -929,7 +1122,6 @@ mod tests {
             TrayCommand::Restart,
             &mut session,
             &mut intent,
-            &mut RetryBackoff::default(),
             &mut Instant::now(),
             &restart_pending,
             &monitor,
@@ -949,7 +1141,6 @@ mod tests {
             &mut last_status,
             &mut session,
             &mut intent,
-            &mut RetryBackoff::default(),
         );
         assert_eq!(monitor.snapshot().state, AgentState::Faulted);
         assert_eq!(intent.pending_captures, 1);
@@ -975,13 +1166,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_is_bounded_and_resets_after_capture() {
-        let mut backoff = RetryBackoff::default();
-        let delays = (0..7).map(|_| backoff.next_delay()).collect::<Vec<_>>();
-        assert_eq!(delays, [1, 2, 5, 10, 30, 30, 30].map(Duration::from_secs));
-
-        backoff.reset();
-        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    fn production_retry_delay_and_visible_error_are_thirty_seconds() {
+        assert_eq!(FAULT_RETRY_DELAY, Duration::from_secs(30));
+        let monitor = AgentMonitor::new();
+        report_unexpected_exit(
+            &monitor,
+            SessionExit::Failed("USB download failed".to_owned()),
+            FAULT_RETRY_DELAY,
+        );
+        assert_eq!(monitor.snapshot().state, AgentState::Faulted);
+        assert_eq!(
+            monitor.snapshot().last_error.as_deref(),
+            Some("USB download failed. Automatic capture retry in 30 seconds.")
+        );
     }
 
     #[test]

@@ -388,6 +388,12 @@
                         <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
                                       IsEnabled="False" IsOn="True" Visibility="Collapsed" Toggled="ExposureControl_Changed" />
                         <TextBlock Text="AutoPierCam controls exposure and gain through Regain." FontSize="12" TextWrapping="Wrap" />
+                        <NumberBox x:Name="LatitudeNumberBox" Header="Observing latitude · degrees north"
+                                   Minimum="-90" Maximum="90" IsEnabled="False" />
+                        <NumberBox x:Name="LongitudeNumberBox" Header="Observing longitude · degrees east"
+                                   Minimum="-180" Maximum="180" IsEnabled="False" />
+                        <TextBlock Text="Set both coordinates to choose day/night at capture startup. West and south are negative. Leave both blank to use exposure feedback only. Changes take effect on next capture start."
+                                   FontSize="12" TextWrapping="Wrap" />
                         <StackPanel Spacing="8">
                             <NumberBox x:Name="MinGainNumberBox" Header="Minimum gain · application control only"
                                        Minimum="0" Maximum="600" Value="0" SmallChange="10"
@@ -400,6 +406,19 @@
                                        Text="Equal gain limits hold gain fixed. Shorter exposures raises gain first, increasing noise." />
                         </StackPanel>
                         <ToggleSwitch x:Name="Raw16Toggle" Header="Save lossless 16-bit PNG stills" IsEnabled="False" />
+                        <ComboBox x:Name="WhiteBalanceModeComboBox" Header="Color white balance · Regain"
+                                  HorizontalAlignment="Stretch" SelectedIndex="0" IsEnabled="False">
+                            <ComboBoxItem Content="Disabled · preserve backend defaults" />
+                            <ComboBoxItem Content="Manual" />
+                            <ComboBoxItem Content="Auto once per capture session" />
+                            <ComboBoxItem Content="Auto continuous" />
+                        </ComboBox>
+                        <NumberBox x:Name="WhiteBalanceRedNumberBox" Header="Red multiplier / initial AWB gain"
+                                   Minimum="0.125" Maximum="8" Value="1" SmallChange="0.1" IsEnabled="False" />
+                        <NumberBox x:Name="WhiteBalanceBlueNumberBox" Header="Blue multiplier / initial AWB gain"
+                                   Minimum="0.125" Maximum="8" Value="1" SmallChange="0.1" IsEnabled="False" />
+                        <TextBlock Text="Linear multipliers relative to green (1), not SDK slider values. Regain applies WB to previews and saved images, including 16-bit PNGs. Save restarts capture; Auto once estimates again after reconnect. For stars or narrowband scenes, prefer Manual: AWB assumes a neutral scene."
+                                   FontSize="12" TextWrapping="Wrap" />
                         <TextBlock Text="16-bit PNGs use more storage than JPEGs. Exposure limits depend on the selected driver."
                                    FontSize="12" TextWrapping="Wrap" />
                         <TextBox x:Name="CameraNameFilterTextBox" Header="Camera model filter (optional)" PlaceholderText="ASI676MC"

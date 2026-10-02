@@ -340,6 +340,8 @@ impl AgentMonitor {
             "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.gain_range".to_owned(),
+            "camera.startup_location".to_owned(),
+            "camera.white_balance".to_owned(),
             "camera.raw16".to_owned(),
             "capture.preview_rate".to_owned(),
             "video.ffmpeg".to_owned(),
@@ -1185,6 +1187,9 @@ fn run_agent_inner(
         image_type,
     };
     camera.set_roi(roi)?;
+    if let Some(wb) = &config.camera.white_balance {
+        camera.configure_white_balance(wb)?;
+    }
     info!(camera = %info.name, width = roi.width, height = roi.height, bin = roi.bin,
         preview_max_fps = config.capture.preview_max_fps,
         "continuous camera session started");
@@ -1193,6 +1198,18 @@ fn run_agent_inner(
     let preview_sink = preview_encoder.as_ref().map(PreviewEncoder::sink);
     let mut state = CaptureLoopState::default();
     state.configure_exposure(&config.camera, auto_limits);
+    if state.initial_mode.is_some() {
+        let controller = state
+            .adaptive
+            .as_ref()
+            .expect("configured exposure controller");
+        camera.set_control(
+            ControlType::EXPOSURE,
+            controller.initial_exposure_us(),
+            false,
+        )?;
+        info!(mode = ?controller.mode(), "startup lighting selected from observing location and UTC");
+    }
     camera.start_capture()?;
     let result = (|| {
         loop {
@@ -1401,6 +1418,7 @@ fn acquire_disabled_upload_ledger_lease(
 /// requests, reset interval, or lost adaptive controller history.
 struct CaptureLoopState {
     settled: bool,
+    initial_mode: Option<LightMode>,
     preview_cadence: PreviewCadence,
     adaptive: Option<AdaptiveExposure>,
     seen_capture_generation: u64,
@@ -1412,6 +1430,7 @@ impl Default for CaptureLoopState {
     fn default() -> Self {
         Self {
             settled: false,
+            initial_mode: None,
             preview_cadence: PreviewCadence::default(),
             adaptive: None,
             seen_capture_generation: 0,
@@ -1423,6 +1442,15 @@ impl Default for CaptureLoopState {
 
 impl CaptureLoopState {
     fn configure_exposure(&mut self, config: &CameraConfig, limits: AutoLimits) {
+        self.configure_exposure_at(config, limits, SystemTime::now());
+    }
+
+    fn configure_exposure_at(
+        &mut self,
+        config: &CameraConfig,
+        limits: AutoLimits,
+        now: SystemTime,
+    ) {
         if let Some(controller) = &mut self.adaptive {
             controller.update_limits(
                 limits.min_exposure_us,
@@ -1434,6 +1462,7 @@ impl CaptureLoopState {
             controller.set_prefer_short_exposures(config.prefer_short_exposures);
             return;
         }
+        self.initial_mode = autopiercam_core::solar::startup_mode(config, now);
         self.adaptive = Some({
             let mut controller = AdaptiveExposure::new(
                 limits.min_exposure_us,
@@ -1442,6 +1471,9 @@ impl CaptureLoopState {
                 limits.max_gain,
                 limits.target_brightness as u8,
             );
+            if let Some(mode) = self.initial_mode {
+                controller = controller.with_initial_mode(mode);
+            }
             controller.set_prefer_short_exposures(config.prefer_short_exposures);
             controller
         });
@@ -2328,6 +2360,40 @@ mod tests {
     }
 
     #[test]
+    fn startup_location_seeds_once_and_live_saves_do_not_reseed() {
+        let config = CameraConfig {
+            latitude_deg: Some(0.0),
+            longitude_deg: Some(0.0),
+            ..Default::default()
+        };
+        let limits = AutoLimits {
+            min_exposure_us: 100,
+            max_exposure_us: 60_000_000,
+            min_gain: 0,
+            max_gain: 300,
+            target_brightness: 100,
+        };
+        let midnight = UNIX_EPOCH + Duration::from_secs(1_773_964_800); // 2026-03-20 UTC
+        let mut state = CaptureLoopState::default();
+        state.configure_exposure_at(&config, limits, midnight);
+        assert_eq!(state.initial_mode, Some(LightMode::Night));
+        assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
+        assert_eq!(
+            state.adaptive.as_ref().unwrap().initial_exposure_us(),
+            1_000_000
+        );
+        state.configure_exposure_at(&config, limits, midnight + Duration::from_secs(43200));
+        assert_eq!(state.adaptive.as_ref().unwrap().mode(), LightMode::Night);
+        let mut restarted = CaptureLoopState::default();
+        restarted.configure_exposure_at(&config, limits, midnight + Duration::from_secs(43200));
+        assert_eq!(restarted.adaptive.as_ref().unwrap().mode(), LightMode::Day);
+        assert_eq!(
+            restarted.adaptive.as_ref().unwrap().initial_exposure_us(),
+            10_000
+        );
+    }
+
+    #[test]
     fn updating_limits_preserves_settling_cadence_requests_and_night_mode() {
         let mut config = CameraConfig {
             exposure_control: ExposureControl::Adaptive,
@@ -2747,6 +2813,8 @@ mod tests {
                 "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.gain_range".to_owned(),
+                "camera.startup_location".to_owned(),
+                "camera.white_balance".to_owned(),
                 "camera.raw16".to_owned(),
                 "capture.preview_rate".to_owned(),
                 "video.ffmpeg".to_owned()

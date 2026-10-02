@@ -29,8 +29,9 @@ Actual limits come from the opened camera.
 The pinned Regain direct backend supports ASI676MC up to **2,000 seconds**,
 validated with a full-frame RAW16 capture. Set max_exposure_us to at most
 2000000000 (2,000,000 ms in the Viewer). Higher ceilings
-fail visibly; there is no silent direct-to-SDK fallback. ASI662MC must use
-Regain's SDK backend until upstream adds direct support.
+fail visibly; there is no silent direct-to-SDK fallback. Regain 0.5.2 also
+supports ASI662MC Direct USB, advertising the same ceiling. Upstream Windows
+ASI662MC evidence covers through 600 seconds, not 2,000 seconds.
 
 ## Gain and shorter exposures
 
@@ -52,14 +53,36 @@ finish before edits can take effect. There is no video backlog to flush.
 ## Cadence, settling and lighting mode
 
 The controller targets sampled p90 brightness, shortens clipped frames
-aggressively, and uses a brightness deadband. Lighting mode uses exposure-based
-hysteresis, not a fixed sunrise/sunset time. Roof state and artificial lights
+aggressively, and uses a brightness deadband. After startup, lighting mode uses
+exposure-based hysteresis, not a fixed sunrise/sunset time. Roof state and artificial lights
 can legitimately differ from astronomical day/night. Chatstronomy applies its
 own 30-second mode dwell before reporting a transition.
 
 Startup settling waits for stable controls; previews appear during this phase.
 Changing output/upload settings preserves the controller's history. Camera,
 backend, serial or image-layout changes require a new session.
+
+### Initial day/night selection
+
+Set observing latitude and longitude in Viewer Settings, or `latitude_deg` and
+`longitude_deg` under `[camera]` in TOML. Both are optional but must be provided
+together: north/east positive, south/west negative, ranges -90..90 and -180..180.
+No location is inferred or sent to a service. Leave both blank to preserve the
+previous startup behavior.
+
+On each new capture session, the current UTC instant and observing location
+seed the lighting mode using the approximate
+[NOAA solar-position equations](https://gml.noaa.gov/grad/solcalc/solareqns.PDF).
+Below -6 degrees solar altitude is night; civil twilight and daylight are day.
+This handles longitude, seasons and polar day/night without depending on the
+computer's timezone or daylight-saving setting. An invalid system time falls
+back to the previous behavior.
+
+The first exposure is 1 second at night or 10 milliseconds by day, clamped to
+the configured and camera-supported limits. Gain limits are unchanged. Normal
+frame feedback then adjusts exposure and can override the initial mode. Saving
+coordinates during capture does not restart or reseed it; the next new capture
+session uses them. Recording pause/resume and output reloads preserve history.
 
 Maximum preview frame rate paces acquisition and preview publication; it cannot
 make a long exposure finish sooner. Save next frame requests the next eligible
@@ -68,9 +91,12 @@ not the preview.
 
 Frame progress has an exposure-aware deadline. Repeated 'exposing' replies do
 not reset the time since the last completed frame. A worker timeout, invalid
-frame or capture error faults the session; use the tray's restart command or
-save corrected settings to retry. No automatic USB reset or repeated discovery
-is attempted.
+frame or capture error faults the session. After the old camera owner and cleanup
+have exited, the tray automatically retries after 30 seconds, retaining the saved
+backend/selection and recording-pause state. Each failed attempt waits another
+30 seconds. Use the tray's restart command or save corrected settings to retry
+sooner; quitting cancels retries. Discovery occurs only before opening the new
+session, never while a camera is owned. No automatic USB reset is attempted.
 
 ## Validation
 

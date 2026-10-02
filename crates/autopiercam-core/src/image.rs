@@ -119,7 +119,12 @@ pub fn raw16_stats(raw: &[u8], sample_stride_pixels: usize) -> Result<LumaStats,
     }
     let mut histogram = [0_u64; 256];
     let (mut sum, mut count) = (0, 0);
-    for pixel in raw.chunks_exact(2).step_by(sample_stride_pixels.max(1)) {
+    for pixel in raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .step_by(sample_stride_pixels.max(1))
+    {
         histogram[pixel[1] as usize] += 1;
         sum += u64::from(pixel[1]);
         count += 1;
@@ -135,7 +140,7 @@ pub fn luma_stats(rgb: &[u8], sample_stride_pixels: usize) -> Result<LumaStats, 
     let mut histogram = [0_u64; 256];
     let mut sum = 0_u64;
     let mut count = 0_u64;
-    for pixel in rgb.chunks_exact(3).step_by(stride) {
+    for pixel in rgb.as_chunks::<3>().0.iter().step_by(stride) {
         // Integer Rec. 709 approximation is sufficient for exposure feedback.
         let luma = ((54_u32 * pixel[0] as u32
             + 183_u32 * pixel[1] as u32
@@ -249,7 +254,12 @@ pub fn raw16_to_raw8(raw: &[u8]) -> Result<Vec<u8>, ImageError> {
             actual: raw.len(),
         });
     }
-    Ok(raw.chunks_exact(2).map(|pixel| pixel[1]).collect())
+    Ok(raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pixel| pixel[1])
+        .collect())
 }
 
 fn allocate_rgb(width: u32, height: u32) -> Result<Vec<u8>, ImageError> {

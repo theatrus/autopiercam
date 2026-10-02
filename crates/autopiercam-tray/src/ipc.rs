@@ -1185,6 +1185,8 @@ mod tests {
                 "cameras.list",
                 "camera.adaptive_exposure",
                 "camera.gain_range",
+                "camera.startup_location",
+                "camera.white_balance",
                 "camera.raw16",
                 "capture.preview_rate",
                 "video.ffmpeg"

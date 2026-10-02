@@ -37,8 +37,9 @@ them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Reload camera list** reads cached discovery without discarding unsaved settings.
-Discovery runs before capture starts. Driver faults require an operator restart
-or configuration save; they do not trigger rescans. Discovery never probes other cameras during acquisition or settling, even with
+Discovery runs before capture starts. After a driver fault and completed cleanup,
+the tray retries automatically after 30 seconds using the saved camera selection;
+each fresh attempt performs startup discovery. Discovery never probes other cameras during acquisition or settling, even with
 recording paused. Restart the tray agent to discover newly connected cameras.
 A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
@@ -47,14 +48,15 @@ cameras require an exact serial number for persistent selection.
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-Version 0.2.13 uses Regain and application-controlled exposure for both
+Version 0.2.14 uses Regain and application-controlled exposure for both
 driver choices. ASI662MC and ASI676MC direct USB have a
 2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md).
 
-Version 0.2.13 adds ASI662MC Direct USB through Regain 0.5.2. SDK remains the
-default. Select Direct USB explicitly in
-Settings, then reselect the camera and save. Both direct models require bin 1.
+Version 0.2.14 updates Regain to 0.5.3, adds white-balance controls and retries
+failed capture sessions after 30 seconds. ASI662MC Direct USB has been supported
+since 0.2.13. SDK remains the default. Select Direct USB explicitly in Settings,
+then reselect the camera and save. Both direct models require bin 1.
 
 ## What is installed
 
@@ -142,11 +144,12 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 ## Silent installation and diagnostics
 
 If capture stops progressing, the agent reports a camera-worker fault independently
-of the Viewer connection. Restarting the Viewer does not restart capture. Quit
-the tray agent and relaunch it. Quit allows 30 seconds for graceful cleanup, then
-terminates its own process if cleanup is stuck. The Regain build first enforces
-deadlines on the isolated camera process and waits for an operator restart after
-a fault; it does not automatically rescan. Unfinished
+of the Viewer connection. After cleanup exits, the tray automatically retries in
+30 seconds; repeated failures use the same delay. Restarting the Viewer does not
+restart capture. A tray restart or configuration save can retry sooner. Quit
+cancels pending retries and allows 30 seconds for graceful cleanup, then
+terminates its own process if cleanup is stuck. Regain first enforces
+deadlines on the isolated camera process. Unfinished
 stills/video or uploads may be interrupted; already finalized files remain.
 Restart requests never open a second camera handle while the original worker is
 still running. An unresponsive restart asks the operator to quit and relaunch.
@@ -154,19 +157,19 @@ still running. An unresponsive restart asks the operator to quit and relaunch.
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.13-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.14-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.13-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.14-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.13-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.14-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

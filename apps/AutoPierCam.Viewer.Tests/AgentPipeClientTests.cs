@@ -7,6 +7,59 @@ using Xunit;
 
 public sealed class AgentPipeClientTests
 {
+    [Theory]
+    [InlineData("manual", 2.0, 0.5, true)]
+    [InlineData("once", 0.125, 8.0, true)]
+    [InlineData("continuous", 1.0, 1.0, true)]
+    [InlineData("auto", 1.0, 1.0, false)]
+    [InlineData("manual", 0.0, 1.0, false)]
+    [InlineData("once", 1.0, 8.1, false)]
+    [InlineData("manual", double.NaN, 1.0, false)]
+    public async Task WhiteBalanceValidatesAndRoundTrips(string mode, double red, double blue, bool valid)
+    {
+        var original = JsonSerializer.Deserialize<AgentConfiguration>(
+            await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        Assert.Null(original.Camera.WhiteBalance);
+        Assert.DoesNotContain("white_balance", JsonSerializer.Serialize(original));
+        var wb = new AgentWhiteBalanceConfiguration { Mode = mode, Red = red, Blue = blue };
+        var config = original with { Camera = original.Camera with { WhiteBalance = wb } };
+        if (!valid) { Assert.Throws<AgentProtocolException>(() => config.Validate("test")); return; }
+        config.Validate("test");
+        Assert.Equal(config, JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config)));
+        var form = SettingsFormValues.FromConfiguration(config);
+        Assert.Equal(mode, form.WhiteBalanceMode);
+        Assert.Equal(SettingsFormValues.Number(red), form.WhiteBalanceRed);
+        Assert.Equal(SettingsFormValues.Number(blue), form.WhiteBalanceBlue);
+        await WithResponse("config.replace", new { revision = 2UL, saved = true, restart_scheduled = true },
+            async client => Assert.True((await client.ReplaceConfigurationAsync(1, config)).RestartScheduled),
+            request => Assert.Equal(wb, request.GetProperty("payload").GetProperty("config").GetProperty("camera")
+                .GetProperty("white_balance").Deserialize<AgentWhiteBalanceConfiguration>()));
+        var disabled = config with { Camera = config.Camera with { WhiteBalance = null } };
+        Assert.DoesNotContain("white_balance", JsonSerializer.Serialize(disabled));
+        Assert.Equal("disabled", SettingsFormValues.FromConfiguration(disabled).WhiteBalanceMode);
+    }
+
+    [Theory]
+    [InlineData(null, null, true)]
+    [InlineData(0.0, 0.0, true)]
+    [InlineData(-90.0, 180.0, true)]
+    [InlineData(null, 0.0, false)]
+    [InlineData(0.0, null, false)]
+    [InlineData(91.0, 0.0, false)]
+    [InlineData(0.0, -181.0, false)]
+    public void ObservingLocationValidatesAndRoundTrips(double? lat, double? lon, bool valid)
+    {
+        var config = JsonSerializer.Deserialize<AgentConfiguration>(
+            File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        config = config with { Camera = config.Camera with { LatitudeDeg = lat, LongitudeDeg = lon } };
+        if (!valid) { Assert.Throws<AgentProtocolException>(() => config.Validate("test")); return; }
+        config.Validate("test");
+        Assert.Equal(config.Camera, JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!.Camera);
+        var form = SettingsFormValues.FromConfiguration(config);
+        Assert.Equal(SettingsFormValues.Number(lat ?? double.NaN), form.Latitude);
+        Assert.Equal(SettingsFormValues.Number(lon ?? double.NaN), form.Longitude);
+    }
+
     [Fact]
     public async Task GainControlsRoundTripWithoutRestart()
     {

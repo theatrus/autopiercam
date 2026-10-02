@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.13 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.14 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.13)](https://github.com/theatrus/autopiercam/releases/download/v0.2.13/AutoPierCam-0.2.13-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.13)
+[Download the signed Windows x64 installer (0.2.14)](https://github.com/theatrus/autopiercam/releases/download/v0.2.14/AutoPierCam-0.2.14-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.14)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,12 +25,13 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.13 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+Version 0.2.14 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-Version 0.2.13 updates Regain to 0.5.2 and adds ASI662MC Direct USB (RAW16,
-bin 1), with corrected centered-crop alignment. SDK remains the default.
+Version 0.2.14 automatically retries failed capture sessions after 30 seconds,
+selects the initial day/night mode from time and configured location, and exposes
+Regain 0.5.3 manual white balance and AWB for both drivers. SDK remains the default.
 See [driver limits and validation](docs/regain-backend.md).
 
 - pinned Regain drivers in an isolated worker, with explicit SDK or direct USB selection;
@@ -46,7 +47,7 @@ See [driver limits and validation](docs/regain-backend.md).
 - application-controlled exposure beyond 60 seconds where supported, lossless 16-bit PNG
   stills, and bounded preview-resolution MP4 recording; see
   [exposure](docs/exposure.md) and [video](docs/video.md);
-- a restartable camera supervisor; faults require an explicit restart or settings save;
+- a restartable camera supervisor with automatic 30-second fault retry;
 - a Windows notification-area host that owns and supervises the camera worker;
 - per-user Windows installer packaging with optional start-at-sign-in,
   self-contained Viewer deployment, orderly upgrade shutdown, and retained

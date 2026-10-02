@@ -17,6 +17,20 @@ exposure_control = "adaptive"
 # Set min_gain = max_gain for fixed gain with automatic exposure.
 target_brightness = 100
 settle_frames = 6
+# Optional observing location (degrees north/east; west and south are negative).
+# Set BOTH to select startup day/night from UTC and solar altitude. No geolocation/network.
+# latitude_deg = 40.0
+# longitude_deg = -120.0
+# Night begins below -6 degrees (civil twilight). Startup exposure is 1 s at night,
+# 10 ms by day, clamped to your limits; frame feedback takes over afterward.
+# Changes apply at the next capture start; blank preserves legacy startup behavior.
+
+# Optional Regain WB for BOTH drivers. Omit to preserve unmanaged backend defaults.
+# Linear red/blue multipliers relative to green=1, range 0.125..8 (not SDK values).
+# White balance affects previews AND saved images, including 16-bit PNGs.
+# white_balance = { mode = "manual", red = 1.0, blue = 1.0 }
+# Modes: manual, once (new estimate per session), continuous. Changes restart capture.
+# AWB assumes a neutral scene; use manual gains for strongly colored/narrowband skies.
 
 [capture]
 directory = "captures"

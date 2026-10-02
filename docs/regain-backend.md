@@ -1,7 +1,8 @@
 # Regain camera backend
 
-AutoPierCam 0.2.13 uses Regain 0.5.2 (Rust 1.89 or newer), pinned to release commit
-`a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06` in Cargo.toml and Cargo.lock.
+AutoPierCam 0.2.14 uses Regain 0.5.3 (Rust 1.89 or newer), pinned to the
+`v0.5.3.0` release commit `4cd6c153891ba7a2884e9e494055e59d11f13e77` in Cargo.toml
+and Cargo.lock. Published AutoPierCam 0.2.13 uses Regain 0.5.2.
 ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
 There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
 point calls the unchanged upstream drivers; `regain-core::Worker` owns the
@@ -41,7 +42,45 @@ preview-rate cap still applies. Centered ROI origins are aligned to 8 pixels
 on both axes. Bin 2 is not supported. Direct mode uses the installed ZWO USB
 driver on Windows but does not load the ZWO SDK.
 
-## Capture and safety
+## White balance
+
+AutoPierCam 0.2.14 exposes Regain 0.5.3's shared software white balance in
+Settings for both SDK and Direct USB. Published AutoPierCam 0.2.13 does not have
+these controls. Disabled is the default and sends no WB command, retaining the
+backend's existing behavior; SDK and Direct are not guaranteed to have matching
+unmanaged colors.
+
+Manual uses red/blue linear multipliers relative to green=1 (0.125–8), **not** the
+ZWO SDK slider scale. Auto once estimates until it has a valid frame and then
+holds the gains for that session. Continuous AWB smooths valid gray-world
+estimates. Red/blue fields provide initial gains while AWB waits for suitable
+signal. Dark or clipped/insufficient signal holds the preceding gains. Strongly
+colored, sparse night-sky or narrowband scenes can defeat gray-world assumptions;
+use manual gains when color consistency matters.
+
+Regain applies the correction to RAW16 Bayer data before AutoPierCam's RAW8
+conversion or debayering. Thus previews, JPEG/video output and 16-bit PNGs all
+include the correction; an enabled WB PNG is not unmodified sensor data. The
+application does not implement another estimator or apply WB a second time.
+Managed SDK capture neutralizes native WB first and restores the previous values
+on orderly close. A crash, hung worker or forced termination cannot guarantee
+restoration; close failures are logged. No physical-camera WB calibration is
+claimed.
+
+```toml
+[camera]
+white_balance = { mode = "manual", red = 1.0, blue = 1.0 }
+# Or mode = "once" / "continuous". Omit white_balance to disable management.
+```
+
+Changing WB restarts the capture session, including when disabling it. An
+automatic fault retry starts from the saved gains: Auto once estimates again,
+and Continuous starts smoothing again. Effective AWB estimates are not written
+back to the user's configuration. Only the capture owner commands the worker;
+the Viewer/IPC never opens an extra handle. Older agents do not advertise
+`camera.white_balance`, so their Viewer controls stay disabled.
+
+## Capture ownership and safety
 
 Only the capture owner starts or commands a worker. Discovery runs before open,
 never while acquiring, settling or paused. IPC and the Viewer use cached
@@ -63,9 +102,17 @@ than silently shortening night exposures.
 Regain calls have parent-enforced deadlines (15 s open, 5 s controls/start,
 2 s status/stop/close, 10 s download); frame progress retains AutoPierCam's
 exposure-aware deadline. A poll reporting 'exposing' is not a completed frame.
-Faults terminate the worker. The tray stops automatic retries: restart from the
-tray or save corrected settings to try again. No USB reset, port cycle, controller
-reset, background rescan, or cross-backend recovery is performed.
+Faults terminate the worker. Once the camera-owning thread and its cleanup have
+finished, the tray waits 30 seconds and automatically starts a fresh session with
+the saved backend and camera selection. Repeated failures each wait 30 seconds;
+the original error remains visible with a retry notice. Restart from the tray
+or save corrected settings to retry sooner. Recording pause and queued capture
+requests survive reconnection; quitting cancels the pending retry.
+No replacement starts while the old owner is alive. Discovery runs only at
+the start of the new session, never during active acquisition. No USB reset,
+port cycle, controller reset or cross-backend fallback is performed. The
+one-shot/headless CLI still returns its failure to the caller; automatic session
+retry belongs to the tray supervisor.
 
 Process isolation bounds a hung user-space call. It does not guarantee recovery
 from a wedged kernel driver, USB controller, firmware or another application's
@@ -111,6 +158,13 @@ limit has not been hardware-validated on the 662. Cold startup, optical accuracy
 and Linux/macOS hardware also remain unvalidated. AutoPierCam's pin-update tests
 use simulated ASI662MC full frames, centered ROIs, controls and the save pipeline;
 they are not additional physical-camera validation.
+
+Subsequent operator-authorized Windows checks captured from ASI662MC and
+ASI676MC concurrently with opposite SDK/Direct backends. Both assignments
+succeeded at 1-second exposure, including full-resolution saves. See the
+[mixed-backend diagnostic report](asi662-coexistence.md) for startup-order
+coverage, build provenance and limitations; the reported original no-capture
+incident has not been reproduced.
 
 Before release, still validate day/night convergence, native Bayer orientation,
 rate limiting, live saves and USB interruption with operator approval. Simulator

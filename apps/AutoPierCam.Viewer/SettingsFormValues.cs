@@ -8,6 +8,11 @@ internal sealed record SettingsFormValues
 {
     internal string Driver { get; init; } = "zwo_sdk";
     internal string Serial { get; init; } = "";
+    internal string Latitude { get; init; } = "";
+    internal string Longitude { get; init; } = "";
+    internal string WhiteBalanceMode { get; init; } = "disabled";
+    internal string WhiteBalanceRed { get; init; } = "1";
+    internal string WhiteBalanceBlue { get; init; } = "1";
     internal string MaxExposure { get; init; } = "";
     internal string MaxGain { get; init; } = "";
     internal string MinGain { get; init; } = "";
@@ -36,6 +41,11 @@ internal sealed record SettingsFormValues
 
     internal static SettingsFormValues FromConfiguration(AgentConfiguration config) => new() {
         Driver = config.Camera.Driver ?? "zwo_sdk", Serial = Text(config.Camera.Serial),
+        Latitude = Number(config.Camera.LatitudeDeg ?? double.NaN),
+        Longitude = Number(config.Camera.LongitudeDeg ?? double.NaN),
+        WhiteBalanceMode = config.Camera.WhiteBalance?.Mode ?? "disabled",
+        WhiteBalanceRed = Number(config.Camera.WhiteBalance?.Red ?? 1),
+        WhiteBalanceBlue = Number(config.Camera.WhiteBalance?.Blue ?? 1),
         MaxExposure = Number(config.Camera.MaxExposureUs / 1000d), MaxGain = Number(config.Camera.MaxGain),
         MinGain = Number(config.Camera.MinGain ?? 0), PreferShortExposures = config.Camera.PreferShortExposures == true,
         Interval = Number(config.Capture.IntervalMs / 1000d),
