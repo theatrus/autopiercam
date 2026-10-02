@@ -209,7 +209,7 @@ impl Driver {
         self.serial.as_deref()
     }
     pub fn version(&self) -> String {
-        format!("Regain 0.5.2 / {:?}", self.backend)
+        format!("Regain 0.5.3 / {:?}", self.backend)
     }
     pub fn is_direct(&self) -> bool {
         self.backend == CameraDriver::ZwoDirect

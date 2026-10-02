@@ -1,6 +1,6 @@
 # Regain camera backend
 
-The development build uses Regain 0.5.3 (Rust 1.89 or newer), pinned to the
+AutoPierCam 0.2.14 uses Regain 0.5.3 (Rust 1.89 or newer), pinned to the
 `v0.5.3.0` release commit `4cd6c153891ba7a2884e9e494055e59d11f13e77` in Cargo.toml
 and Cargo.lock. Published AutoPierCam 0.2.13 uses Regain 0.5.2.
 ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
@@ -42,9 +42,9 @@ preview-rate cap still applies. Centered ROI origins are aligned to 8 pixels
 on both axes. Bin 2 is not supported. Direct mode uses the installed ZWO USB
 driver on Windows but does not load the ZWO SDK.
 
-## White balance (development build)
+## White balance
 
-The development build exposes Regain 0.5.3's shared software white balance in
+AutoPierCam 0.2.14 exposes Regain 0.5.3's shared software white balance in
 Settings for both SDK and Direct USB. Published AutoPierCam 0.2.13 does not have
 these controls. Disabled is the default and sends no WB command, retaining the
 backend's existing behavior; SDK and Direct are not guaranteed to have matching
