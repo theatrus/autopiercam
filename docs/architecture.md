@@ -45,7 +45,7 @@ not interrupted for pacing; there is no queued video stream to drain.
 
 Exposure/gain edits during a frame are queued until its completion. Ordinary
 saves preserve controller history and settling. Backend, serial, camera or
-image-layout changes restart the session. Paused recording keeps previews
+image-layout or white-balance changes restart the session. Paused recording keeps previews
 running without acquiring extra scheduled stills.
 
 ### Regain adapter
@@ -55,18 +55,27 @@ camera-only autopiercam-regain-worker entry point calls the pinned upstream
 drivers without duplicating SDK bindings. Regain SDK and experimental direct
 USB are explicit choices; unsupported direct settings fail without fallback.
 
+Opt-in white balance is configured by the capture owner before its first frame.
+Regain owns manual gains and AWB for both backends, applying corrected Bayer
+RAW16 before AutoPierCam's conversion/debayering. The Viewer persists settings;
+it does not estimate gains or issue camera commands. Disabled settings preserve
+unmanaged backend behavior. AWB state lasts for one capture session.
+
     Closed -> Discover -> Open -> Configure -> Expose -> Download
                             ^                     |          |
                             +----- next frame ----+----------+
                             |
                           Close
-    Any fault -> Kill worker -> wait for operator restart
+    Any fault -> Kill worker -> Join owner/cleanup -> wait 30 s -> fresh session (tray)
 
 The adapter validates identity, capabilities and frame layout, caches controls
 while exposing, and rejects live discovery while a camera is owned. It keeps
 RAW16 samples for PNG stills or derives RAW8 from their high bytes. Regain calls
 have deadlines; AutoPierCam separately enforces frame-progress deadlines.
-Unexpected capture exits latch a fault rather than rescan/reopen automatically.
+Unexpected capture exits remain visibly faulted during the tray supervisor's
+30-second retry delay. The next attempt uses the saved camera/backend; only a
+joined owner permits startup discovery and reopening. No USB reset or fallback
+to a different backend is attempted.
 
 See [Regain backend](regain-backend.md) for selection, exact dependency pin,
 current camera support and required hardware validation.
@@ -90,8 +99,11 @@ mock camera backend.
 The agent is a normal per-user background executable. On Windows its primary
 thread owns the notification icon and event loop. A supervisor owns cancellation,
 camera ownership, config-driven restarts, and IPC. Camera startup and runtime
-faults stop capture until the operator restarts the agent or saves settings.
-The supervisor does not automatically reopen or rescan a faulted driver.
+faults stop the current session. After its camera-owning thread has exited and
+been joined, the supervisor waits 30 seconds and tries a fresh session. Each
+failure uses the same delay. A restart or configuration save can retry sooner;
+shutdown cancels retries. Pause intent and queued captures survive reconnection.
+No new session starts while an old owner remains alive.
 
 The tray menu exposes Status, Open AutoPierCam, Pause/Resume capture, Capture
 now, and Exit. Exit attempts ordered shutdown, with an independent 30-second
@@ -421,8 +433,9 @@ Ordered shutdown:
 Preview encoding drains and the current video segment finalizes before retention
 and upload workers stop, keeping publication inside the ledger lifecycle lease.
 
-The implemented startup path validates configuration and leaves startup or runtime
-camera faults for an operator restart. When upload is enabled it opens and validates the
+The implemented startup path validates configuration; the tray retries startup
+or runtime camera failures after completed cleanup and a 30-second delay.
+The standalone CLI instead returns failures to its caller. When upload is enabled it opens and validates the
 bound ledger, recovers abandoned claims, reconciles the capture directory
 against the activation watermark, and resumes due attempts. It then completes
 an initial retention sweep before opening the camera. When uploads are disabled

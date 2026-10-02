@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub camera: CameraConfig,
@@ -22,7 +22,7 @@ impl Config {
         capture != next.capture || self.upload != next.upload || self.video != next.video
     }
 
-    /// Only acquisition layout/device changes need a new SDK session.
+    /// Acquisition layout/device or white-balance changes need a new camera session.
     pub fn requires_camera_restart(&self, next: &Self) -> bool {
         let a = &self.camera;
         let b = &next.camera;
@@ -34,6 +34,7 @@ impl Config {
             || a.height != b.height
             || a.bin != b.bin
             || a.raw16 != b.raw16
+            || a.white_balance != b.white_balance
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -47,6 +48,28 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.camera.white_balance.as_ref().is_some_and(|wb| {
+            [wb.red, wb.blue]
+                .iter()
+                .any(|gain| !gain.is_finite() || !(0.125..=8.0).contains(gain))
+        }) {
+            return Err(ConfigError::Validation(
+                "camera white-balance gains must be finite multipliers in 0.125..=8",
+            ));
+        }
+        match (self.camera.latitude_deg, self.camera.longitude_deg) {
+            (None, None) => (),
+            (Some(lat), Some(lon))
+                if lat.is_finite()
+                    && lon.is_finite()
+                    && (-90.0..=90.0).contains(&lat)
+                    && (-180.0..=180.0).contains(&lon) => {}
+            _ => {
+                return Err(ConfigError::Validation(
+                    "camera latitude_deg and longitude_deg must both be set, finite, and within -90..90 and -180..180 degrees",
+                ));
+            }
+        }
         if self.camera.bin != 1 {
             return Err(ConfigError::Validation(
                 "camera.bin must be 1 until color binning is characterized",
@@ -200,9 +223,17 @@ pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> 
     Ok(validate_upload_endpoint(endpoint)?.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
+    /// None preserves the backend's unmanaged behavior. Managed output is corrected RAW16.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub white_balance: Option<WhiteBalanceConfig>,
+    /// Optional observing location; used only when a capture session starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude_deg: Option<f64>,
     #[serde(skip_serializing_if = "CameraDriver::is_sdk")]
     pub driver: CameraDriver,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +265,9 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
+            white_balance: None,
+            latitude_deg: None,
+            longitude_deg: None,
             driver: CameraDriver::ZwoSdk,
             serial: None,
             exposure_control: ExposureControl::Sdk,
@@ -252,6 +286,32 @@ impl Default for CameraConfig {
             settle_frames: 6,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WhiteBalanceConfig {
+    pub mode: WhiteBalanceMode,
+    /// Linear multipliers relative to green; also the initial gains for AWB.
+    pub red: f64,
+    pub blue: f64,
+}
+impl Default for WhiteBalanceConfig {
+    fn default() -> Self {
+        Self {
+            mode: WhiteBalanceMode::Manual,
+            red: 1.0,
+            blue: 1.0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhiteBalanceMode {
+    #[default]
+    Manual,
+    Once,
+    Continuous,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -401,6 +461,33 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observing_location_is_optional_paired_validated_and_does_not_restart() {
+        let original = Config::default();
+        let mut config = original.clone();
+        for (lat, lon) in [
+            (Some(0.0), None),
+            (None, Some(0.0)),
+            (Some(91.0), Some(0.0)),
+            (Some(0.0), Some(-181.0)),
+            (Some(f64::NAN), Some(0.0)),
+            (Some(0.0), Some(f64::INFINITY)),
+        ] {
+            config.camera.latitude_deg = lat;
+            config.camera.longitude_deg = lon;
+            assert!(config.validate().is_err());
+        }
+        config.camera.latitude_deg = Some(-90.0);
+        config.camera.longitude_deg = Some(180.0);
+        config.validate().unwrap();
+        assert!(!original.requires_camera_restart(&config));
+        assert!(!original.requires_recording_reload(&config));
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        assert!(!toml::to_string(&original).unwrap().contains("latitude_deg"));
+    }
 
     #[test]
     fn gain_controls_are_opt_in_validated_and_live_reloadable() {
@@ -436,6 +523,48 @@ mod tests {
         next.validate().unwrap();
         next.camera.prefer_short_exposures = false;
         next.validate().unwrap();
+    }
+
+    #[test]
+    fn white_balance_is_opt_in_validated_and_restarts_camera() {
+        let original = Config::default();
+        assert!(
+            !toml::to_string(&original)
+                .unwrap()
+                .contains("white_balance")
+        );
+        let mut next = original.clone();
+        for mode in [
+            WhiteBalanceMode::Manual,
+            WhiteBalanceMode::Once,
+            WhiteBalanceMode::Continuous,
+        ] {
+            next.camera.white_balance = Some(WhiteBalanceConfig {
+                mode,
+                red: 2.0,
+                blue: 0.5,
+            });
+            next.validate().unwrap();
+            assert!(original.requires_camera_restart(&next));
+            assert!(!next.requires_camera_restart(&next));
+            assert!(!original.requires_recording_reload(&next));
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&next).unwrap()).unwrap(),
+                next
+            );
+        }
+        for gain in [0.0, 0.124, 8.001, f64::NAN, f64::INFINITY] {
+            next.camera.white_balance.as_mut().unwrap().red = gain;
+            assert!(next.validate().is_err());
+        }
+        next.camera.white_balance = Some(WhiteBalanceConfig {
+            red: 0.125,
+            blue: 8.0,
+            ..WhiteBalanceConfig::default()
+        });
+        next.validate().unwrap();
+        assert!(toml::from_str::<Config>("[camera.white_balance]\nmode='auto'").is_err());
+        assert!(toml::from_str::<Config>("[camera.white_balance]\nunexpected=true").is_err());
     }
 
     #[test]

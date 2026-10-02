@@ -220,11 +220,13 @@ fn check_sdk(
             };
             let elapsed = started.elapsed();
             let stats = if raw16 {
-                let bitwise_or = buffer.chunks_exact(2).fold(0_u16, |bits, pixel| {
+                let bitwise_or = buffer.as_chunks::<2>().0.iter().fold(0_u16, |bits, pixel| {
                     bits | u16::from_le_bytes([pixel[0], pixel[1]])
                 });
                 let maximum = buffer
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
                     .max()
                     .unwrap_or(0);

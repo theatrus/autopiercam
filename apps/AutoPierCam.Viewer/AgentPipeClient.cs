@@ -737,6 +737,14 @@ internal sealed record AgentConfiguration
                 $"{method} returned invalid camera exposure or gain bounds.");
         }
 
+        if ((Camera.LatitudeDeg is null) != (Camera.LongitudeDeg is null) ||
+            Camera.LatitudeDeg is double lat && (!double.IsFinite(lat) || lat < -90 || lat > 90) ||
+            Camera.LongitudeDeg is double lon && (!double.IsFinite(lon) || lon < -180 || lon > 180))
+            throw new AgentProtocolException($"{method} returned an invalid observing location.");
+
+        if (Camera.WhiteBalance is { } wb && !wb.IsValid)
+            throw new AgentProtocolException($"{method} returned invalid white-balance settings.");
+
         if (Camera.ExposureControl != "adaptive" && ((Camera.MinGain ?? 0) > 0 || Camera.PreferShortExposures == true))
             throw new AgentProtocolException($"{method} returned gain controls that require application-controlled exposure.");
 
@@ -807,6 +815,18 @@ internal sealed record AgentConfiguration
 
 internal sealed record AgentCameraConfiguration
 {
+    [JsonPropertyName("white_balance")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public AgentWhiteBalanceConfiguration? WhiteBalance { get; init; }
+
+    [JsonPropertyName("latitude_deg")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? LatitudeDeg { get; init; }
+
+    [JsonPropertyName("longitude_deg")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? LongitudeDeg { get; init; }
+
     [JsonPropertyName("driver")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Driver { get; init; }
@@ -866,6 +886,20 @@ internal sealed record AgentCameraConfiguration
     [JsonPropertyName("settle_frames")]
     [JsonRequired]
     public uint SettleFrames { get; init; }
+}
+
+internal sealed record AgentWhiteBalanceConfiguration
+{
+    [JsonPropertyName("mode")]
+    public string Mode { get; init; } = "manual";
+    [JsonPropertyName("red")]
+    public double Red { get; init; } = 1;
+    [JsonPropertyName("blue")]
+    public double Blue { get; init; } = 1;
+    [JsonIgnore]
+    public bool IsValid => Mode is "manual" or "once" or "continuous" &&
+        double.IsFinite(Red) && Red >= 0.125 && Red <= 8 &&
+        double.IsFinite(Blue) && Blue >= 0.125 && Blue <= 8;
 }
 
 internal sealed record AgentCaptureConfiguration

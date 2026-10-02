@@ -45,8 +45,9 @@ Reserved methods currently return a structured `not_implemented` error:
 is_color }], scanned_at_unix_ms, error }`. The capture thread publishes this
 inventory before selecting/opening a camera, including when selection faults.
 IPC only reads the cached inventory; it never opens a camera or calls the SDK.
-Discovery runs before opening a camera. Faults require an operator restart or
-configuration save, not an automatic retry. It never runs during acquisition, settling, or paused recording:
+Discovery runs before opening a camera, including a fresh session started by
+the tray's 30-second automatic fault retry. The previous camera-owning thread
+must exit before a retry is allowed. Discovery never runs during acquisition, settling, or paused recording:
 the SDK's property lookup can internally open devices and hang. While acquiring,
 the Viewer reloads only the cached inventory. Restart the tray agent to discover
 newly attached cameras.
@@ -181,7 +182,7 @@ them only when `storage.retention` is advertised and otherwise preserves any
 loaded non-null values unchanged. The agent validates the document and expected
 revision, syncs a unique temporary file, atomically replaces the TOML file, and
 schedules application on the camera-owning thread. Camera selection, ROI/binning
-and RAW format changes schedule a controlled restart. Other settings do not:
+and RAW format or white-balance changes schedule a controlled restart. Other settings do not:
 exposure limits, gain, cadence, preview frame rate and JPEG quality update in place; recording-service
 changes drain and replace those services while preserving the open camera,
 preview session, paused state and completed startup settling. Success confirms
@@ -199,6 +200,22 @@ The `capture.preview_rate` capability advertises editing of
 default may be omitted from canonical JSON. Viewer preserves an existing value
 without offering edits when that capability is absent. Preview publication is
 capped independently of scheduled stills and explicit capture requests.
+
+The `camera.white_balance` capability advertises the optional
+`camera.white_balance` object: `mode` (`manual`, `once`, `continuous`), `red` and
+`blue` (finite linear multipliers in 0.125–8, default 1). Omission/null disables
+management and preserves backend defaults. Changed WB settings restart capture;
+Regain owns estimation and correction for both drivers. Corrected pixels feed
+all outputs, including 16-bit PNGs. AWB estimates are session state, not persisted
+configuration; Once estimates again after reconnect. Old agents do not receive
+newly synthesized fields from the Viewer.
+
+The `camera.startup_location` capability advertises optional numeric
+`camera.latitude_deg` and `camera.longitude_deg`. Both must be present together
+and finite, within -90..90 and -180..180 respectively. Unset values are omitted
+from canonical JSON. They seed astronomical day/night only at the next new
+capture session; saving them does not force a restart. Clients without editing
+support must preserve loaded values.
 
 The `camera.gain_range` capability advertises `camera.min_gain` (integer,
 default 0) and `camera.prefer_short_exposures` (boolean, default false).

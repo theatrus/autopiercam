@@ -37,8 +37,9 @@ them. The live preview updates automatically. The internal configuration
 fingerprint is used only for conflict protection, not displayed as a version.
 The picker works even when the agent reports an ambiguous-camera fault.
 **Reload camera list** reads cached discovery without discarding unsaved settings.
-Discovery runs before capture starts. Driver faults require an operator restart
-or configuration save; they do not trigger rescans. Discovery never probes other cameras during acquisition or settling, even with
+Discovery runs before capture starts. After a driver fault and completed cleanup,
+the tray retries automatically after 30 seconds using the saved camera selection;
+each fresh attempt performs startup discovery. Discovery never probes other cameras during acquisition or settling, even with
 recording paused. Restart the tray agent to discover newly connected cameras.
 A saved but disconnected camera stays selected as unavailable.
 Camera IDs can change after USB reconnects; reselect when needed. Identical-model
@@ -142,11 +143,12 @@ autopiercam shutdown-agent --if-running --timeout-seconds 30
 ## Silent installation and diagnostics
 
 If capture stops progressing, the agent reports a camera-worker fault independently
-of the Viewer connection. Restarting the Viewer does not restart capture. Quit
-the tray agent and relaunch it. Quit allows 30 seconds for graceful cleanup, then
-terminates its own process if cleanup is stuck. The Regain build first enforces
-deadlines on the isolated camera process and waits for an operator restart after
-a fault; it does not automatically rescan. Unfinished
+of the Viewer connection. After cleanup exits, the tray automatically retries in
+30 seconds; repeated failures use the same delay. Restarting the Viewer does not
+restart capture. A tray restart or configuration save can retry sooner. Quit
+cancels pending retries and allows 30 seconds for graceful cleanup, then
+terminates its own process if cleanup is stuck. Regain first enforces
+deadlines on the isolated camera process. Unfinished
 stills/video or uploads may be interrupted; already finalized files remain.
 Restart requests never open a second camera handle while the original worker is
 still running. An unresponsive restart asks the operator to quit and relaunch.

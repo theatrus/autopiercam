@@ -46,6 +46,20 @@ impl AdaptiveExposure {
         self.mode
     }
 
+    /// Seed a fresh session, leaving subsequent frame-feedback transitions intact.
+    pub fn with_initial_mode(mut self, mode: LightMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn initial_exposure_us(&self) -> i64 {
+        match self.mode {
+            LightMode::Day => 10_000,
+            LightMode::Night => 1_000_000,
+        }
+        .clamp(self.min_us, self.max_us)
+    }
+
     /// Preserve controller history while changing the operator's noise/cadence tradeoff.
     pub fn set_prefer_short_exposures(&mut self, prefer: bool) {
         self.prefer_short_exposures = prefer;
@@ -130,6 +144,25 @@ impl AdaptiveExposure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_mode_respects_limits_and_can_yield_to_frames() {
+        let mut c =
+            AdaptiveExposure::new(100, 100_000, 0, 300, 100).with_initial_mode(LightMode::Night);
+        assert_eq!(c.initial_exposure_us(), 100_000);
+        let setting = ExposureSetting {
+            exposure_us: 100_000,
+            gain: 0,
+        };
+        c.observe(setting, stats(100, 0.0));
+        c.observe(setting, stats(100, 0.0));
+        assert_eq!(c.mode(), LightMode::Night);
+        c.observe(setting, stats(100, 0.0));
+        assert_eq!(c.mode(), LightMode::Day);
+        assert_eq!(
+            AdaptiveExposure::new(20_000, 20_000, 0, 0, 100).initial_exposure_us(),
+            20_000
+        );
+    }
     fn stats(p90: u8, clipped: f32) -> LumaStats {
         LumaStats {
             mean: p90 as f32,

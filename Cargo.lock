@@ -191,6 +191,7 @@ dependencies = [
 name = "autopiercam-core"
 version = "0.2.13"
 dependencies = [
+ "chrono",
  "serde",
  "thiserror 2.0.20",
  "toml 0.9.12+spec-1.1.0",
@@ -215,6 +216,7 @@ dependencies = [
  "autopiercam-camera",
  "autopiercam-core",
  "embed-resource",
+ "regain-core",
  "regain-zwo",
  "serde_json",
  "tempfile",
@@ -2504,8 +2506,8 @@ dependencies = [
 
 [[package]]
 name = "regain-core"
-version = "0.5.2"
-source = "git+https://github.com/pulsarfab/regain?rev=a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06#a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06"
+version = "0.5.3"
+source = "git+https://github.com/pulsarfab/regain?rev=4cd6c153891ba7a2884e9e494055e59d11f13e77#4cd6c153891ba7a2884e9e494055e59d11f13e77"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2519,8 +2521,8 @@ dependencies = [
 
 [[package]]
 name = "regain-transport"
-version = "0.5.2"
-source = "git+https://github.com/pulsarfab/regain?rev=a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06#a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06"
+version = "0.5.3"
+source = "git+https://github.com/pulsarfab/regain?rev=4cd6c153891ba7a2884e9e494055e59d11f13e77#4cd6c153891ba7a2884e9e494055e59d11f13e77"
 dependencies = [
  "anyhow",
  "nusb",
@@ -2532,8 +2534,8 @@ dependencies = [
 
 [[package]]
 name = "regain-worker"
-version = "0.5.2"
-source = "git+https://github.com/pulsarfab/regain?rev=a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06#a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06"
+version = "0.5.3"
+source = "git+https://github.com/pulsarfab/regain?rev=4cd6c153891ba7a2884e9e494055e59d11f13e77#4cd6c153891ba7a2884e9e494055e59d11f13e77"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2541,13 +2543,14 @@ dependencies = [
 
 [[package]]
 name = "regain-zwo"
-version = "0.5.2"
-source = "git+https://github.com/pulsarfab/regain?rev=a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06#a13b0c7af07a5bd3e4016a944a1829dd0e7e2f06"
+version = "0.5.3"
+source = "git+https://github.com/pulsarfab/regain?rev=4cd6c153891ba7a2884e9e494055e59d11f13e77#4cd6c153891ba7a2884e9e494055e59d11f13e77"
 dependencies = [
  "anyhow",
  "libc",
  "libloading",
  "nusb",
+ "regain-core",
  "regain-transport",
  "regain-worker",
  "serde",

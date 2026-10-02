@@ -15,7 +15,8 @@ public sealed partial class MainWindow
     private void TrackSettingsEdits()
     {
         foreach (NumberBox input in new[] { MaxExposureNumberBox, MaxGainNumberBox, MinGainNumberBox, StillIntervalNumberBox,
-            RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox })
+            RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox, LatitudeNumberBox, LongitudeNumberBox,
+            WhiteBalanceRedNumberBox, WhiteBalanceBlueNumberBox })
         {
             input.ValueChanged += (_, _) => MarkSettingsEdited();
             input.LostFocus += (_, _) => MarkSettingsEdited();
@@ -28,6 +29,10 @@ public sealed partial class MainWindow
         foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
         CameraDriverComboBox.SelectionChanged += (_, _) => MarkSettingsEdited();
+        WhiteBalanceModeComboBox.SelectionChanged += (_, _) => {
+            MarkSettingsEdited();
+            SetControlsForOperation(_operationInProgress);
+        };
 
     }
 
@@ -74,7 +79,7 @@ public sealed partial class MainWindow
     {
         ConfigInfoBar.Title = _hasUnsavedSettings ? "Unsaved changes" : "Settings loaded";
         ConfigInfoBar.Message = _hasUnsavedSettings
-            ? "Save applies changes. Only camera or RAW format changes restart capture."
+            ? "Save applies changes. Camera, RAW format or white-balance changes restart capture."
             : "Settings match the saved configuration.";
         SetConfigurationFeedback(InfoBarSeverity.Informational, _hasUnsavedSettings);
     }
@@ -94,6 +99,10 @@ public sealed partial class MainWindow
         return new() {
             Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",
             Serial = SettingsFormValues.Text(CameraSerialTextBox.Text),
+            Latitude = Number(LatitudeNumberBox), Longitude = Number(LongitudeNumberBox),
+            WhiteBalanceMode = SelectedWhiteBalanceMode(),
+            WhiteBalanceRed = WhiteBalanceModeComboBox.SelectedIndex > 0 ? Number(WhiteBalanceRedNumberBox) : "1",
+            WhiteBalanceBlue = WhiteBalanceModeComboBox.SelectedIndex > 0 ? Number(WhiteBalanceBlueNumberBox) : "1",
             MaxExposure = Number(MaxExposureNumberBox), MaxGain = Number(MaxGainNumberBox),
             MinGain = Number(MinGainNumberBox), PreferShortExposures = PreferShortExposuresToggle.IsOn,
             Interval = Number(StillIntervalNumberBox), RetentionMax = Number(RetentionMaxMiBNumberBox),

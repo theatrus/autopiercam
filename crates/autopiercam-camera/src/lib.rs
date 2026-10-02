@@ -1,7 +1,7 @@
 //! Synchronous capture-owner adapter to Regain's isolated camera workers.
 //! Discovery is forbidden while a camera is owned; no retries, fallback or USB resets.
 use anyhow::{Context, Result, bail, ensure};
-use autopiercam_core::config::CameraDriver;
+use autopiercam_core::config::{CameraDriver, WhiteBalanceConfig, WhiteBalanceMode};
 use regain_core::{CancellationToken, Runtime, Worker};
 use serde_json::{Value, json};
 use std::{
@@ -356,6 +356,47 @@ pub struct Camera {
     failed: bool,
 }
 impl Camera {
+    /// Called only by the capture owner before acquisition; disable by reopening.
+    /// All estimation/correction stays in Regain, before RAW8 conversion/debayering.
+    pub fn configure_white_balance(&mut self, config: &WhiteBalanceConfig) -> Result<()> {
+        ensure!(
+            !self.active && !self.pending && !self.failed,
+            "configure white balance before capture starts"
+        );
+        ensure!(
+            self.info.is_color && self.roi.bin == 1,
+            "white balance requires a color camera at bin 1"
+        );
+        use regain_core::white_balance::{Gains, Mode, Output, Settings};
+        let settings = Settings {
+            mode: match config.mode {
+                WhiteBalanceMode::Manual => Mode::Manual,
+                WhiteBalanceMode::Once => Mode::Once,
+                WhiteBalanceMode::Continuous => Mode::Continuous,
+            },
+            gains: Gains {
+                red: config.red,
+                blue: config.blue,
+            },
+            output: Output::Corrected,
+        };
+        settings.gains.validate()?;
+        let response = self.runtime.block_on(
+            self.worker
+                .borrow_mut()
+                .white_balance(Some(settings), &CancellationToken::new()),
+        )?;
+        ensure!(
+            response["managed"] == true,
+            "Regain did not enable managed white balance"
+        );
+        let actual: Settings = serde_json::from_value(response["settings"].clone())?;
+        ensure!(
+            actual == settings,
+            "Regain white-balance configuration readback mismatch"
+        );
+        Ok(())
+    }
     pub fn info(&self) -> &CameraInfo {
         &self.info
     }
@@ -485,7 +526,7 @@ impl Camera {
     pub fn start_capture(&mut self) -> Result<()> {
         ensure!(
             !self.failed,
-            "Regain worker faulted; explicit restart required"
+            "Regain worker faulted; a new camera session is required"
         );
         self.active = true;
         Ok(())
@@ -567,8 +608,10 @@ impl Drop for Camera {
     fn drop(&mut self) {
         // Kill on error rather than call back into a poisoned driver. No reopening
         // or inventory refresh occurs here. Regain owns/reaps its process tree.
-        if !self.failed {
-            let _ = self.call("close", Value::Null, 2.);
+        if !self.failed
+            && let Err(error) = self.call("close", Value::Null, 2.)
+        {
+            tracing::warn!(%error, "Regain close failed; camera controls may not have been restored");
         }
         self.runtime.block_on(self.worker.borrow_mut().kill());
         if let Ok(mut owned) = self.driver.owned.lock() {
@@ -585,7 +628,7 @@ fn decode_frame(
 ) -> Result<()> {
     ensure!(
         meta.get("cleanupError").is_none(),
-        "Regain frame cleanup failed; explicit restart required"
+        "Regain frame cleanup failed; camera session must restart"
     );
     ensure!(
         meta["width"] == exposure.width
@@ -600,7 +643,7 @@ fn decode_frame(
         }
         ImageType::Raw8 => {
             out.clear();
-            out.extend(pixels.chunks_exact(2).map(|p| p[1]))
+            out.extend(pixels.as_chunks::<2>().0.iter().map(|p| p[1]))
         }
         _ => bail!("unsupported output format"),
     }

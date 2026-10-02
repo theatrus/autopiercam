@@ -1107,6 +1107,13 @@ public sealed partial class MainWindow : Window
         AdaptiveExposureToggle.IsOn = true;
         CameraDriverComboBox.SelectedIndex = configuration.Camera.Driver == "zwo_direct" ? 1 : 0;
         CameraSerialTextBox.Text = configuration.Camera.Serial ?? string.Empty;
+        LatitudeNumberBox.Value = configuration.Camera.LatitudeDeg ?? double.NaN;
+        LongitudeNumberBox.Value = configuration.Camera.LongitudeDeg ?? double.NaN;
+        WhiteBalanceModeComboBox.SelectedIndex = configuration.Camera.WhiteBalance?.Mode switch {
+            "manual" => 1, "once" => 2, "continuous" => 3, _ => 0
+        };
+        WhiteBalanceRedNumberBox.Value = configuration.Camera.WhiteBalance?.Red ?? 1;
+        WhiteBalanceBlueNumberBox.Value = configuration.Camera.WhiteBalance?.Blue ?? 1;
         Raw16Toggle.IsOn = configuration.Camera.Raw16 == true;
         CameraNameFilterTextBox.Text = configuration.Camera.NameContains ?? string.Empty;
         double maxExposureMs = configuration.Camera.MaxExposureUs / 1000.0;
@@ -1146,8 +1153,32 @@ public sealed partial class MainWindow : Window
         SetConfigurationFeedback(InfoBarSeverity.Informational, false);
     }
 
+    private string SelectedWhiteBalanceMode() => WhiteBalanceModeComboBox.SelectedIndex switch {
+        1 => "manual", 2 => "once", 3 => "continuous", _ => "disabled"
+    };
+
     private AgentConfiguration BuildConfigurationFromInputs(AgentConfiguration original)
     {
+        var whiteBalance = original.Camera.WhiteBalance;
+        if (_latestAgentStatus?.HasCapability("camera.white_balance") == true)
+        {
+            whiteBalance = SelectedWhiteBalanceMode() == "disabled" ? null : new AgentWhiteBalanceConfiguration {
+                Mode = SelectedWhiteBalanceMode(), Red = WhiteBalanceRedNumberBox.Value, Blue = WhiteBalanceBlueNumberBox.Value
+            };
+            if (whiteBalance is not null && !whiteBalance.IsValid)
+                throw new UserInputException("White-balance multipliers must be finite numbers from 0.125 to 8.");
+        }
+        double? latitude = original.Camera.LatitudeDeg;
+        double? longitude = original.Camera.LongitudeDeg;
+        if (_latestAgentStatus?.HasCapability("camera.startup_location") == true)
+        {
+            latitude = double.IsNaN(LatitudeNumberBox.Value) ? null : LatitudeNumberBox.Value;
+            longitude = double.IsNaN(LongitudeNumberBox.Value) ? null : LongitudeNumberBox.Value;
+            if ((latitude is null) != (longitude is null) ||
+                latitude is double lat && (!double.IsFinite(lat) || lat < -90 || lat > 90) ||
+                longitude is double lon && (!double.IsFinite(lon) || lon < -180 || lon > 180))
+                throw new UserInputException("Enter both coordinates: latitude -90 to 90 and longitude -180 to 180, or leave both blank.");
+        }
         uint? previewMaxFps = original.Capture.PreviewMaxFps;
         if (_latestAgentStatus?.HasCapability("capture.preview_rate") == true)
         {
@@ -1248,6 +1279,9 @@ public sealed partial class MainWindow : Window
             {
                 Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",
                 Serial = NormalizeOptionalText(CameraSerialTextBox.Text),
+                LatitudeDeg = latitude,
+                LongitudeDeg = longitude,
+                WhiteBalance = whiteBalance,
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
                 MinGain = minGain,
@@ -1659,6 +1693,11 @@ public sealed partial class MainWindow : Window
         // Keep values editable even in SDK mode so switching back does not
         // silently discard them; Save explains that nondefaults require adaptive.
         MinGainNumberBox.IsEnabled = PreferShortExposuresToggle.IsEnabled = editable && supported;
+        LatitudeNumberBox.IsEnabled = LongitudeNumberBox.IsEnabled =
+            editable && _latestAgentStatus?.HasCapability("camera.startup_location") == true;
+        WhiteBalanceModeComboBox.IsEnabled = editable && _latestAgentStatus?.HasCapability("camera.white_balance") == true;
+        WhiteBalanceRedNumberBox.IsEnabled = WhiteBalanceBlueNumberBox.IsEnabled =
+            WhiteBalanceModeComboBox.IsEnabled && WhiteBalanceModeComboBox.SelectedIndex > 0;
         GainControlHelpText.Text = !supported
             ? "Update the capture agent to configure minimum gain and shorter exposures."
             : AdaptiveExposureToggle.IsOn

@@ -19,6 +19,7 @@ regain-zwo.workspace = true
 embed-resource.workspace = true
 
 [dev-dependencies]
+regain-core.workspace = true
 autopiercam = { path = "../autopiercam" }
 autopiercam-camera = { path = "../autopiercam-camera", features = ["simulator"] }
 autopiercam-core = { path = "../autopiercam-core" }
