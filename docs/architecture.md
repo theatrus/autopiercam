@@ -2,7 +2,7 @@
 
 ## Product identity
 
-The product name is AutoPierCam and the current release line is 0.2.14. Yann
+The product name is AutoPierCam and the current release line is 0.2.15. Yann
 Ramin is the author. The canonical source repository and project homepage are
 <https://github.com/theatrus/autopiercam>. AutoPierCam source and documentation
 are licensed under Apache-2.0; bundled third-party components retain their own
@@ -39,7 +39,7 @@ regain-device child and uses start/status/download requests to acquire frames.
 
 ### Acquisition pacing
 
-capture.preview_max_fps is live-reloadable (1–30, default 2). Individual
+capture.preview_max_fps is live-reloadable (0.01–30, default 2). Individual
 exposures start only when the next preview or still is due. Long exposures are
 not interrupted for pacing; there is no queued video stream to drain.
 
@@ -74,8 +74,11 @@ RAW16 samples for PNG stills or derives RAW8 from their high bytes. Regain calls
 have deadlines; AutoPierCam separately enforces frame-progress deadlines.
 Unexpected capture exits remain visibly faulted during the tray supervisor's
 30-second retry delay. The next attempt uses the saved camera/backend; only a
-joined owner permits startup discovery and reopening. No USB reset or fallback
-to a different backend is attempted.
+joined owner permits startup discovery and reopening. Optional Windows USB-port
+recovery runs on the exiting capture thread only after its camera worker and
+handles are gone, before the normal retry delay. It requires a serial-bound
+target and has a five-minute cooldown shared across attempts. Storage/configuration
+failures do not reset USB. No fallback to a different backend is attempted.
 
 See [Regain backend](regain-backend.md) for selection, exact dependency pin,
 current camera support and required hardware validation.

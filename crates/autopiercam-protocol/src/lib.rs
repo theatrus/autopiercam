@@ -236,6 +236,10 @@ pub struct CameraList {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DetectedCamera {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
     pub id: i32,
     pub name: String,
     pub is_color: bool,

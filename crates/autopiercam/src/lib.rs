@@ -171,6 +171,7 @@ impl AgentControl {
 /// Read-only runtime status shared with the tray and local IPC server.
 #[derive(Clone, Debug)]
 pub struct AgentMonitor {
+    last_usb_recovery: Arc<Mutex<Option<Instant>>>,
     inner: Arc<RwLock<AgentStatus>>,
     camera_progress_at: Arc<RwLock<Instant>>,
     cameras: Arc<RwLock<CameraList>>,
@@ -342,12 +343,16 @@ impl AgentMonitor {
             "camera.gain_range".to_owned(),
             "camera.startup_location".to_owned(),
             "camera.white_balance".to_owned(),
+            #[cfg(windows)]
+            "camera.usb_reset_on_fault".to_owned(),
             "camera.raw16".to_owned(),
             "capture.preview_rate".to_owned(),
+            "capture.preview_rate_fractional".to_owned(),
             "video.ffmpeg".to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
+            last_usb_recovery: Arc::new(Mutex::new(None)),
             camera_progress_at: Arc::new(RwLock::new(Instant::now())),
             cameras: Arc::new(RwLock::new(CameraList::default())),
             capturing_generation: Arc::new(AtomicU64::new(0)),
@@ -422,6 +427,8 @@ impl AgentMonitor {
                     cameras
                         .iter()
                         .map(|camera| DetectedCamera {
+                            serial: camera.serial.clone(),
+                            discovery_error: camera.discovery_error.clone(),
                             id: camera.camera_id,
                             name: camera.name.clone(),
                             is_color: camera.is_color,
@@ -857,10 +864,11 @@ impl CaptureProgress {
     fn pace_acquisition(
         &mut self,
         camera: &mut Camera,
-        max_fps: u32,
+        max_fps: f64,
         control: Option<&AgentControl>,
         seen_generation: Option<u64>,
         still_due: Option<Instant>,
+        observer: &CaptureObserver<'_>,
     ) -> Result<()> {
         // Only pace after completed frames, never restart a long exposure
         // between the SDK's short read-timeout polls.
@@ -898,7 +906,12 @@ impl CaptureProgress {
             if delay.is_zero() {
                 break;
             }
+            let idle_started = Instant::now();
             thread::sleep(delay.min(Duration::from_millis(25)));
+            self.wait.defer_by(idle_started.elapsed());
+            // Only the capture owner reports this intentional idle heartbeat;
+            // blocking camera calls still age out normally.
+            self.publish(observer);
         }
         // The caller starts the stream only after rechecking cancellation/reload.
         Ok(())
@@ -930,7 +943,7 @@ struct CaptureObserver<'a> {
     monitor: Option<&'a AgentMonitor>,
     preview: Option<&'a PreviewSink>,
     preview_cadence: PreviewCadence,
-    preview_max_fps: u32,
+    preview_max_fps: f64,
     adaptive: Option<AdaptiveExposure>,
     sdk_mode: ExposureMode,
     mode_started: Instant,
@@ -948,7 +961,7 @@ impl<'a> CaptureObserver<'a> {
             monitor,
             preview,
             preview_cadence: PreviewCadence::default(),
-            preview_max_fps: 2,
+            preview_max_fps: 2.0,
             adaptive: None,
             sdk_mode: ExposureMode::default(),
             mode_started: Instant::now(),
@@ -1099,9 +1112,61 @@ fn run_agent_with_optional_preview(
     preview: Option<&PreviewSession>,
 ) -> Result<()> {
     monitor.begin_attempt();
-    let result = run_agent_inner(sdk, config_path, max_frames, control, monitor, preview);
+    let mut result = run_agent_inner(sdk, config_path, max_frames, control, monitor, preview);
+    // run_agent_inner has returned: its Camera and all recording services have
+    // been dropped, including the isolated camera worker. Never reset a live owner.
+    let cancelled = || control.is_shutdown() || control.reload_pending.load(Ordering::Acquire);
+    let enabled = Config::load(config_path).is_ok_and(|config| {
+        config.camera.usb_reset_on_fault && config.camera.serial.as_deref() == sdk.selected_serial()
+    });
+    if should_reset_usb(&result, enabled, cancelled(), sdk.has_usb_recovery_target()) {
+        let mut last = monitor
+            .last_usb_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if usb_recovery_due(*last, now) {
+            *last = Some(now); // Failed/denied resets also consume the cooldown.
+            drop(last);
+            monitor.report_fault(
+                "Camera capture failed; attempting USB recovery for the selected camera only",
+            );
+            match sdk.reset_bound_usb(cancelled) {
+                Ok(()) => {
+                    warn!(
+                        "Selected camera USB recovery completed; normal capture retry will reverify its serial"
+                    );
+                    result = result.context("Selected camera USB port reset completed");
+                }
+                Err(error) => result = result.context(format!("USB recovery failed: {error:#}")),
+            }
+        } else {
+            warn!(
+                "USB recovery suppressed by the five-minute cooldown; normal capture retry remains enabled"
+            );
+        }
+    }
     publish_attempt_result(&result, control, monitor);
     result
+}
+
+fn usb_recovery_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(300))
+}
+
+fn should_reset_usb(result: &Result<()>, enabled: bool, cancelled: bool, bound: bool) -> bool {
+    enabled
+        && !cancelled
+        && bound
+        && result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<autopiercam_camera::FrameError>()
+                .is_some_and(|error| !error.is_timeout())
+        })
+}
+
+fn camera_deadline(message: String) -> anyhow::Error {
+    autopiercam_camera::FrameError::Failed(anyhow!(message)).into()
 }
 
 fn publish_attempt_result(result: &Result<()>, control: &AgentControl, monitor: &AgentMonitor) {
@@ -1140,6 +1205,16 @@ fn run_agent_inner(
         );
     }
     let bayer = core_bayer(info.bayer_pattern)?;
+    if config.camera.usb_reset_on_fault {
+        // Binding is before open, on this capture thread. If it cannot prove the
+        // exact identity, capture may continue but USB recovery stays unavailable.
+        match sdk.bind_usb_recovery(&info) {
+            Ok(()) => info!(
+                "USB recovery bound to the selected camera; enabled with a five-minute cooldown"
+            ),
+            Err(error) => warn!(%error, "USB recovery unavailable; continuing without port resets"),
+        }
+    }
     let mut camera = sdk.open(info.clone())?;
     monitor.set_camera(camera.info());
     info!(serial = camera.serial(), "Regain camera identity verified");
@@ -1596,6 +1671,7 @@ fn capture_loop(
                     Some(control),
                     Some(state.seen_capture_generation),
                     still_due,
+                    &observer,
                 )?;
                 if control.is_shutdown() {
                     break;
@@ -1607,10 +1683,10 @@ fn capture_loop(
                 progress.refresh(camera, *auto_limits);
                 progress.publish(&observer);
                 if progress.wait.expired(progress.started.elapsed()) {
-                    bail!(
+                    return Err(camera_deadline(format!(
                         "camera produced no frame within its exposure deadline ({} ms)",
                         duration_millis(progress.wait.timeout())
-                    );
+                    )));
                 }
                 let result = camera.poll_frame(
                     &mut frame_buffer,
@@ -1625,10 +1701,10 @@ fn capture_loop(
                     Ok(meta) => meta,
                     Err(error) if error.is_timeout() => {
                         if progress.wait.expired(progress.started.elapsed()) {
-                            bail!(
+                            return Err(camera_deadline(format!(
                                 "camera produced no frame within its exposure deadline ({} ms)",
                                 duration_millis(progress.wait.timeout())
-                            );
+                            )));
                         }
                         continue;
                     }
@@ -1719,7 +1795,16 @@ fn wait_for_auto_settle(
         if observer.video.is_some_and(video::VideoWorker::is_finished) {
             bail!("video worker stopped while exposure was settling");
         }
-        progress.pace_acquisition(camera, observer.preview_max_fps, control, None, None)?;
+        // Settling needs fresh AE samples even when previews are infrequent.
+        // Publication still honors the configured cap independently.
+        progress.pace_acquisition(
+            camera,
+            observer.preview_max_fps.max(1.0),
+            control,
+            None,
+            None,
+            observer,
+        )?;
         if control.is_some_and(AgentControl::is_shutdown) {
             return Ok(None);
         }
@@ -1732,11 +1817,13 @@ fn wait_for_auto_settle(
             control.is_some_and(AgentControl::is_shutdown),
         ) {
             WaitDecision::Cancelled => return Ok(None),
-            WaitDecision::Stalled => bail!(
-                "camera produced no frame while automatic exposure was settling within its exposure deadline ({} ms; {} frames received)",
-                duration_millis(progress.wait.timeout()),
-                settling.received()
-            ),
+            WaitDecision::Stalled => {
+                return Err(camera_deadline(format!(
+                    "camera produced no frame while automatic exposure was settling within its exposure deadline ({} ms; {} frames received)",
+                    duration_millis(progress.wait.timeout()),
+                    settling.received()
+                )));
+            }
             WaitDecision::UseLatestFrame => {
                 warn!(
                     received = settling.received(),
@@ -2029,7 +2116,12 @@ fn select_camera(sdk: &Arc<Driver>, camera_id: Option<i32>) -> Result<CameraInfo
 fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> Result<CameraInfo> {
     let inventory = cameras.clone();
     let mut cameras = cameras.into_iter().filter(|camera| {
-        (config.serial.is_some()
+        config.serial.as_deref().is_none_or(|serial| {
+            camera
+                .serial
+                .as_deref()
+                .is_none_or(|found| found.eq_ignore_ascii_case(serial))
+        }) && (config.serial.is_some()
             || config
                 .camera_id
                 .is_none_or(|camera_id| camera.camera_id == camera_id))
@@ -2049,7 +2141,11 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
     // Regain direct inventory uses one model descriptor for identical units.
     // An explicit serial selects the physical device in the worker; this only
     // selects equivalent metadata. Without a serial, ambiguity is an error.
-    if cameras.any(|other| config.serial.is_none() || other.name != selected.name) {
+    if cameras.any(|other| {
+        config.serial.is_none()
+            || other.name != selected.name
+            || (other.serial.is_some() && selected.serial.is_some())
+    }) {
         bail!(
             "more than one connected camera matches the configuration; choose a camera in the Viewer and save settings"
         );
@@ -2471,6 +2567,8 @@ mod tests {
 
     fn detected_camera(id: i32, name: &str) -> CameraInfo {
         CameraInfo {
+            serial: None,
+            discovery_error: None,
             camera_id: id,
             name: name.into(),
             max_width: 1,
@@ -2541,6 +2639,31 @@ mod tests {
         config.serial = Some("explicit-selection".into());
         config.camera_id = Some(99);
         assert!(select_configured_camera(cameras, &config).is_ok());
+    }
+
+    #[test]
+    fn serial_inventory_matches_case_and_never_substitutes_another_device() {
+        let mut first = detected_camera(26155, "ASI662MC");
+        first.serial = Some("abcdef0123456789".into());
+        let mut second = first.clone();
+        second.serial = Some("1234567890abcdef".into());
+        let mut config = CameraConfig {
+            camera_id: Some(99),
+            name_contains: Some("662".into()),
+            serial: Some("ABCDEF0123456789".into()),
+            ..CameraConfig::default()
+        };
+        assert_eq!(
+            select_configured_camera(vec![second.clone(), first.clone()], &config)
+                .unwrap()
+                .serial,
+            first.serial
+        );
+        assert!(select_configured_camera(vec![first.clone(), first], &config).is_err());
+        assert!(select_configured_camera(vec![second.clone()], &config).is_err());
+        config.serial = None;
+        config.camera_id = Some(26155);
+        assert!(select_configured_camera(vec![second.clone(), second], &config).is_err());
     }
 
     #[test]
@@ -2645,6 +2768,32 @@ mod tests {
         monitor.set_state(AgentState::Capturing);
         assert_eq!(monitor.snapshot().frames_captured, 1);
         assert_eq!(monitor.capturing_generation(), 1);
+    }
+
+    #[test]
+    fn usb_recovery_is_opt_in_capture_only_cancel_safe_and_rate_limited() {
+        let capture = Err(camera_deadline("synthetic camera timeout".into()));
+        assert!(should_reset_usb(&capture, true, false, true));
+        assert!(!should_reset_usb(&capture, false, false, true));
+        assert!(!should_reset_usb(&capture, true, true, true));
+        assert!(!should_reset_usb(&capture, true, false, false));
+        assert!(!should_reset_usb(&Ok(()), true, false, true));
+        for message in ["disk full", "invalid configuration", "video encoder failed"] {
+            assert!(!should_reset_usb(&Err(anyhow!(message)), true, false, true));
+        }
+        let pending = Err(autopiercam_camera::FrameError::Pending.into());
+        assert!(!should_reset_usb(&pending, true, false, true));
+        let now = Instant::now();
+        assert!(usb_recovery_due(None, now));
+        assert!(!usb_recovery_due(Some(now), now + Duration::from_secs(299)));
+        assert!(usb_recovery_due(Some(now), now + Duration::from_secs(300)));
+        let monitor = AgentMonitor::new();
+        *monitor.last_usb_recovery.lock().unwrap() = Some(now);
+        monitor.begin_attempt();
+        assert_eq!(
+            *monitor.clone().last_usb_recovery.lock().unwrap(),
+            Some(now)
+        );
     }
 
     #[test]
@@ -2755,6 +2904,8 @@ mod tests {
     fn agent_monitor_publishes_cloneable_protocol_status() {
         let monitor = AgentMonitor::new();
         monitor.set_camera(&CameraInfo {
+            serial: None,
+            discovery_error: None,
             camera_id: 7,
             name: "Test camera".to_owned(),
             max_width: 1,
@@ -2815,8 +2966,11 @@ mod tests {
                 "camera.gain_range".to_owned(),
                 "camera.startup_location".to_owned(),
                 "camera.white_balance".to_owned(),
+                #[cfg(windows)]
+                "camera.usb_reset_on_fault".to_owned(),
                 "camera.raw16".to_owned(),
                 "capture.preview_rate".to_owned(),
+                "capture.preview_rate_fractional".to_owned(),
                 "video.ffmpeg".to_owned()
             ]
         );

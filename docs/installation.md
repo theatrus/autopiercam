@@ -48,13 +48,15 @@ cameras require an exact serial number for persistent selection.
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-Version 0.2.14 uses Regain and application-controlled exposure for both
+Version 0.2.15 uses Regain and application-controlled exposure for both
 driver choices. ASI662MC and ASI676MC direct USB have a
 2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md).
 
-Version 0.2.14 updates Regain to 0.5.3, adds white-balance controls and retries
-failed capture sessions after 30 seconds. ASI662MC Direct USB has been supported
+Version 0.2.15 adds discovered serial selection, fractional preview rates and
+opt-in Windows USB port recovery. Failed sessions still retry after 30 seconds.
+USB recovery requires an explicit serial and an elevated agent; it is off by
+default. ASI662MC Direct USB has been supported
 since 0.2.13. SDK remains the default. Select Direct USB explicitly in Settings,
 then reselect the camera and save. Both direct models require bin 1.
 
@@ -157,19 +159,19 @@ still running. An unresponsive restart asks the operator to quit and relaunch.
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.14-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.15-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.14-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.15-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.14-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.15-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support
@@ -182,10 +184,15 @@ camera appears in Device Manager. Do not include upload bearer tokens.
 
 ## Preview frame rate
 
-In Viewer **Settings**, use **Maximum preview frames per second** (whole numbers
-1–30, default 2). Saving this setting does not reopen the camera or repeat
+In Viewer **Settings**, use **Maximum preview frame rate** (decimal values
+0.01–30, default 2). For example, 0.5 means every 2 seconds and 0.1 means every
+10 seconds. Both Viewer and agent must support fractional rates; older agents
+retain the whole-number 1–30 range. Saving this setting does not reopen the camera or repeat
 startup settling. Short daytime exposures are paced by stopping the video stream
 between frames; long night exposures are allowed to finish uninterrupted.
+Intentional idle time is excluded from camera timeouts. Startup settling collects
+samples at no less than a 1 fps cadence (exposure permitting), while preview
+publication still obeys the configured cap.
 Faster scheduled stills and **Save next frame** can acquire sooner, but do not
 raise the preview publication cap. Security video and Chatstronomy use that
 shared preview, so they cannot receive new images faster than this limit.

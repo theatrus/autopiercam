@@ -14,6 +14,7 @@ simulator = []
 anyhow.workspace = true
 autopiercam-core = { path = "../autopiercam-core" }
 regain-core.workspace = true
+regain-transport.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

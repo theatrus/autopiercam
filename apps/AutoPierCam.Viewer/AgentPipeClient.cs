@@ -744,12 +744,14 @@ internal sealed record AgentConfiguration
 
         if (Camera.WhiteBalance is { } wb && !wb.IsValid)
             throw new AgentProtocolException($"{method} returned invalid white-balance settings.");
+        if (Camera.UsbResetOnFault == true && !AgentCameraConfiguration.IsUsbRecoverySerial(Camera.Serial))
+            throw new AgentProtocolException($"{method} requires an explicit nonzero 16-digit camera serial for USB recovery.");
 
         if (Camera.ExposureControl != "adaptive" && ((Camera.MinGain ?? 0) > 0 || Camera.PreferShortExposures == true))
             throw new AgentProtocolException($"{method} returned gain controls that require application-controlled exposure.");
 
         if (Capture.IntervalMs == 0 ||
-            Capture.PreviewMaxFps is < 1 or > 30 ||
+            Capture.PreviewMaxFps is double fps && !AgentCaptureConfiguration.IsSupportedPreviewRate(fps, true) ||
             Capture.JpegQuality is < 1 or > 100 ||
             Capture.WriterQueueCapacity == 0)
         {
@@ -815,6 +817,13 @@ internal sealed record AgentConfiguration
 
 internal sealed record AgentCameraConfiguration
 {
+    internal static bool IsUsbRecoverySerial(string? serial) => serial is { Length: 16 } &&
+        serial != "0000000000000000" && serial.All(Uri.IsHexDigit);
+
+    [JsonPropertyName("usb_reset_on_fault")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? UsbResetOnFault { get; init; }
+
     [JsonPropertyName("white_balance")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public AgentWhiteBalanceConfiguration? WhiteBalance { get; init; }
@@ -904,6 +913,10 @@ internal sealed record AgentWhiteBalanceConfiguration
 
 internal sealed record AgentCaptureConfiguration
 {
+    internal static bool IsSupportedPreviewRate(double value, bool fractional) =>
+        double.IsFinite(value) && value >= (fractional ? 0.01 : 1) && value <= 30 &&
+        (fractional || value == Math.Truncate(value));
+
     [JsonIgnore]
     public bool HasRetentionMaxBytes { get; init; } = true;
 
@@ -920,7 +933,7 @@ internal sealed record AgentCaptureConfiguration
 
     [JsonPropertyName("preview_max_fps")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public uint? PreviewMaxFps { get; init; }
+    public double? PreviewMaxFps { get; init; }
 
     [JsonPropertyName("jpeg_quality")]
     [JsonRequired]

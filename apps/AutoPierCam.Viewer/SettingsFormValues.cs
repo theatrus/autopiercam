@@ -8,6 +8,7 @@ internal sealed record SettingsFormValues
 {
     internal string Driver { get; init; } = "zwo_sdk";
     internal string Serial { get; init; } = "";
+    internal bool UsbResetOnFault { get; init; }
     internal string Latitude { get; init; } = "";
     internal string Longitude { get; init; } = "";
     internal string WhiteBalanceMode { get; init; } = "disabled";
@@ -41,6 +42,7 @@ internal sealed record SettingsFormValues
 
     internal static SettingsFormValues FromConfiguration(AgentConfiguration config) => new() {
         Driver = config.Camera.Driver ?? "zwo_sdk", Serial = Text(config.Camera.Serial),
+        UsbResetOnFault = config.Camera.UsbResetOnFault == true,
         Latitude = Number(config.Camera.LatitudeDeg ?? double.NaN),
         Longitude = Number(config.Camera.LongitudeDeg ?? double.NaN),
         WhiteBalanceMode = config.Camera.WhiteBalance?.Mode ?? "disabled",

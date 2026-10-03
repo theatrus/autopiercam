@@ -35,6 +35,7 @@ impl Config {
             || a.bin != b.bin
             || a.raw16 != b.raw16
             || a.white_balance != b.white_balance
+            || a.usb_reset_on_fault != b.usb_reset_on_fault
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -48,6 +49,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.camera.usb_reset_on_fault
+            && !self.camera.serial.as_deref().is_some_and(|s| {
+                s.len() == 16 && s.bytes().all(|c| c.is_ascii_hexdigit()) && s != "0000000000000000"
+            })
+        {
+            return Err(ConfigError::Validation(
+                "camera.usb_reset_on_fault requires an explicit 16-digit nonzero camera serial",
+            ));
+        }
         if self.camera.white_balance.as_ref().is_some_and(|wb| {
             [wb.red, wb.blue]
                 .iter()
@@ -115,9 +125,11 @@ impl Config {
                 "capture.interval_ms must be greater than zero",
             ));
         }
-        if !(1..=30).contains(&self.capture.preview_max_fps) {
+        if !self.capture.preview_max_fps.is_finite()
+            || !(0.01..=30.0).contains(&self.capture.preview_max_fps)
+        {
             return Err(ConfigError::Validation(
-                "capture.preview_max_fps must be between 1 and 30",
+                "capture.preview_max_fps must be a finite number between 0.01 and 30",
             ));
         }
         if self.capture.writer_queue_capacity == 0 {
@@ -226,6 +238,9 @@ pub fn normalize_upload_endpoint(endpoint: &str) -> Result<String, ConfigError> 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
+    /// Opt-in Windows camera-port recovery; never reset a shared hub/controller.
+    #[serde(skip_serializing_if = "is_false")]
+    pub usb_reset_on_fault: bool,
     /// None preserves the backend's unmanaged behavior. Managed output is corrected RAW16.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub white_balance: Option<WhiteBalanceConfig>,
@@ -237,6 +252,7 @@ pub struct CameraConfig {
     #[serde(skip_serializing_if = "CameraDriver::is_sdk")]
     pub driver: CameraDriver,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_serial")]
     pub serial: Option<String>,
     /// Legacy SDK selection remains readable; Regain always uses application control.
     #[serde(skip_serializing_if = "ExposureControl::is_sdk")]
@@ -262,10 +278,20 @@ pub struct CameraConfig {
     pub settle_frames: u32,
 }
 
+fn deserialize_serial<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|s| {
+        let serial = s.trim();
+        (!serial.is_empty()).then(|| serial.to_ascii_lowercase())
+    }))
+}
+
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
             white_balance: None,
+            usb_reset_on_fault: false,
             latitude_deg: None,
             longitude_deg: None,
             driver: CameraDriver::ZwoSdk,
@@ -349,14 +375,17 @@ fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
     pub directory: PathBuf,
     pub interval_ms: u64,
     /// Preview publication cap and idle acquisition cadence. Stills can request sooner.
-    #[serde(skip_serializing_if = "is_default_preview_fps")]
-    pub preview_max_fps: u32,
+    #[serde(
+        skip_serializing_if = "is_default_preview_fps",
+        serialize_with = "serialize_preview_fps"
+    )]
+    pub preview_max_fps: f64,
     pub jpeg_quality: u8,
     pub writer_queue_capacity: usize,
     pub keep_latest: bool,
@@ -373,7 +402,7 @@ impl Default for CaptureConfig {
         Self {
             directory: PathBuf::from("captures"),
             interval_ms: 10_000,
-            preview_max_fps: 2,
+            preview_max_fps: 2.0,
             jpeg_quality: 88,
             writer_queue_capacity: 2,
             keep_latest: true,
@@ -384,8 +413,20 @@ impl Default for CaptureConfig {
     }
 }
 
-fn is_default_preview_fps(value: &u32) -> bool {
-    *value == 2
+fn is_default_preview_fps(value: &f64) -> bool {
+    *value == 2.0
+}
+
+// Preserve integer JSON/TOML for legacy readers when the configured rate is whole.
+fn serialize_preview_fps<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if value.is_finite() && (0.01..=30.0).contains(value) && value.fract() == 0.0 {
+        serializer.serialize_u32(*value as u32)
+    } else {
+        serializer.serialize_f64(*value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -460,6 +501,19 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blank_serial_is_unspecified_and_hex_case_is_normalized() {
+        for serial in ["", "  "] {
+            let config: super::Config =
+                toml::from_str(&format!("[camera]\nserial = '{serial}'")).unwrap();
+            assert_eq!(config.camera.serial, None);
+            config.validate().unwrap();
+        }
+        let config: super::Config =
+            toml::from_str("[camera]\nserial = ' ABCDEF0123456789 '").unwrap();
+        assert_eq!(config.camera.serial.as_deref(), Some("abcdef0123456789"));
+        config.validate().unwrap();
+    }
     use super::*;
     #[test]
     fn observing_location_is_optional_paired_validated_and_does_not_restart() {
@@ -570,8 +624,8 @@ mod tests {
     #[test]
     fn preview_rate_defaults_round_trips_and_reloads_without_camera_or_recorder_restart() {
         let original: Config = toml::from_str("").unwrap();
-        assert_eq!(original.capture.preview_max_fps, 2);
-        for rate in [1, 2, 15, 30] {
+        assert_eq!(original.capture.preview_max_fps, 2.0);
+        for rate in [0.01, 0.1, 0.5, 1.0, 2.0, 2.5, 15.0, 30.0] {
             let mut next = original.clone();
             next.capture.preview_max_fps = rate;
             next.validate().unwrap();
@@ -579,12 +633,70 @@ mod tests {
             assert!(!original.requires_recording_reload(&next));
             let round_trip: Config = toml::from_str(&toml::to_string(&next).unwrap()).unwrap();
             assert_eq!(round_trip.capture.preview_max_fps, rate);
+            let json = serde_json::to_string(&next).unwrap();
+            let round_trip: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_trip.capture.preview_max_fps, rate);
+            if rate.fract() == 0.0 && rate != 2.0 {
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["capture"]["preview_max_fps"].as_u64(), Some(rate as u64));
+            }
         }
-        for rate in [0, 31, u32::MAX] {
+        for rate in [
+            0.0,
+            0.009,
+            -1.0,
+            31.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             let mut next = original.clone();
             next.capture.preview_max_fps = rate;
             assert!(next.validate().is_err());
         }
+    }
+
+    #[test]
+    fn usb_recovery_requires_explicit_identity_and_restarts_for_binding_changes() {
+        let original = Config::default();
+        assert!(!original.camera.usb_reset_on_fault);
+        assert!(
+            !toml::to_string(&original)
+                .unwrap()
+                .contains("usb_reset_on_fault")
+        );
+        let mut config = original.clone();
+        config.camera.usb_reset_on_fault = true;
+        for serial in [
+            None,
+            Some(""),
+            Some("0000000000000000"),
+            Some("unknown"),
+            Some("1234567890abcdeg"),
+        ] {
+            config.camera.serial = serial.map(str::to_owned);
+            assert!(config.validate().is_err());
+        }
+        config.camera.serial = Some("1234567890abcdef".into());
+        config.validate().unwrap();
+        let disabled = Config {
+            camera: CameraConfig {
+                usb_reset_on_fault: false,
+                ..config.camera.clone()
+            },
+            ..config.clone()
+        };
+        assert!(disabled.requires_camera_restart(&config));
+        let loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn legacy_integer_preview_rates_remain_readable() {
+        let config: Config = toml::from_str("[capture]\npreview_max_fps = 5").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.capture.preview_max_fps, 5.0);
+        let config: Config = serde_json::from_str(r#"{"capture":{"preview_max_fps":5}}"#).unwrap();
+        assert_eq!(config.capture.preview_max_fps, 5.0);
     }
 
     #[test]

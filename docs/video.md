@@ -20,7 +20,7 @@ frames_per_second = 2
 
 Segments accept 1–600 seconds and sampling rates 1–30 fps. Useful new samples
 are also limited by `capture.preview_max_fps` (default **2 fps**, configurable
-from 1–30 in Viewer Settings), and long exposures reduce that further. Raising
+from 0.01–30 in Viewer Settings), and long exposures reduce that further. Raising
 the video sampling rate alone does not increase acquisition or preview rate.
 This is not full-resolution planetary video. Actual elapsed
 gaps between sampled frames determine playback timing; no synthetic intermediate

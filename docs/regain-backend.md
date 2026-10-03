@@ -1,11 +1,12 @@
 # Regain camera backend
 
-AutoPierCam 0.2.14 uses Regain 0.5.3 (Rust 1.89 or newer), pinned to the
-`v0.5.3.0` release commit `4cd6c153891ba7a2884e9e494055e59d11f13e77` in Cargo.toml
-and Cargo.lock. Published AutoPierCam 0.2.13 uses Regain 0.5.2.
+AutoPierCam 0.2.15 uses Regain 0.5.3 plus the serial-discovery fixes in
+[Regain PR #9](https://github.com/pulsarfab/regain/pull/9), pinned to reviewed
+commit `f2eee177796d40d594a70c71470783b947c71130` in Cargo.toml and Cargo.lock.
+AutoPierCam 0.2.14 used the `v0.5.3.0` release; 0.2.13 used Regain 0.5.2.
 ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
-There are no AutoPierCam SDK bindings. The camera-only `regain-device` entry
-point calls the unchanged upstream drivers; `regain-core::Worker` owns the
+There are no AutoPierCam SDK bindings. The `regain-device` entry
+point calls the upstream drivers and USB recovery helper; `regain-core::Worker` owns the
 framed transport, deadlines and process supervision.
 
 ## Selection
@@ -35,6 +36,16 @@ in the Viewer and restart capture. A saved serial is verified on open.
 Identical models require an exact serial; an ambiguous selection never silently
 opens the first camera. SDK IDs remain useful for selecting distinct models
 but are not durable USB identity.
+
+From 0.2.15 the capture owner requests an optional serial-aware inventory before
+opening capture. Viewer camera choices show discovered serials and fill the
+serial field when selected. Blank serial means no filter; hexadecimal serials
+are matched case-insensitively. Direct USB IDs are model/product IDs, not unique
+per-device identifiers. A busy/unidentified device retains a discovery error in
+the list; its serial is not guessed. SDK discovery opens, initializes and closes
+devices; Direct discovery queries identity without capture. These probes are
+never issued by Viewer/IPC and never while the capture owner holds a camera.
+Reload camera list reads the cached inventory, not a fresh hardware scan.
 
 ASI662MC Direct USB provides 1920×1080 RGGB frames, gain 0–600, and an
 approximately 100 ms minimum frame interval for short exposures. AutoPierCam's
@@ -109,10 +120,49 @@ the original error remains visible with a retry notice. Restart from the tray
 or save corrected settings to retry sooner. Recording pause and queued capture
 requests survive reconnection; quitting cancels the pending retry.
 No replacement starts while the old owner is alive. Discovery runs only at
-the start of the new session, never during active acquisition. No USB reset,
-port cycle, controller reset or cross-backend fallback is performed. The
+the start of the new session, never during active acquisition. USB recovery is
+disabled unless explicitly configured as described below. Hub/controller reset
+and cross-backend fallback are never performed. The
 one-shot/headless CLI still returns its failure to the caller; automatic session
 retry belongs to the tray supervisor.
+
+### Opt-in USB port recovery (0.2.15)
+
+Enable **Reset this camera's USB port after capture failure** in Viewer Settings,
+or set `camera.usb_reset_on_fault = true`. Save the camera's explicit, nonzero
+16-digit hexadecimal serial first. Changing this option restarts the camera
+session so recovery can bind the physical device before acquisition begins.
+
+On Windows, run `autopiercam-tray.exe` persistently with administrator rights,
+under the same Windows account used for the existing configuration. Launch Viewer
+normally to keep it unelevated; launching it from an elevated tray inherits that
+tray's elevation. AutoPierCam does not install a service or scheduled task, change
+the existing logon setup, or prompt for elevation during automatic recovery.
+An unelevated reset attempt fails visibly and ordinary capture retry continues.
+Windows requires elevation for the [hub port-cycle request](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbioctl/ni-usbioctl-ioctl_usb_hub_cycle_port).
+
+Regain binds the selected camera serial to a physical device before opening it.
+On a fatal frame-read/exposure failure or an exposure deadline, AutoPierCam first
+closes and reaps the camera worker, then invokes Regain's bounded reset helper.
+The helper rechecks device generation, identity and the immediate parent port;
+it never resets an entire hub/controller or guesses among cameras. Unknown
+models, missing/ambiguous identity, changed device generation and busy devices
+fail closed. Binding failure leaves ordinary capture available without USB reset.
+The pinned helper supports ASI662MC, ASI676MC, ASI2600MM Pro/Duo, ASI6200MM Pro
+and ASI220MM Mini identities; this is not reset support for every SDK model.
+
+There is at most one attempt per failed session and a five-minute cooldown per
+running agent, including unsuccessful/permission-denied resets. Storage, encoder,
+configuration and discovery failures do not trigger recovery. Shutdown or settings
+reload before dispatch cancels it. Once dispatched, the bounded helper completes;
+an abrupt host termination can interrupt recovery. The normal 30-second tray retry
+then reopens the explicitly selected serial and reapplies camera/WB settings.
+The headless one-shot CLI reports the failed capture even after a successful reset.
+
+Port cycling does not guarantee removal of USB power and never switches an
+external camera power supply. This integration is simulator-tested only; physical
+AutoPierCam reset/reconnect behavior and multi-camera isolation need an explicit
+hardware validation pass. Linux/macOS automatic reset is not enabled here.
 
 Process isolation bounds a hung user-space call. It does not guarantee recovery
 from a wedged kernel driver, USB controller, firmware or another application's

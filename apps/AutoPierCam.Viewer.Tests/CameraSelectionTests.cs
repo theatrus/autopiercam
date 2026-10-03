@@ -7,6 +7,32 @@ public sealed class CameraSelectionTests
         new(3, "ZWO ASI676MC", true), new(7, "ZWO ASI662MC", true), new(9, "ZWO ASI120MM", false)], 1, null);
 
     [Fact]
+    public void SerialDistinguishesDuplicateDirectModelIdsAndSurvivesReassignedIds()
+    {
+        CameraInventory inventory = new([
+            new(26155, "ZWO ASI662MC", true, "abcdef0123456789"),
+            new(26155, "ZWO ASI662MC", true, "1234567890abcdef")], 1, null);
+        var choices = CameraChoice.Create(inventory, 0, "ASI662", "ABCDEF0123456789");
+        var selected = CameraChoice.Selected(choices, 0, "ASI662", "ABCDEF0123456789");
+        Assert.Equal("abcdef0123456789", selected.Serial);
+        Assert.Contains("serial abcdef0123456789", selected.Label);
+        Assert.Equal(26155, selected.Id);
+        choices = CameraChoice.Create(inventory, 26155, "ASI662");
+        Assert.Contains("ambiguous", CameraChoice.Selected(choices, 26155, "ASI662").Label);
+    }
+
+    [Fact]
+    public void MissingSerialIsPreservedAndProbeErrorsAreVisible()
+    {
+        CameraInventory inventory = new([new(26155, "ZWO ASI662MC", true, null, "USB busy")], 1, null);
+        var choices = CameraChoice.Create(inventory, null, "ASI662", "1234567890abcdef");
+        Assert.Contains(choices, choice => choice.Label.Contains("USB busy"));
+        var selected = CameraChoice.Selected(choices, null, "ASI662", "1234567890abcdef");
+        Assert.Equal("1234567890abcdef", selected.Serial);
+        Assert.Contains("unavailable", selected.Label);
+    }
+
+    [Fact]
     public void MultipleCamerasRequireExplicitChoice()
     {
         var choices = CameraChoice.Create(Inventory, null, null);

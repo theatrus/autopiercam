@@ -619,6 +619,13 @@ fn publish_snapshot_if_changed<F>(
     if last_status.as_ref() == Some(&status) {
         return;
     }
+    // Progress (including elapsed exposure time) changes at the supervisor's
+    // polling cadence. Deliver it to clients, but log only semantic transitions.
+    if status_transition(last_status.as_ref(), &status) {
+        tracing::info!(paused = status.state == AgentState::Paused,
+            state = ?status.state, camera = ?status.camera, error = ?status.last_error,
+            "capture worker status changed");
+    }
     if status.state == AgentState::Faulted
         && last_status.as_ref().is_none_or(|last| {
             last.state != AgentState::Faulted || last.last_error != status.last_error
@@ -629,6 +636,14 @@ fn publish_snapshot_if_changed<F>(
     }
     emit(WorkerEvent::StatusChanged(Box::new(status.clone())));
     *last_status = Some(status);
+}
+
+fn status_transition(previous: Option<&AgentStatus>, current: &AgentStatus) -> bool {
+    previous.is_none_or(|previous| {
+        previous.state != current.state
+            || previous.camera != current.camera
+            || previous.last_error != current.last_error
+    })
 }
 
 struct CameraSession {
@@ -826,6 +841,69 @@ fn run_camera(
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn progress_updates_are_delivered_without_logging_status_transitions() {
+        let mut status = AgentMonitor::new().snapshot();
+        status.state = AgentState::Capturing;
+        status.camera = Some(autopiercam_protocol::StatusCamera {
+            id: 1,
+            name: "synthetic camera".into(),
+        });
+        status.exposure = Some(autopiercam_protocol::StatusExposure {
+            session_generation: 1,
+            settling: false,
+            exposure_us: 1_000_000,
+            gain: 0,
+            max_exposure_us: 1_000_000,
+            settling_frames: 0,
+            settling_min_frames: 0,
+            wait_elapsed_ms: 0,
+            frame_timeout_ms: 7_000,
+        });
+        let events = RefCell::new(Vec::new());
+        let emit = |event| events.borrow_mut().push(event);
+        let mut previous = None;
+        assert!(status_transition(previous.as_ref(), &status));
+        publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        for elapsed in [100, 200, 300] {
+            status.exposure.as_mut().unwrap().wait_elapsed_ms = elapsed;
+            assert!(!status_transition(previous.as_ref(), &status));
+            publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        }
+        status.frames_captured += 1;
+        status.frames_saved += 1;
+        assert!(!status_transition(previous.as_ref(), &status));
+        publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        // An identical snapshot is still deduplicated, unlike real progress.
+        publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        assert_eq!(events.borrow().len(), 5);
+        assert!(
+            matches!(events.borrow().last(), Some(WorkerEvent::StatusChanged(latest))
+            if latest.frames_captured == 1 && latest.exposure.as_ref().unwrap().wait_elapsed_ms == 300)
+        );
+
+        for state in [
+            AgentState::Paused,
+            AgentState::Capturing,
+            AgentState::Faulted,
+        ] {
+            status.state = state;
+            assert!(status_transition(previous.as_ref(), &status));
+            publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        }
+        // Compare full errors, not truncated tray tooltips, and camera IDs even
+        // when two selected devices have the same model name.
+        for suffix in ["first", "second"] {
+            status.last_error = Some(format!("{} {suffix}", "x".repeat(100)));
+            assert!(status_transition(previous.as_ref(), &status));
+            publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        }
+        status.camera.as_mut().unwrap().id = 2;
+        assert!(status_transition(previous.as_ref(), &status));
+        publish_snapshot_if_changed(status.clone(), &emit, &mut previous);
+        assert!(!status_transition(previous.as_ref(), &status));
+    }
 
     fn synthetic_options() -> WorkerOptions {
         WorkerOptions {

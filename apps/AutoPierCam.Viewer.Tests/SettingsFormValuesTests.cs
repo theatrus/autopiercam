@@ -6,6 +6,15 @@ using Xunit;
 public sealed class SettingsFormValuesTests
 {
     [Fact]
+    public void UsbRecoveryIsDisabledByDefaultAndTrackedAsAnEdit()
+    {
+        var baseline = SettingsFormValues.FromConfiguration(Config);
+        Assert.False(baseline.UsbResetOnFault);
+        Assert.Equal(baseline, SettingsFormValues.FromConfiguration(Config with { Camera = Config.Camera with { UsbResetOnFault = false } }));
+        Assert.NotEqual(baseline, baseline with { UsbResetOnFault = true });
+    }
+
+    [Fact]
     public void RegainDefaultsAreCleanAndDriverOrSerialEditsAreDirty()
     {
         var baseline = SettingsFormValues.FromConfiguration(Config);
@@ -43,6 +52,11 @@ public sealed class SettingsFormValuesTests
         var changed = baseline with { PreviewRate = SettingsFormValues.Number(5) };
         Assert.NotEqual(baseline, changed);
         Assert.Equal(baseline, changed with { PreviewRate = SettingsFormValues.Number(2) });
+        var fractional = SettingsFormValues.FromConfiguration(Config with {
+            Capture = Config.Capture with { PreviewMaxFps = 0.1 }
+        });
+        Assert.NotEqual(baseline, fractional);
+        Assert.Equal("0.1", fractional.PreviewRate);
     }
     private static AgentConfiguration Config => JsonSerializer.Deserialize<AgentConfiguration>(
         File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
