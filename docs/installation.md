@@ -48,13 +48,15 @@ cameras require an exact serial number for persistent selection.
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-Version 0.2.15 uses Regain and application-controlled exposure for both
+Version 0.2.16 uses Regain and application-controlled exposure for both
 driver choices. ASI662MC and ASI676MC direct USB have a
 2,000-second limit. See the [exposure guide](exposure.md) and
 [Regain migration](regain-backend.md).
 
-Version 0.2.15 adds discovered serial selection, fractional preview rates and
-opt-in Windows USB port recovery. Failed sessions still retry after 30 seconds.
+Version 0.2.16 reuses cached identity on reconnect, without probing other cameras
+for their serials. Failed capture sessions still retry after 30 seconds; failed
+discovery backs off for 5, 10, 20, then 30 minutes. It retains fractional preview
+rates and opt-in Windows USB port recovery from 0.2.15.
 USB recovery requires an explicit serial and an elevated agent; it is off by
 default. ASI662MC Direct USB has been supported
 since 0.2.13. SDK remains the default. Select Direct USB explicitly in Settings,
@@ -159,19 +161,19 @@ still running. An unresponsive restart asks the operator to quit and relaunch.
 Before installing a downloaded release, compare its published SHA-256 with:
 
 ```powershell
-Get-FileHash .\AutoPierCam-0.2.15-x64.msi -Algorithm SHA256
+Get-FileHash .\AutoPierCam-0.2.16-x64.msi -Algorithm SHA256
 ```
 
 Install with the default sign-in behavior and a verbose MSI log:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.15-x64.msi /qn /norestart /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.16-x64.msi /qn /norestart /l*v .\autopiercam-install.log
 ```
 
 Install without the optional sign-in feature:
 
 ```powershell
-msiexec.exe /i .\AutoPierCam-0.2.15-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
+msiexec.exe /i .\AutoPierCam-0.2.16-x64.msi /qn /norestart ADDLOCAL=MainApplication /l*v .\autopiercam-install.log
 ```
 
 For a normal uninstall, use Windows Installed apps. Administrators and support

@@ -211,7 +211,7 @@
                                 <ComboBoxItem Content="Regain · ZWO SDK" Tag="zwo_sdk" />
                                 <ComboBoxItem Content="Regain · ZWO Direct USB (experimental)" Tag="zwo_direct" />
                             </ComboBox>
-                            <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional for one matching camera)" PlaceholderText="Choose a discovered camera below, or enter its serial" IsEnabled="False" />
+                            <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional for one matching camera)" PlaceholderText="Verified after connection; optionally enter the expected serial" IsEnabled="False" />
                             <TextBlock Text="ASI662MC and ASI676MC support Direct USB: RAW16, bin 1, up to 2,000 s. Changing drivers restarts capture."
                                        FontSize="12" TextWrapping="Wrap" />
                             <TextBlock Text="Camera" />

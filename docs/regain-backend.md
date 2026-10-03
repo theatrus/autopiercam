@@ -1,8 +1,8 @@
 # Regain camera backend
 
-AutoPierCam 0.2.15 uses Regain 0.5.3 plus the serial-discovery fixes in
-[Regain PR #9](https://github.com/pulsarfab/regain/pull/9), pinned to reviewed
-commit `f2eee177796d40d594a70c71470783b947c71130` in Cargo.toml and Cargo.lock.
+AutoPierCam 0.2.16 uses Regain 0.5.3 plus targeted reconnect fixes in
+[Regain PR #10](https://github.com/pulsarfab/regain/pull/10), pinned to
+commit `416101a90b9b9d27696d91c9dd6bbc1055b4c52e` in Cargo.toml and Cargo.lock.
 AutoPierCam 0.2.14 used the `v0.5.3.0` release; 0.2.13 used Regain 0.5.2.
 ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
 There are no AutoPierCam SDK bindings. The `regain-device` entry
@@ -33,19 +33,35 @@ max_exposure_us = 60000000 # Both direct models support up to 2000000000
 
 Keep the selected model filter. Backend changes clear the transient camera ID
 in the Viewer and restart capture. A saved serial is verified on open.
-Identical models require an exact serial; an ambiguous selection never silently
-opens the first camera. SDK IDs remain useful for selecting distinct models
-but are not durable USB identity.
+An ambiguous selection never silently opens the first camera. A selected SDK ID
+can identify one initial candidate; it is not durable identity. The verified
+serial is retained in memory across retries even when the optional field is blank.
+Identical Direct USB models cannot be distinguished by product ID; if their
+serials are unknown, automatic capture refuses to probe them to find a match.
 
-From 0.2.15 the capture owner requests an optional serial-aware inventory before
-opening capture. Viewer camera choices show discovered serials and fill the
-serial field when selected. Blank serial means no filter; hexadecimal serials
-are matched case-insensitively. Direct USB IDs are model/product IDs, not unique
-per-device identifiers. A busy/unidentified device retains a discovery error in
-the list; its serial is not guessed. SDK discovery opens, initializes and closes
-devices; Direct discovery queries identity without capture. These probes are
-never issued by Viewer/IPC and never while the capture owner holds a camera.
-Reload camera list reads the cached inventory, not a fresh hardware scan.
+0.2.15's automatic serial-aware scan opened every SDK camera. **0.2.16 removes
+that scan.** Initial discovery requests descriptors only, and the selected
+camera's verified serial appears in cached Viewer choices after connecting.
+Blank serial is allowed for one unambiguous candidate; hexadecimal serials match
+case-insensitively. Serial verification precedes SDK initialization on reconnect.
+Direct USB retains an opaque interface locator internally, opens only that
+interface, and verifies its serial. It never falls back to another interface.
+
+Inventory and selected identity survive capture worker replacement and exposure
+settings changes. Capture retries stay at 30 seconds; failed/empty discovery has
+a separate 5/10/20/30-minute capped backoff. No successful inventory is refreshed
+automatically on fault. Reload camera list is still cache-only. To deliberately
+rediscover changed hardware, stop/restart the agent when other cameras are idle.
+An SDK ID or USB interface that changes after replug/reset may need this operator
+action rather than an automatic scan. Camera driver changes invalidate that
+backend's cached selection. No identity paths are persisted or sent over IPC.
+
+SDK initial descriptor discovery still calls `ASIGetCameraProperty`, which can
+internally open devices. Targeted SDK reopen calls the count API once to populate
+the new process's device table but does not sweep properties or initialize other
+cameras. This is not a system-wide interlock or proof of vendor SDK safety with
+another application's camera. Synthetic call-count tests cover the reconnect
+policy; the reported hardware deadlock has not been reproduced or proven fixed.
 
 ASI662MC Direct USB provides 1920×1080 RGGB frames, gain 0–600, and an
 approximately 100 ms minimum frame interval for short exposures. AutoPierCam's

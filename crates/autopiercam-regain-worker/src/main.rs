@@ -5,7 +5,7 @@ fn main() -> anyhow::Result<()> {
     let vendor = args.next().unwrap_or_default();
     if vendor == "--version" {
         println!(
-            "autopiercam-regain-worker {} (Regain f2eee177796d)",
+            "autopiercam-regain-worker {} (Regain 416101a90b9b)",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
