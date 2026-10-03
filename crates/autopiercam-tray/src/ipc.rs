@@ -1187,8 +1187,10 @@ mod tests {
                 "camera.gain_range",
                 "camera.startup_location",
                 "camera.white_balance",
+                "camera.usb_reset_on_fault",
                 "camera.raw16",
                 "capture.preview_rate",
+                "capture.preview_rate_fractional",
                 "video.ffmpeg"
             ]
         );
@@ -1280,7 +1282,7 @@ mod tests {
                 next.camera.min_gain = 200;
                 next.camera.prefer_short_exposures = true;
                 next.capture.interval_ms = 5000;
-                next.capture.preview_max_fps = 5;
+                next.capture.preview_max_fps = 0.1;
             }
             let response = dispatch(
                 Request::new("live-save", Method::ConfigReplace).with_payload(
@@ -1297,7 +1299,10 @@ mod tests {
             let saved: ConfigSaved = serde_json::from_value(response.result.unwrap()).unwrap();
             assert!(saved.saved);
             assert!(!saved.restart_scheduled);
-            assert_eq!(store.snapshot().unwrap().config.capture.preview_max_fps, 5);
+            assert_eq!(
+                store.snapshot().unwrap().config.capture.preview_max_fps,
+                0.1
+            );
             assert_eq!(store.snapshot().unwrap().config.camera.min_gain, 200);
             assert!(
                 store
@@ -1491,11 +1496,15 @@ mod tests {
         let monitor = AgentMonitor::new();
         let cameras = vec![
             autopiercam_protocol::DetectedCamera {
+                serial: None,
+                discovery_error: None,
                 id: 7,
                 name: "ZWO ASI676MC".into(),
                 is_color: true,
             },
             autopiercam_protocol::DetectedCamera {
+                serial: None,
+                discovery_error: None,
                 id: 9,
                 name: "ZWO ASI662MC".into(),
                 is_color: true,

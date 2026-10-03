@@ -5,6 +5,24 @@ using Xunit;
 public sealed class SettingsLayoutTests
 {
     [Fact]
+    public void UsbRecoveryIsExplicitlyOptIn()
+    {
+        var toggle = Named(Markup(), "UsbResetOnFaultToggle");
+        Assert.Equal("False", (string?)toggle.Attribute("IsOn"));
+        Assert.Equal("False", (string?)toggle.Attribute("IsEnabled"));
+    }
+
+    [Fact]
+    public void PreviewRateAllowsDecimalInputBelowOneFps()
+    {
+        var rate = Named(Markup(), "PreviewMaxFpsNumberBox");
+        Assert.Equal("0.01", (string?)rate.Attribute("Minimum"));
+        Assert.Equal("30", (string?)rate.Attribute("Maximum"));
+        Assert.Equal("0.1", (string?)rate.Attribute("SmallChange"));
+        Assert.Equal("2", (string?)rate.Attribute("Value"));
+    }
+
+    [Fact]
     public void HeaderUsesCompactBrandingAndPreservesStatusAndActions()
     {
         var markup = Markup();

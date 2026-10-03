@@ -101,10 +101,14 @@ public sealed class AgentPipeClientTests
     }
 
     [Theory]
-    [InlineData(1u)]
-    [InlineData(2u)]
-    [InlineData(30u)]
-    public async Task PreviewRateRoundTripsWithoutRestart(uint fps)
+    [InlineData(0.01)]
+    [InlineData(0.1)]
+    [InlineData(0.5)]
+    [InlineData(1.0)]
+    [InlineData(2.0)]
+    [InlineData(2.5)]
+    [InlineData(30.0)]
+    public async Task PreviewRateRoundTripsWithoutRestart(double fps)
     {
         var original = JsonSerializer.Deserialize<AgentConfiguration>(
             await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
@@ -114,19 +118,63 @@ public sealed class AgentPipeClientTests
         Assert.Equal(fps, JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!.Capture.PreviewMaxFps);
         await WithResponse("config.replace", new { revision = 1UL, saved = true, restart_scheduled = false },
             async client => Assert.False((await client.ReplaceConfigurationAsync(1, config)).RestartScheduled),
-            request => Assert.Equal(fps, request.GetProperty("payload").GetProperty("config").GetProperty("capture").GetProperty("preview_max_fps").GetUInt32()));
+            request => {
+                var value = request.GetProperty("payload").GetProperty("config").GetProperty("capture").GetProperty("preview_max_fps");
+                Assert.Equal(fps, value.GetDouble());
+                // Whole rates retain the integer wire format older agents accept.
+                if (fps == Math.Truncate(fps)) Assert.Equal((uint)fps, value.GetUInt32());
+            });
     }
 
     [Theory]
-    [InlineData(0u)]
-    [InlineData(31u)]
-    public async Task InvalidPreviewRateIsRejected(uint fps)
+    [InlineData(0.0)]
+    [InlineData(0.009)]
+    [InlineData(-1.0)]
+    [InlineData(31.0)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public async Task InvalidPreviewRateIsRejected(double fps)
     {
         var config = JsonSerializer.Deserialize<AgentConfiguration>(
             await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
         config = config with { Capture = config.Capture with { PreviewMaxFps = fps } };
         Assert.Throws<AgentProtocolException>(() => config.Validate("test"));
     }
+    [Theory]
+    [InlineData(0.01, false, false)]
+    [InlineData(0.5, false, false)]
+    [InlineData(2.5, false, false)]
+    [InlineData(1.0, false, true)]
+    [InlineData(30.0, false, true)]
+    [InlineData(0.01, true, true)]
+    [InlineData(0.5, true, true)]
+    [InlineData(2.5, true, true)]
+    [InlineData(double.NaN, true, false)]
+    public void PreviewRateEditingRespectsAgentCapability(double rate, bool fractional, bool allowed)
+    {
+        Assert.Equal(allowed, AgentCaptureConfiguration.IsSupportedPreviewRate(rate, fractional));
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("", false)]
+    [InlineData("0000000000000000", false)]
+    [InlineData("1234567890abcdeg", false)]
+    [InlineData("1234567890abcdef", true)]
+    public void UsbRecoveryRequiresAnExplicitCameraSerial(string? serial, bool valid)
+    {
+        var original = JsonSerializer.Deserialize<AgentConfiguration>(
+            File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "config-default.json")))!;
+        Assert.Null(original.Camera.UsbResetOnFault);
+        Assert.DoesNotContain("usb_reset_on_fault", JsonSerializer.Serialize(original));
+        var config = original with { Camera = original.Camera with { UsbResetOnFault = true, Serial = serial } };
+        if (valid) {
+            config.Validate("test");
+            Assert.True(JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!.Camera.UsbResetOnFault);
+        } else Assert.Throws<AgentProtocolException>(() => config.Validate("test"));
+    }
+
     [Fact]
     public async Task SaveAcceptsLiveReloadWithoutRestart()
     {

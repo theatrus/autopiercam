@@ -94,6 +94,7 @@ fn asi662_direct_full_frame_and_centered_roi() {
         .expect("pinned Regain must advertise ASI662MC Direct USB");
     assert_eq!((info.max_width, info.max_height), (1920, 1080));
     assert!(info.is_color);
+    assert_eq!(info.serial.as_deref(), Some("direct-simulator"));
     assert_eq!(info.bayer_pattern, autopiercam_camera::BayerPattern::Rg);
     assert_eq!(info.supported_bins, vec![1]);
     let mut camera = driver.open(info).unwrap();
@@ -172,6 +173,35 @@ fn asi662_direct_full_frame_and_centered_roi() {
             }
         }
         camera.stop_capture().unwrap();
+    }
+}
+
+#[test]
+fn discovered_serials_accept_case_variants_and_reject_mismatches() {
+    for (backend, serial) in [
+        (CameraDriver::ZwoSdk, "SIM00001"),
+        (CameraDriver::ZwoDirect, "DIRECT-SIMULATOR"),
+    ] {
+        let driver = driver(backend, json!({}), Some(serial.into()));
+        let info = driver.cameras().unwrap().remove(0);
+        assert!(info.serial.as_deref().unwrap().eq_ignore_ascii_case(serial));
+        let camera = driver.open(info.clone()).unwrap();
+        drop(camera);
+        let mut changed = info;
+        changed.serial = Some("different-device".into());
+        assert!(driver.open(changed).is_err());
+    }
+}
+
+#[test]
+fn blank_serial_filters_open_a_single_matching_camera() {
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        for serial in ["", "  "] {
+            let driver = driver(backend, json!({}), Some(serial.into()));
+            assert!(driver.selected_serial().is_none());
+            let info = driver.cameras().unwrap().remove(0);
+            drop(driver.open(info).unwrap());
+        }
     }
 }
 
@@ -395,7 +425,7 @@ fn production_pipeline_settles_and_saves_a_simulated_frame() {
         ..Default::default()
     });
     config.camera.settle_frames = 1;
-    config.capture.preview_max_fps = 30;
+    config.capture.preview_max_fps = 30.0;
     config.capture.interval_ms = 1;
     config.capture.directory = temp.path().join("captures");
     // Explicitly local-only. No upload, video or sharing service is started.
@@ -438,7 +468,7 @@ fn asi662_direct_pipeline_settles_and_saves_without_network() {
     config.camera.min_gain = 200;
     config.camera.max_gain = 200;
     config.camera.settle_frames = 1;
-    config.capture.preview_max_fps = 30;
+    config.capture.preview_max_fps = 30.0;
     config.capture.interval_ms = 1;
     config.capture.directory = temp.path().join("captures");
     assert!(!config.upload.enabled && !config.video.enabled);
@@ -458,4 +488,100 @@ fn asi662_direct_pipeline_settles_and_saves_without_network() {
     let saved = monitor.snapshot().last_artifact.unwrap();
     assert!(Path::new(&saved).is_file());
     assert_eq!(Path::new(&saved).extension().unwrap(), "png");
+}
+
+#[test]
+fn fractional_preview_idle_does_not_fault_the_production_pipeline() {
+    let driver = driver(
+        CameraDriver::ZwoSdk,
+        json!({"instant":true,"width":64,"height":64}),
+        None,
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = autopiercam_core::config::Config::default();
+    config.camera.min_exposure_us = 1000;
+    config.camera.max_exposure_us = 1000;
+    config.camera.settle_frames = 1;
+    config.capture.preview_max_fps = 0.1;
+    // Longer than the 5-second short-exposure timeout, sooner than the preview.
+    config.capture.interval_ms = 7000;
+    config.capture.directory = temp.path().join("captures");
+    assert!(!config.upload.enabled && !config.video.enabled);
+    let path = temp.path().join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let monitor = autopiercam::AgentMonitor::new();
+    autopiercam::run_agent_with_monitor_and_preview(
+        &driver,
+        &path,
+        Some(2),
+        &autopiercam::AgentControl::new(),
+        &monitor,
+        &autopiercam::PreviewHub::new().begin_session(),
+    )
+    .unwrap();
+    assert_eq!(monitor.snapshot().frames_saved, 2);
+}
+
+#[test]
+fn simulated_usb_recovery_requires_release_and_consumes_the_binding_once() {
+    let serial = "1234567890abcdef";
+    let driver = driver(
+        CameraDriver::ZwoSdk,
+        json!({"instant":true,"serial":serial}),
+        Some(serial.into()),
+    );
+    let info = driver
+        .cameras()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.is_color)
+        .unwrap();
+    driver.bind_usb_recovery(&info).unwrap();
+    let camera = setup(&driver);
+    assert!(driver.bind_usb_recovery(&info).is_err());
+    assert!(driver.reset_bound_usb(|| false).is_err());
+    assert!(driver.has_usb_recovery_target());
+    drop(camera);
+    assert!(driver.reset_bound_usb(|| true).is_err());
+    assert!(driver.has_usb_recovery_target());
+    driver.reset_bound_usb(|| false).unwrap();
+    assert!(!driver.has_usb_recovery_target());
+    assert!(driver.reset_bound_usb(|| false).is_err());
+    assert!(!frame(&mut setup(&driver)).is_empty());
+}
+
+#[test]
+fn simulated_capture_fault_resets_only_when_opted_in_and_respects_cooldown() {
+    let serial = "1234567890abcdef";
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = autopiercam_core::config::Config::default();
+    config.camera.serial = Some(serial.into());
+    config.camera.min_exposure_us = 1000;
+    config.camera.max_exposure_us = 1000;
+    config.capture.directory = temp.path().join("captures");
+    let path = temp.path().join("config.toml");
+    let monitor = autopiercam::AgentMonitor::new();
+    for (enabled, reset) in [(false, false), (true, true), (true, false)] {
+        config.camera.usb_reset_on_fault = enabled;
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let driver = driver(
+            CameraDriver::ZwoSdk,
+            json!({"instant":true,"serial":serial,"fault":"download"}),
+            Some(serial.into()),
+        );
+        let error = autopiercam::run_agent_with_monitor_and_preview(
+            &driver,
+            &path,
+            Some(1),
+            &autopiercam::AgentControl::new(),
+            &monitor,
+            &autopiercam::PreviewHub::new().begin_session(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}").contains("USB port reset completed"),
+            reset
+        );
+        assert_eq!(monitor.snapshot().frames_saved, 0);
+    }
 }

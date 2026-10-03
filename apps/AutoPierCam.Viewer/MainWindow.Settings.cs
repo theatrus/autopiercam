@@ -26,7 +26,7 @@ public sealed partial class MainWindow
         }
         foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
-        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle })
+        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle, UsbResetOnFaultToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
         CameraDriverComboBox.SelectionChanged += (_, _) => MarkSettingsEdited();
         WhiteBalanceModeComboBox.SelectionChanged += (_, _) => {
@@ -99,6 +99,7 @@ public sealed partial class MainWindow
         return new() {
             Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",
             Serial = SettingsFormValues.Text(CameraSerialTextBox.Text),
+            UsbResetOnFault = UsbResetOnFaultToggle.IsOn,
             Latitude = Number(LatitudeNumberBox), Longitude = Number(LongitudeNumberBox),
             WhiteBalanceMode = SelectedWhiteBalanceMode(),
             WhiteBalanceRed = WhiteBalanceModeComboBox.SelectedIndex > 0 ? Number(WhiteBalanceRedNumberBox) : "1",

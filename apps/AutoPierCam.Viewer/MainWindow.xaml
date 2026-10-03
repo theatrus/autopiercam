@@ -211,7 +211,7 @@
                                 <ComboBoxItem Content="Regain · ZWO SDK" Tag="zwo_sdk" />
                                 <ComboBoxItem Content="Regain · ZWO Direct USB (experimental)" Tag="zwo_direct" />
                             </ComboBox>
-                            <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional)" IsEnabled="False" />
+                            <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional for one matching camera)" PlaceholderText="Choose a discovered camera below, or enter its serial" IsEnabled="False" />
                             <TextBlock Text="ASI662MC and ASI676MC support Direct USB: RAW16, bin 1, up to 2,000 s. Changing drivers restarts capture."
                                        FontSize="12" TextWrapping="Wrap" />
                             <TextBlock Text="Camera" />
@@ -388,6 +388,10 @@
                         <ToggleSwitch x:Name="AdaptiveExposureToggle" Header="Application-controlled day/night exposure"
                                       IsEnabled="False" IsOn="True" Visibility="Collapsed" Toggled="ExposureControl_Changed" />
                         <TextBlock Text="AutoPierCam controls exposure and gain through Regain." FontSize="12" TextWrapping="Wrap" />
+                        <ToggleSwitch x:Name="UsbResetOnFaultToggle" Header="Reset this camera's USB port after capture failure"
+                                      IsEnabled="False" IsOn="False" />
+                        <TextBlock Text="Opt-in Windows recovery. Requires a saved camera serial and an administrator-started agent. Resets only the verified camera port after closing capture, at most once every 5 minutes. Never resets a hub or prompts for elevation. Other faults use normal retry. USB reset may not remove physical power."
+                                   FontSize="12" TextWrapping="Wrap" />
                         <NumberBox x:Name="LatitudeNumberBox" Header="Observing latitude · degrees north"
                                    Minimum="-90" Maximum="90" IsEnabled="False" />
                         <NumberBox x:Name="LongitudeNumberBox" Header="Observing longitude · degrees east"
@@ -426,9 +430,9 @@
                         <StackPanel Spacing="6">
                             <TextBlock Text="Maximum preview frame rate" />
                             <NumberBox x:Name="PreviewMaxFpsNumberBox" Header="Frames per second"
-                                       Minimum="1" Maximum="30" SmallChange="1" LargeChange="5"
+                                       Minimum="0.01" Maximum="30" SmallChange="0.1" LargeChange="1"
                                        SpinButtonPlacementMode="Compact" Value="2" IsEnabled="False" />
-                            <TextBlock Text="Default: 2 fps. Exposure time may limit the actual rate."
+                            <TextBlock Text="Default: 2 fps. Decimal rates are supported: 0.5 = every 2 seconds; 0.1 = every 10 seconds. Exposure time may limit the actual rate. Older agents require whole numbers from 1 to 30."
                                        FontSize="12" TextWrapping="Wrap" />
                         </StackPanel>
                         <StackPanel Spacing="6">

@@ -42,7 +42,7 @@ Reserved methods currently return a structured `not_implemented` error:
 - artifacts.list
 
 `cameras.list` (capability `cameras.list`) returns `{ cameras: [{ id, name,
-is_color }], scanned_at_unix_ms, error }`. The capture thread publishes this
+is_color, serial?, discovery_error? }], scanned_at_unix_ms, error }`. The capture thread publishes this
 inventory before selecting/opening a camera, including when selection faults.
 IPC only reads the cached inventory; it never opens a camera or calls the SDK.
 Discovery runs before opening a camera, including a fresh session started by
@@ -118,7 +118,9 @@ necessarily the requested configuration value. Exposure/gain are asynchronous
 SDK readback estimates, not exact metadata for an individual frame.
 
 `wait_elapsed_ms` is monotonic time since the most recent completed frame (or
-stream startup). `frame_timeout_ms` is the total permitted no-frame wait,
+stream startup), excluding intentional pacing while the stream is stopped.
+The capture owner continues to publish liveness during that idle period.
+`frame_timeout_ms` is the total permitted no-frame wait,
 including all short SDK polls. It is twice the longest relevant observed
 exposure plus five seconds, retaining one previous frame's exposure allowance
 to tolerate a queued night frame during a transition to daylight. The agent
@@ -196,12 +198,27 @@ or reconfigure hardware/services. Invalid runtime settings still surface through
 normal agent fault status.
 
 The `capture.preview_rate` capability advertises editing of
-`capture.preview_max_fps`: an integer from 1–30, default 2 when omitted. The
+`capture.preview_max_fps`: a finite number from 0.01–30, default 2 when omitted.
+The additional `capture.preview_rate_fractional` capability permits decimal rates;
+without it, Viewer restricts edits to the legacy integer 1–30 range. Whole rates
+retain integer serialization for old readers. Older Viewers cannot read a
+fractional configured rate; update both components before using one. The
 default may be omitted from canonical JSON. Viewer preserves an existing value
 without offering edits when that capability is absent. Preview publication is
 capped independently of scheduled stills and explicit capture requests.
 
 The `camera.white_balance` capability advertises the optional
+`camera.white_balance` settings described below.
+
+On Windows, `camera.usb_reset_on_fault` advertises editing the optional boolean
+`camera.usb_reset_on_fault` (false/omitted by default). Enabling it requires an
+explicit nonzero 16-digit hexadecimal `camera.serial`. A changed setting restarts
+capture to bind the device before acquisition. Old agents never receive a newly
+synthesized field. The capture thread alone may invoke recovery after teardown;
+there is no reset IPC command or arbitrary port/target parameter. See
+[USB recovery](regain-backend.md#opt-in-usb-port-recovery-unreleased).
+
+The white-balance configuration is an optional
 `camera.white_balance` object: `mode` (`manual`, `once`, `continuous`), `red` and
 `blue` (finite linear multipliers in 0.125–8, default 1). Omission/null disables
 management and preserves backend defaults. Changed WB settings restart capture;

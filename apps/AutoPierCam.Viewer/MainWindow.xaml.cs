@@ -1108,6 +1108,7 @@ public sealed partial class MainWindow : Window
         CameraDriverComboBox.SelectedIndex = configuration.Camera.Driver == "zwo_direct" ? 1 : 0;
         CameraSerialTextBox.Text = configuration.Camera.Serial ?? string.Empty;
         LatitudeNumberBox.Value = configuration.Camera.LatitudeDeg ?? double.NaN;
+        UsbResetOnFaultToggle.IsOn = configuration.Camera.UsbResetOnFault == true;
         LongitudeNumberBox.Value = configuration.Camera.LongitudeDeg ?? double.NaN;
         WhiteBalanceModeComboBox.SelectedIndex = configuration.Camera.WhiteBalance?.Mode switch {
             "manual" => 1, "once" => 2, "continuous" => 3, _ => 0
@@ -1159,6 +1160,11 @@ public sealed partial class MainWindow : Window
 
     private AgentConfiguration BuildConfigurationFromInputs(AgentConfiguration original)
     {
+        bool? usbResetOnFault = original.Camera.UsbResetOnFault;
+        if (_latestAgentStatus?.HasCapability("camera.usb_reset_on_fault") == true)
+            usbResetOnFault = UsbResetOnFaultToggle.IsOn ? true : null;
+        if (usbResetOnFault == true && !AgentCameraConfiguration.IsUsbRecoverySerial(NormalizeOptionalText(CameraSerialTextBox.Text)))
+            throw new UserInputException("USB recovery requires the selected camera's nonzero 16-digit hexadecimal serial. Enter it before enabling recovery.");
         var whiteBalance = original.Camera.WhiteBalance;
         if (_latestAgentStatus?.HasCapability("camera.white_balance") == true)
         {
@@ -1179,13 +1185,16 @@ public sealed partial class MainWindow : Window
                 longitude is double lon && (!double.IsFinite(lon) || lon < -180 || lon > 180))
                 throw new UserInputException("Enter both coordinates: latitude -90 to 90 and longitude -180 to 180, or leave both blank.");
         }
-        uint? previewMaxFps = original.Capture.PreviewMaxFps;
+        double? previewMaxFps = original.Capture.PreviewMaxFps;
         if (_latestAgentStatus?.HasCapability("capture.preview_rate") == true)
         {
             double value = PreviewMaxFpsNumberBox.Value;
-            if (!double.IsFinite(value) || value < 1 || value > 30 || value != Math.Truncate(value))
-                throw new UserInputException("Maximum preview frame rate must be a whole number from 1 to 30.");
-            previewMaxFps = (uint)value;
+            bool fractional = _latestAgentStatus?.HasCapability("capture.preview_rate_fractional") == true;
+            if (!AgentCaptureConfiguration.IsSupportedPreviewRate(value, fractional))
+                throw new UserInputException(fractional
+                    ? "Maximum preview frame rate must be a number from 0.01 to 30."
+                    : "This agent supports only whole-number frame rates from 1 to 30. Update the agent for fractional rates.");
+            previewMaxFps = value;
         }
         long maxExposureUs = ReadScaledInt64(
             MaxExposureNumberBox.Value,
@@ -1282,6 +1291,7 @@ public sealed partial class MainWindow : Window
                 LatitudeDeg = latitude,
                 LongitudeDeg = longitude,
                 WhiteBalance = whiteBalance,
+                UsbResetOnFault = usbResetOnFault,
                 MaxExposureUs = maxExposureUs,
                 MaxGain = maxGain,
                 MinGain = minGain,
@@ -1659,6 +1669,13 @@ public sealed partial class MainWindow : Window
             (!_cameraInventoryLoaded || CameraComboBox.SelectedItem is not CameraChoice { Id: not null });
         StillIntervalNumberBox.IsEnabled = configurationControlsEnabled;
         PreviewMaxFpsNumberBox.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("capture.preview_rate") == true;
+        // Do not clamp an edited decimal back to 1 during a transient disconnect.
+        if (_latestAgentStatus is { } previewRateStatus)
+        {
+            bool fractionalPreviewRate = previewRateStatus.HasCapability("capture.preview_rate_fractional");
+            PreviewMaxFpsNumberBox.Minimum = fractionalPreviewRate ? 0.01 : 1;
+            PreviewMaxFpsNumberBox.SmallChange = fractionalPreviewRate ? 0.1 : 1;
+        }
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
@@ -1696,6 +1713,7 @@ public sealed partial class MainWindow : Window
         LatitudeNumberBox.IsEnabled = LongitudeNumberBox.IsEnabled =
             editable && _latestAgentStatus?.HasCapability("camera.startup_location") == true;
         WhiteBalanceModeComboBox.IsEnabled = editable && _latestAgentStatus?.HasCapability("camera.white_balance") == true;
+        UsbResetOnFaultToggle.IsEnabled = editable && _latestAgentStatus?.HasCapability("camera.usb_reset_on_fault") == true;
         WhiteBalanceRedNumberBox.IsEnabled = WhiteBalanceBlueNumberBox.IsEnabled =
             WhiteBalanceModeComboBox.IsEnabled && WhiteBalanceModeComboBox.SelectedIndex > 0;
         GainControlHelpText.Text = !supported

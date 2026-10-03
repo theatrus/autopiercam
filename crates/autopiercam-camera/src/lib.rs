@@ -1,5 +1,5 @@
 //! Synchronous capture-owner adapter to Regain's isolated camera workers.
-//! Discovery is forbidden while a camera is owned; no retries, fallback or USB resets.
+//! Discovery and opt-in USB recovery require the camera owner to have released its handle.
 use anyhow::{Context, Result, bail, ensure};
 use autopiercam_core::config::{CameraDriver, WhiteBalanceConfig, WhiteBalanceMode};
 use regain_core::{CancellationToken, Runtime, Worker};
@@ -51,6 +51,8 @@ impl ImageType {
 }
 #[derive(Clone, Debug)]
 pub struct CameraInfo {
+    pub serial: Option<String>,
+    pub discovery_error: Option<String>,
     pub name: String,
     pub camera_id: i32,
     pub max_width: u32,
@@ -130,12 +132,20 @@ fn executor() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+fn normalized_serial(serial: Option<String>) -> Option<String> {
+    serial.and_then(|s| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_ascii_lowercase())
+    })
+}
+
 pub struct Driver {
     runtime: Runtime,
     backend: CameraDriver,
     serial: Option<String>,
     // Held through worker teardown. Serializes list/open and rejects live discovery.
     owned: Mutex<bool>,
+    recovery_target: Mutex<Option<String>>,
 }
 impl Driver {
     /// Test-only construction always passes --simulate; it cannot access hardware.
@@ -154,8 +164,9 @@ impl Driver {
                 sdk_simulation: Some(settings),
             },
             backend,
-            serial,
+            serial: normalized_serial(serial),
             owned: Mutex::new(false),
+            recovery_target: Mutex::new(None),
         }
     }
     pub fn new(sdk: Option<&Path>, backend: CameraDriver, serial: Option<String>) -> Result<Self> {
@@ -198,8 +209,9 @@ impl Driver {
                 sdk_simulation: None,
             },
             backend,
-            serial,
+            serial: normalized_serial(serial),
             owned: Mutex::new(false),
+            recovery_target: Mutex::new(None),
         })
     }
     pub fn path(&self) -> &Path {
@@ -207,6 +219,81 @@ impl Driver {
     }
     pub fn selected_serial(&self) -> Option<&str> {
         self.serial.as_deref()
+    }
+    /// Called only by the capture owner before opening the selected camera.
+    /// A missing/ambiguous binding must never turn into a guessed port reset.
+    pub fn bind_usb_recovery(&self, info: &CameraInfo) -> Result<()> {
+        let owned = self
+            .owned
+            .lock()
+            .map_err(|_| anyhow::anyhow!("camera ownership poisoned"))?;
+        ensure!(!*owned, "Release the camera before binding USB recovery");
+        *self
+            .recovery_target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("USB recovery state poisoned"))? = None;
+        let serial = self
+            .serial
+            .as_deref()
+            .context("USB recovery requires an explicit serial")?;
+        ensure!(
+            serial.len() == 16
+                && serial.bytes().all(|c| c.is_ascii_hexdigit())
+                && serial != "0000000000000000",
+            "Invalid USB recovery serial"
+        );
+        let encoded = if self.runtime.simulate {
+            "simulation".to_owned()
+        } else {
+            ensure!(
+                cfg!(windows),
+                "USB port recovery currently requires Windows"
+            );
+            let encoded = executor()?.block_on(self.runtime.usb_command(
+                &["zwo", "camera-direct", "--usb-target", &info.name, serial],
+                30,
+            ))?;
+            let target = regain_transport::usb::Target::decode(&encoded)?;
+            ensure!(
+                target.serial.eq_ignore_ascii_case(serial),
+                "USB recovery serial mismatch"
+            );
+            encoded
+        };
+        *self
+            .recovery_target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("USB recovery state poisoned"))? = Some(encoded);
+        Ok(())
+    }
+
+    pub fn has_usb_recovery_target(&self) -> bool {
+        self.recovery_target
+            .lock()
+            .is_ok_and(|target| target.is_some())
+    }
+
+    /// Consume the binding once, only after camera teardown. The helper verifies
+    /// the original device generation again immediately before cycling its port.
+    pub fn reset_bound_usb(&self, cancelled: impl Fn() -> bool) -> Result<()> {
+        let owned = self
+            .owned
+            .lock()
+            .map_err(|_| anyhow::anyhow!("camera ownership poisoned"))?;
+        ensure!(!*owned, "Cannot reset USB while the camera is owned");
+        ensure!(!cancelled(), "USB recovery cancelled before dispatch");
+        let target = self
+            .recovery_target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("USB recovery state poisoned"))?
+            .take()
+            .context("No verified USB recovery target")?;
+        if !self.runtime.simulate {
+            executor()?.block_on(self.runtime.usb_command(&["usb", "reset", &target], 80))?;
+        }
+        // Do not start replacement capture here; the supervisor's normal retry
+        // reopens with the explicit saved serial and restores all settings.
+        Ok(())
     }
     pub fn version(&self) -> String {
         format!("Regain 0.5.3 / {:?}", self.backend)
@@ -224,11 +311,19 @@ impl Driver {
             "Camera discovery is unavailable while acquiring; use the cached inventory"
         );
         let runtime = executor()?;
-        let list = runtime.block_on(self.runtime.list(
-            self.is_direct(),
-            diagnostic(),
-            &CancellationToken::new(),
-        ))?;
+        let list = runtime.block_on(async {
+            let mut worker = self.runtime.spawn(self.is_direct(), diagnostic()).await?;
+            let result = worker
+                .call(
+                    "list",
+                    json!({"serials":true}),
+                    30.,
+                    &CancellationToken::new(),
+                )
+                .await;
+            worker.kill().await;
+            result.map(|r| r.0)
+        })?;
         list.as_array()
             .context("invalid Regain inventory")?
             .iter()
@@ -245,7 +340,7 @@ impl Driver {
         let mut worker = runtime.block_on(self.runtime.spawn(self.is_direct(), diagnostic()))?;
         let result = runtime.block_on(worker.call(
             "open",
-            json!({"name":info.name,"serial":self.serial}),
+            json!({"name":info.name,"serial":self.serial.as_deref().map(str::to_ascii_lowercase)}),
             15.,
             &CancellationToken::new(),
         ));
@@ -264,7 +359,13 @@ impl Driver {
                 .filter(|s| !s.is_empty())
                 .context("Regain did not report a camera serial")?;
             ensure!(
-                self.serial.as_deref().is_none_or(|s| s == serial),
+                self.serial
+                    .as_deref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case(serial))
+                    && info
+                        .serial
+                        .as_deref()
+                        .is_none_or(|s| s.eq_ignore_ascii_case(serial)),
                 "Camera serial changed"
             );
             let controls: Vec<regain_core::Control> =
@@ -680,6 +781,11 @@ fn parse_info(v: &Value) -> Result<CameraInfo> {
         "invalid camera bins"
     );
     Ok(CameraInfo {
+        serial: v["serial"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        discovery_error: v["discoveryError"].as_str().map(str::to_owned),
         name: v["name"]
             .as_str()
             .filter(|s| !s.is_empty())

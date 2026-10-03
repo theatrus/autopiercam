@@ -6,6 +6,7 @@ namespace AutoPierCam.Viewer;
 public sealed partial class MainWindow
 {
     private bool _cameraInventoryLoaded;
+    private bool _refreshingCameraChoices;
 
     private async Task RefreshCamerasAsync(CancellationToken cancellationToken, bool preserveSelection)
     {
@@ -26,16 +27,22 @@ public sealed partial class MainWindow
         CameraChoice? pending = preserveSelection ? CameraComboBox.SelectedItem as CameraChoice : null;
         int? selectedId = pending is not null ? pending.Id : _configurationSnapshot?.Config.Camera.CameraId;
         string? selectedFilter = pending is not null ? pending.NameFilter : _configurationSnapshot?.Config.Camera.NameContains;
-        IReadOnlyList<CameraChoice> choices = CameraChoice.Create(inventory, selectedId, selectedFilter);
-        CameraComboBox.ItemsSource = choices;
-        CameraComboBox.SelectedItem = CameraChoice.Selected(choices, selectedId, selectedFilter);
+        string? selectedSerial = preserveSelection ? SettingsFormValues.Text(CameraSerialTextBox.Text) : _configurationSnapshot?.Config.Camera.Serial;
+        IReadOnlyList<CameraChoice> choices = CameraChoice.Create(inventory, selectedId, selectedFilter, selectedSerial);
+        _refreshingCameraChoices = true;
+        try
+        {
+            CameraComboBox.ItemsSource = choices;
+            CameraComboBox.SelectedItem = CameraChoice.Selected(choices, selectedId, selectedFilter, selectedSerial);
+        }
+        finally { _refreshingCameraChoices = false; }
         _cameraInventoryLoaded = true;
         string scan = inventory.ScannedAtUnixMs is { } timestamp
             ? $"Last scan: {DateTimeOffset.FromUnixTimeMilliseconds(timestamp).ToLocalTime():T}. " : "Waiting for the first scan. ";
         CameraHelpText.Text = scan + (inventory.Error is not null
             ? $"Discovery failed: {inventory.Error}. "
             : inventory.Cameras.Any(camera => camera.IsColor) ? string.Empty : "No supported color cameras detected. ") +
-            "Cached during capture. Restart the agent after connecting a camera or after a driver fault. USB reconnects may change IDs.";
+            "Choose a camera to fill its serial. Unavailable serials include discovery errors when reported. This is the agent's cached inventory; automatic reconnect refreshes it. USB reconnects may change IDs.";
     }
 
     private async void RefreshCamerasButton_Click(object sender, RoutedEventArgs args)
@@ -47,6 +54,8 @@ public sealed partial class MainWindow
     {
         if (CameraNameFilterTextBox is not null)
         {
+            if (!_refreshingCameraChoices && !_operationInProgress && CameraComboBox.SelectedItem is CameraChoice choice)
+                CameraSerialTextBox.Text = choice.Serial ?? string.Empty;
             MarkSettingsEdited();
             SetControlsForOperation(_operationInProgress);
         }

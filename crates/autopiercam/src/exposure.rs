@@ -57,9 +57,15 @@ pub(crate) fn poll_timeout_ms(exposure_us: i64) -> i32 {
     (exposure_us.max(1) / 1_000 + 500).clamp(500, 2_000) as i32
 }
 
-pub(crate) fn preview_interval(max_fps: u32) -> Duration {
-    // Round up so integer division cannot exceed the requested maximum.
-    Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(max_fps.clamp(1, 30))))
+pub(crate) fn preview_interval(max_fps: f64) -> Duration {
+    // Config validation rejects non-finite/out-of-range rates. Keep timing safe
+    // even if called with an unchecked value, and round up to honor the cap.
+    let max_fps = if max_fps.is_finite() {
+        max_fps.clamp(0.01, 30.0)
+    } else {
+        2.0
+    };
+    Duration::from_nanos((1_000_000_000.0 / max_fps).ceil() as u64)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -68,7 +74,7 @@ pub(crate) struct PreviewCadence {
 }
 
 impl PreviewCadence {
-    pub(crate) fn take_slot(&mut self, now: std::time::Instant, max_fps: u32) -> bool {
+    pub(crate) fn take_slot(&mut self, now: std::time::Instant, max_fps: f64) -> bool {
         if self
             .last
             .is_some_and(|last| now.saturating_duration_since(last) < preview_interval(max_fps))
@@ -85,7 +91,7 @@ impl PreviewCadence {
 pub(crate) fn acquisition_delay(
     since_frame: Duration,
     exposure_us: i64,
-    max_fps: u32,
+    max_fps: f64,
     still_due_in: Option<Duration>,
     requested: bool,
 ) -> Duration {
@@ -140,6 +146,12 @@ impl FrameWait {
 
     pub(crate) fn elapsed(&self, now: Duration) -> Duration {
         now.saturating_sub(self.last_frame_at)
+    }
+
+    /// Intentional idle time with the stream stopped is not a missing frame.
+    /// Do not reset exposure history or forgive time spent in camera calls.
+    pub(crate) fn defer_by(&mut self, idle: Duration) {
+        self.last_frame_at = self.last_frame_at.saturating_add(idle);
     }
 
     pub(crate) fn timeout(&self) -> Duration {
@@ -253,50 +265,100 @@ mod tests {
     fn preview_cap_survives_extra_stills_rate_changes_and_delays() {
         let now = std::time::Instant::now();
         let mut cadence = PreviewCadence::default();
-        assert!(cadence.take_slot(now, 2));
+        assert!(cadence.take_slot(now, 2.0));
         for ms in 1..500 {
-            assert!(!cadence.take_slot(now + Duration::from_millis(ms), 2));
+            assert!(!cadence.take_slot(now + Duration::from_millis(ms), 2.0));
         }
-        assert!(cadence.take_slot(now + Duration::from_millis(500), 2));
+        assert!(cadence.take_slot(now + Duration::from_millis(500), 2.0));
         // Lowering the rate applies against the last emitted frame, not a reset clock.
-        assert!(!cadence.take_slot(now + Duration::from_secs(1), 1));
-        assert!(cadence.take_slot(now + Duration::from_millis(1500), 1));
-        assert!(cadence.take_slot(now + Duration::from_millis(1600), 10));
+        assert!(!cadence.take_slot(now + Duration::from_secs(1), 1.0));
+        assert!(cadence.take_slot(now + Duration::from_millis(1500), 1.0));
+        assert!(cadence.take_slot(now + Duration::from_millis(1600), 10.0));
         // Copying cadence across a recording epoch preserves the same cap.
         let mut reloaded = cadence;
-        assert!(!reloaded.take_slot(now + Duration::from_millis(1601), 10));
-        assert!(reloaded.take_slot(now + Duration::from_secs(10), 10));
-        assert!(!reloaded.take_slot(now + Duration::from_secs(10), 10));
+        assert!(!reloaded.take_slot(now + Duration::from_millis(1601), 10.0));
+        assert!(reloaded.take_slot(now + Duration::from_secs(10), 10.0));
+        assert!(!reloaded.take_slot(now + Duration::from_secs(10), 10.0));
     }
 
     #[test]
     fn preview_period_never_exceeds_requested_rate() {
-        assert_eq!(preview_interval(1), Duration::from_secs(1));
-        assert_eq!(preview_interval(2), Duration::from_millis(500));
+        assert_eq!(preview_interval(0.01), Duration::from_secs(100));
+        assert_eq!(preview_interval(0.1), Duration::from_secs(10));
+        assert_eq!(preview_interval(0.5), Duration::from_secs(2));
+        assert_eq!(preview_interval(1.0), Duration::from_secs(1));
+        assert_eq!(preview_interval(2.0), Duration::from_millis(500));
         for fps in 1..=30 {
-            assert!(preview_interval(fps) * fps >= Duration::from_secs(1));
+            assert!(preview_interval(f64::from(fps)) * fps >= Duration::from_secs(1));
         }
+    }
+
+    #[test]
+    fn fractional_rates_pace_acquisition_and_live_reload_without_bursts() {
+        let now = std::time::Instant::now();
+        let mut cadence = PreviewCadence::default();
+        assert!(cadence.take_slot(now, 2.0));
+        assert!(!cadence.take_slot(now + Duration::from_secs(1), 0.1));
+        assert!(!cadence.take_slot(now + Duration::from_millis(9999), 0.1));
+        assert!(cadence.take_slot(now + Duration::from_secs(10), 0.1));
+        assert!(!cadence.take_slot(now + Duration::from_secs(10), 0.1));
+        assert!(cadence.take_slot(now + Duration::from_millis(10500), 2.0));
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 50_000, 0.1, None, false),
+            Duration::from_millis(9950)
+        );
+        assert_eq!(
+            acquisition_delay(
+                Duration::ZERO,
+                50_000,
+                0.1,
+                Some(Duration::from_secs(1)),
+                false
+            ),
+            Duration::from_millis(950)
+        );
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 50_000, 0.1, None, true),
+            Duration::ZERO
+        );
+        assert_eq!(
+            acquisition_delay(Duration::ZERO, 30_000_000, 0.1, None, false),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn intentional_idle_does_not_consume_or_reset_the_exposure_deadline() {
+        let mut wait = FrameWait::new(50_000);
+        wait.frame_received(Duration::ZERO);
+        wait.defer_by(Duration::from_secs(100));
+        assert_eq!(
+            wait.elapsed(Duration::from_millis(100500)),
+            Duration::from_millis(500)
+        );
+        assert!(!wait.expired(Duration::from_millis(105099)));
+        assert!(wait.expired(Duration::from_millis(105100)));
     }
 
     #[test]
     fn daytime_acquisition_waits_but_long_exposures_are_uninterrupted() {
         assert_eq!(
-            acquisition_delay(Duration::ZERO, 50_000, 2, None, false),
+            acquisition_delay(Duration::ZERO, 50_000, 2.0, None, false),
             Duration::from_millis(450)
         );
         assert_eq!(
-            acquisition_delay(Duration::from_millis(100), 50_000, 2, None, false),
+            acquisition_delay(Duration::from_millis(100), 50_000, 2.0, None, false),
             Duration::from_millis(350)
         );
         for exposure in [500_000, 30_000_000, 60_000_000, 120_000_000] {
             assert_eq!(
-                acquisition_delay(Duration::ZERO, exposure, 2, None, false),
+                acquisition_delay(Duration::ZERO, exposure, 2.0, None, false),
                 Duration::ZERO
             );
         }
         // Slow processing never adds a catch-up sleep or a burst budget.
         assert_eq!(
-            acquisition_delay(Duration::from_secs(10), 50_000, 2, None, false),
+            acquisition_delay(Duration::from_secs(10), 50_000, 2.0, None, false),
             Duration::ZERO
         );
     }
@@ -304,18 +366,18 @@ mod tests {
     #[test]
     fn still_requests_can_acquire_sooner_than_preview_cadence() {
         assert_eq!(
-            acquisition_delay(Duration::ZERO, 50_000, 1, None, true),
+            acquisition_delay(Duration::ZERO, 50_000, 1.0, None, true),
             Duration::ZERO
         );
         assert_eq!(
-            acquisition_delay(Duration::ZERO, 50_000, 1, Some(Duration::ZERO), false),
+            acquisition_delay(Duration::ZERO, 50_000, 1.0, Some(Duration::ZERO), false),
             Duration::ZERO
         );
         assert_eq!(
             acquisition_delay(
                 Duration::ZERO,
                 50_000,
-                1,
+                1.0,
                 Some(Duration::from_millis(200)),
                 false
             ),
@@ -325,7 +387,7 @@ mod tests {
             acquisition_delay(
                 Duration::ZERO,
                 50_000,
-                1,
+                1.0,
                 Some(Duration::from_secs(10)),
                 false
             ),

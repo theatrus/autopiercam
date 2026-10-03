@@ -287,7 +287,6 @@ fn apply_worker_status(
 ) {
     let paused = status.state == AgentState::Paused;
     let summary = status_summary_text(status);
-    info!(paused, state = ?status.state, status = %summary, "capture worker status changed");
     *worker_paused = paused;
     pause_capture.set_checked(paused);
     status_summary.clone_from(&summary);
