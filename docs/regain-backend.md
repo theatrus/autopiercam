@@ -1,8 +1,10 @@
 # Regain camera backend
 
-AutoPierCam 0.2.16 uses Regain 0.5.3 plus targeted reconnect fixes in
-[Regain PR #10](https://github.com/pulsarfab/regain/pull/10), pinned to
-commit `416101a90b9b9d27696d91c9dd6bbc1055b4c52e` in Cargo.toml and Cargo.lock.
+Current source pins Regain 0.5.3 plus USB 2 fallback fixes in
+[Regain PR #11](https://github.com/pulsarfab/regain/pull/11), at
+commit `bd4238ad548f173821caef7807a0c01fda903801` in Cargo.toml and Cargo.lock.
+Published AutoPierCam 0.2.16 used targeted reconnect fixes from Regain PR #10
+but still rejected USB 2 connections to these color cameras.
 AutoPierCam 0.2.14 used the `v0.5.3.0` release; 0.2.13 used Regain 0.5.2.
 ASI662MC Direct USB requires AutoPierCam 0.2.13 or newer.
 There are no AutoPierCam SDK bindings. The `regain-device` entry
@@ -17,6 +19,23 @@ Settings has an explicit **Camera driver** choice:
   vendor library. The installer still includes the reviewed SDK DLL.
 - **Regain · ZWO Direct USB** (experimental): ASI662MC and ASI676MC support
   RAW16, bin 1, and exposures from 32 microseconds to 2,000 seconds.
+
+Current source supports USB 2 high-speed as well as USB 3 for both models.
+The bus negotiates the link; this does not switch backends or reset a port.
+Regain checks the model, serial and bulk endpoint layout, and logs the selected
+transport. USB 2 uses 512-byte bulk packets. Very short Bayer exposures use a
+roughly 100 ms sensor frame interval while preserving integration time; this
+prevents the observed ASI676 short-ROI retained-frame mismatch. USB 3 and
+host-timed long-exposure timing remain unchanged.
+
+Operator-authorized Windows USB 2 checks passed on ASI662MC and ASI676MC:
+full-resolution frames, 30-second exposures, byte-identical retained replay,
+deliberately interrupted host reads and non-packet-aligned ROI. The ASI676
+production worker also passed close/reopen with cached identity. These are
+not tests of physical USB disconnect/reset, optical accuracy, cold power-up,
+or the installed Viewer's complete SDK-to-Direct handoff. Other Regain camera
+models have the shared transport fallback but await USB 2 hardware validation.
+See [upstream USB 2 evidence](https://github.com/pulsarfab/regain/blob/bd4238ad548f173821caef7807a0c01fda903801/docs/usb2-cameras.md).
 
 SDK remains the default; existing configurations do not switch drivers.
 There is no automatic fallback.
