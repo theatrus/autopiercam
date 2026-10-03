@@ -225,6 +225,26 @@ fn blank_serial_filters_open_a_single_matching_camera() {
 }
 
 #[test]
+fn blank_config_retains_verified_identity_across_driver_replacement() {
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        let first = driver(backend, json!({}), None);
+        let camera = first.open(first.cameras().unwrap().remove(0)).unwrap();
+        let mut verified = camera.info().clone();
+        assert!(verified.serial.is_some());
+        drop(camera);
+        drop(first);
+        let replacement = driver(backend, json!({}), None);
+        drop(replacement.open(verified.clone()).unwrap());
+        verified.serial = Some("different-camera".into());
+        assert!(replacement.open(verified).is_err());
+        assert!(
+            replacement.selected_serial().is_none(),
+            "must not mutate saved selection"
+        );
+    }
+}
+
+#[test]
 fn managed_white_balance_is_shared_and_precedes_raw8_conversion() {
     use autopiercam_core::config::{WhiteBalanceConfig, WhiteBalanceMode};
     use regain_core::white_balance::{Gains, Geometry, Mode, Output, Settings, WhiteBalance};

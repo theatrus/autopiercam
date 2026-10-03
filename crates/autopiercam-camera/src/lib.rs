@@ -329,6 +329,10 @@ impl Driver {
             .collect()
     }
     pub fn open(self: &Arc<Self>, info: CameraInfo) -> Result<Camera> {
+        ensure!(
+            !self.is_direct() || self.runtime.simulate || info.locator.is_some(),
+            "Direct USB requires a selected interface; refusing a serial sweep"
+        );
         let mut owned = self
             .owned
             .lock()
