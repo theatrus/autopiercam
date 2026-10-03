@@ -51,6 +51,8 @@ impl ImageType {
 }
 #[derive(Clone, Debug)]
 pub struct CameraInfo {
+    /// Opaque Direct USB topology selector. Not persisted or exposed over IPC.
+    pub locator: Option<String>,
     pub serial: Option<String>,
     pub discovery_error: Option<String>,
     pub name: String,
@@ -249,10 +251,11 @@ impl Driver {
                 cfg!(windows),
                 "USB port recovery currently requires Windows"
             );
-            let encoded = executor()?.block_on(self.runtime.usb_command(
-                &["zwo", "camera-direct", "--usb-target", &info.name, serial],
-                30,
-            ))?;
+            let mut args = vec!["zwo", "camera-direct", "--usb-target", &info.name, serial];
+            if let Some(locator) = &info.locator {
+                args.push(locator);
+            }
+            let encoded = executor()?.block_on(self.runtime.usb_command(&args, 30))?;
             let target = regain_transport::usb::Target::decode(&encoded)?;
             ensure!(
                 target.serial.eq_ignore_ascii_case(serial),
@@ -314,12 +317,7 @@ impl Driver {
         let list = runtime.block_on(async {
             let mut worker = self.runtime.spawn(self.is_direct(), diagnostic()).await?;
             let result = worker
-                .call(
-                    "list",
-                    json!({"serials":true}),
-                    30.,
-                    &CancellationToken::new(),
-                )
+                .call("list", json!({}), 30., &CancellationToken::new())
                 .await;
             worker.kill().await;
             result.map(|r| r.0)
@@ -331,6 +329,10 @@ impl Driver {
             .collect()
     }
     pub fn open(self: &Arc<Self>, info: CameraInfo) -> Result<Camera> {
+        ensure!(
+            !self.is_direct() || self.runtime.simulate || info.locator.is_some(),
+            "Direct USB requires a selected interface; refusing a serial sweep"
+        );
         let mut owned = self
             .owned
             .lock()
@@ -338,14 +340,19 @@ impl Driver {
         ensure!(!*owned, "A camera already owns this driver");
         let runtime = executor()?;
         let mut worker = runtime.block_on(self.runtime.spawn(self.is_direct(), diagnostic()))?;
-        let result = runtime.block_on(worker.call(
-            "open",
-            json!({"name":info.name,"serial":self.serial.as_deref().map(str::to_ascii_lowercase)}),
-            15.,
-            &CancellationToken::new(),
-        ));
+        let mut selection =
+            json!({"name":info.name,"serial":self.serial.as_deref().or(info.serial.as_deref())});
+        if self.is_direct() {
+            if let Some(locator) = &info.locator {
+                selection["locator"] = json!(locator);
+            }
+        } else {
+            selection["id"] = json!(info.camera_id);
+        }
+        let result =
+            runtime.block_on(worker.call("open", selection, 15., &CancellationToken::new()));
         let parsed = result.and_then(|(v, _)| {
-            let actual = parse_info(&v["info"])?;
+            let mut actual = parse_info(&v["info"])?;
             ensure!(
                 actual.name == info.name
                     && (self.serial.is_some() || actual.camera_id == info.camera_id)
@@ -368,6 +375,7 @@ impl Driver {
                         .is_none_or(|s| s.eq_ignore_ascii_case(serial)),
                 "Camera serial changed"
             );
+            actual.serial = Some(serial.to_owned());
             let controls: Vec<regain_core::Control> =
                 serde_json::from_value(v["controls"].clone())?;
             let controls: BTreeMap<_, _> = controls.into_iter().map(|c| (c.kind, c)).collect();
@@ -781,6 +789,7 @@ fn parse_info(v: &Value) -> Result<CameraInfo> {
         "invalid camera bins"
     );
     Ok(CameraInfo {
+        locator: v["locator"].as_str().map(str::to_owned),
         serial: v["serial"]
             .as_str()
             .filter(|s| !s.is_empty())

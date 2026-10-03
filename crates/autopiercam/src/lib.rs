@@ -7,7 +7,7 @@ use autopiercam_camera::{
 use autopiercam_core::config::ExposureControl;
 use autopiercam_core::exposure::{AdaptiveExposure, ExposureSetting, LightMode};
 use autopiercam_core::{
-    config::{CameraConfig, Config, UploadConfig, normalize_upload_endpoint},
+    config::{CameraConfig, CameraDriver, Config, UploadConfig, normalize_upload_endpoint},
     image::{BayerPattern, demosaic_bilinear, luma_stats, raw8_stats},
 };
 use autopiercam_protocol::{
@@ -171,6 +171,7 @@ impl AgentControl {
 /// Read-only runtime status shared with the tray and local IPC server.
 #[derive(Clone, Debug)]
 pub struct AgentMonitor {
+    discovery: Arc<Mutex<CameraDiscovery>>,
     last_usb_recovery: Arc<Mutex<Option<Instant>>>,
     inner: Arc<RwLock<AgentStatus>>,
     camera_progress_at: Arc<RwLock<Instant>>,
@@ -178,6 +179,103 @@ pub struct AgentMonitor {
     capturing_generation: Arc<AtomicU64>,
     upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
     upload_admin_generation: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CameraSelection {
+    driver: CameraDriver,
+    id: Option<i32>,
+    name: Option<String>,
+    serial: Option<String>,
+}
+impl From<&CameraConfig> for CameraSelection {
+    fn from(c: &CameraConfig) -> Self {
+        Self {
+            driver: c.driver,
+            id: c.camera_id,
+            name: c.name_contains.clone(),
+            serial: c.serial.clone(),
+        }
+    }
+}
+
+/// Capture-thread-only discovery policy, retained across worker replacement.
+/// A capture fault must not become permission to probe every attached camera.
+#[derive(Debug, Default)]
+struct CameraDiscovery {
+    driver: Option<CameraDriver>,
+    inventory: Option<Vec<CameraInfo>>,
+    selected: Option<(CameraSelection, CameraInfo)>,
+    retry_at: Option<Instant>,
+    failures: u32,
+    error: Option<String>,
+}
+impl CameraDiscovery {
+    fn select(
+        &mut self,
+        config: &CameraConfig,
+        now: Instant,
+        scan: impl FnOnce() -> Result<Vec<CameraInfo>>,
+    ) -> Result<CameraInfo> {
+        if self.driver != Some(config.driver) {
+            *self = Self {
+                driver: Some(config.driver),
+                ..Self::default()
+            };
+        }
+        let key = CameraSelection::from(config);
+        if let Some((saved, info)) = &self.selected
+            && *saved == key
+        {
+            return Ok(info.clone());
+        }
+        if self.inventory.is_none() {
+            if let Some(deadline) = self.retry_at.filter(|t| *t > now) {
+                bail!(
+                    "camera discovery cooling down for {} seconds: {}",
+                    deadline.duration_since(now).as_secs(),
+                    self.error.as_deref().unwrap_or("discovery failed")
+                );
+            }
+            match scan() {
+                Ok(list) if !list.is_empty() => {
+                    self.inventory = Some(list);
+                    self.failures = 0;
+                    self.retry_at = None;
+                    self.error = None;
+                }
+                result => {
+                    self.failures = self.failures.saturating_add(1);
+                    let delay = Duration::from_secs(
+                        (300u64 << self.failures.min(4).saturating_sub(1)).min(1800),
+                    );
+                    self.retry_at = Some(now + delay);
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| anyhow!("no connected cameras"));
+                    self.error = Some(format!("{error:#}"));
+                    return Err(error.context(format!(
+                        "discovery failed; hardware discovery delayed {} seconds",
+                        delay.as_secs()
+                    )));
+                }
+            }
+        }
+        select_configured_camera(
+            self.inventory.clone().expect("successful inventory"),
+            config,
+        )
+    }
+    fn remember(&mut self, config: &CameraConfig, info: &CameraInfo) {
+        self.selected = Some((CameraSelection::from(config), info.clone()));
+        if let Some(inventory) = &mut self.inventory {
+            for cached in inventory {
+                if cached.camera_id == info.camera_id && cached.locator == info.locator {
+                    *cached = info.clone();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +450,7 @@ impl AgentMonitor {
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
+            discovery: Arc::new(Mutex::new(CameraDiscovery::default())),
             last_usb_recovery: Arc::new(Mutex::new(None)),
             camera_progress_at: Arc::new(RwLock::new(Instant::now())),
             cameras: Arc::new(RwLock::new(CameraList::default())),
@@ -1187,7 +1286,6 @@ fn run_agent_inner(
 ) -> Result<()> {
     // Publish choices only before opening a camera. ASIGetCameraProperty internally
     // opens devices and can hang; never enumerate from acquisition/settling loops.
-    let cameras = monitor.scan_cameras(sdk)?;
     if max_frames == Some(0) {
         bail!("--max-frames must be greater than zero");
     }
@@ -1197,7 +1295,11 @@ fn run_agent_inner(
     // Keep the same preview session even when recording services are reconfigured.
     let local_preview = preview.is_none().then(|| PreviewHub::new().begin_session());
     let preview = preview.or(local_preview.as_ref());
-    let info = select_configured_camera(cameras, &config.camera)?;
+    let info = monitor
+        .discovery
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .select(&config.camera, Instant::now(), || monitor.scan_cameras(sdk))?;
     if !info.is_color {
         bail!(
             "{} is not a color camera; AutoPierCam requires a color ASI camera",
@@ -1216,6 +1318,23 @@ fn run_agent_inner(
         }
     }
     let mut camera = sdk.open(info.clone())?;
+    monitor
+        .discovery
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remember(&config.camera, camera.info());
+    // Publish the selected camera's verified serial without probing the others.
+    {
+        let mut inventory = monitor.cameras.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = inventory
+            .cameras
+            .iter_mut()
+            .find(|c| c.id == camera.info().camera_id && c.name == camera.info().name)
+        {
+            entry.serial = Some(camera.serial().to_owned());
+            entry.discovery_error = None;
+        }
+    }
     monitor.set_camera(camera.info());
     info!(serial = camera.serial(), "Regain camera identity verified");
     let controls = camera.controls()?;
@@ -2114,14 +2233,20 @@ fn select_camera(sdk: &Arc<Driver>, camera_id: Option<i32>) -> Result<CameraInfo
 }
 
 fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> Result<CameraInfo> {
-    let inventory = cameras.clone();
+    let known_serial = config.serial.as_deref().is_some_and(|serial| {
+        cameras.iter().any(|c| {
+            c.serial
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(serial))
+        })
+    });
     let mut cameras = cameras.into_iter().filter(|camera| {
         config.serial.as_deref().is_none_or(|serial| {
             camera
                 .serial
                 .as_deref()
-                .is_none_or(|found| found.eq_ignore_ascii_case(serial))
-        }) && (config.serial.is_some()
+                .map_or(!known_serial, |found| found.eq_ignore_ascii_case(serial))
+        }) && (known_serial
             || config
                 .camera_id
                 .is_none_or(|camera_id| camera.camera_id == camera_id))
@@ -2135,17 +2260,9 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
     let selected = cameras
         .next()
         .ok_or_else(|| anyhow!("no connected camera matches the configuration"))?;
-    if config.serial.is_none() && inventory.iter().filter(|c| c.name == selected.name).count() > 1 {
-        bail!("several cameras have this model; enter the exact camera serial in Settings");
-    }
-    // Regain direct inventory uses one model descriptor for identical units.
-    // An explicit serial selects the physical device in the worker; this only
-    // selects equivalent metadata. Without a serial, ambiguity is an error.
-    if cameras.any(|other| {
-        config.serial.is_none()
-            || other.name != selected.name
-            || (other.serial.is_some() && selected.serial.is_some())
-    }) {
+    // Unknown identities are not permission for a serial sweep. We must resolve
+    // one descriptor/interface before the worker opens any handle.
+    if cameras.next().is_some() {
         bail!(
             "more than one connected camera matches the configuration; choose a camera in the Viewer and save settings"
         );
@@ -2567,6 +2684,7 @@ mod tests {
 
     fn detected_camera(id: i32, name: &str) -> CameraInfo {
         CameraInfo {
+            locator: None,
             serial: None,
             discovery_error: None,
             camera_id: id,
@@ -2620,7 +2738,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_models_require_serial_and_ignore_stale_ids_when_serial_is_explicit() {
+    fn duplicate_unknown_models_cannot_trigger_a_serial_sweep() {
         let cameras = vec![
             detected_camera(3, "ASI676MC"),
             detected_camera(7, "ASI676MC"),
@@ -2630,15 +2748,118 @@ mod tests {
             name_contains: Some("ASI676MC".into()),
             ..CameraConfig::default()
         };
-        assert!(
+        assert_eq!(
             select_configured_camera(cameras.clone(), &config)
-                .unwrap_err()
-                .to_string()
-                .contains("serial")
+                .unwrap()
+                .camera_id,
+            7
         );
+        config.camera_id = None;
+        assert!(select_configured_camera(cameras.clone(), &config).is_err());
         config.serial = Some("explicit-selection".into());
         config.camera_id = Some(99);
-        assert!(select_configured_camera(cameras, &config).is_ok());
+        assert!(select_configured_camera(cameras, &config).is_err());
+    }
+
+    #[test]
+    fn discovery_cache_survives_retries_and_nonidentity_settings_changes() {
+        let mut cache = CameraDiscovery::default();
+        let mut config = CameraConfig::default();
+        let now = Instant::now();
+        let mut scans = 0;
+        let info = cache
+            .select(&config, now, || {
+                scans += 1;
+                Ok(vec![detected_camera(7, "ASI662MC")])
+            })
+            .unwrap();
+        // Even failed opens reuse inventory; successful opens pin verified serial.
+        cache
+            .select(&config, now, || panic!("retry rescanned"))
+            .unwrap();
+        let mut verified = info;
+        verified.serial = Some("0101010101010101".into());
+        verified.locator = Some("fixture-interface".into());
+        cache.remember(&config, &verified);
+        config.max_gain = 123;
+        for attempt in 1..100 {
+            let found = cache
+                .select(&config, now + Duration::from_secs(30 * attempt), || {
+                    scans += 1;
+                    bail!("must not enumerate")
+                })
+                .unwrap();
+            assert_eq!(found.serial, verified.serial);
+            assert_eq!(found.locator, verified.locator);
+        }
+        assert_eq!(scans, 1);
+        config.camera_id = Some(8);
+        assert!(
+            cache
+                .select(&config, now, || panic!("selection change rescanned"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_and_empty_discovery_have_independent_capped_backoff() {
+        for empty in [false, true] {
+            let mut cache = CameraDiscovery::default();
+            let config = CameraConfig::default();
+            let mut now = Instant::now();
+            for expected_delay in [300, 600, 1200, 1800, 1800] {
+                let mut calls = 0;
+                assert!(
+                    cache
+                        .select(&config, now, || {
+                            calls += 1;
+                            if empty {
+                                Ok(vec![])
+                            } else {
+                                bail!("fixture hung")
+                            }
+                        })
+                        .is_err()
+                );
+                for elapsed in (30..expected_delay).step_by(30) {
+                    assert!(
+                        cache
+                            .select(&config, now + Duration::from_secs(elapsed), || panic!(
+                                "discovery cooldown bypassed"
+                            ))
+                            .is_err()
+                    );
+                }
+                assert_eq!(calls, 1);
+                assert_eq!(
+                    cache.retry_at,
+                    Some(now + Duration::from_secs(expected_delay))
+                );
+                now += Duration::from_secs(expected_delay);
+            }
+            cache
+                .select(&config, now, || Ok(vec![detected_camera(1, "fixture")]))
+                .unwrap();
+            assert_eq!(cache.failures, 0);
+            assert!(cache.retry_at.is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_cache_does_not_cross_backends() {
+        let mut cache = CameraDiscovery::default();
+        let mut config = CameraConfig::default();
+        let now = Instant::now();
+        let info = cache
+            .select(&config, now, || Ok(vec![detected_camera(1, "SDK")]))
+            .unwrap();
+        cache.remember(&config, &info);
+        config.driver = CameraDriver::ZwoDirect;
+        let direct = cache
+            .select(&config, now, || Ok(vec![detected_camera(26155, "Direct")]))
+            .unwrap();
+        assert_eq!(direct.name, "Direct");
+        assert!(cache.selected.is_none());
     }
 
     #[test]
@@ -2904,6 +3125,7 @@ mod tests {
     fn agent_monitor_publishes_cloneable_protocol_status() {
         let monitor = AgentMonitor::new();
         monitor.set_camera(&CameraInfo {
+            locator: None,
             serial: None,
             discovery_error: None,
             camera_id: 7,

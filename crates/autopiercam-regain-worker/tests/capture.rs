@@ -94,7 +94,10 @@ fn asi662_direct_full_frame_and_centered_roi() {
         .expect("pinned Regain must advertise ASI662MC Direct USB");
     assert_eq!((info.max_width, info.max_height), (1920, 1080));
     assert!(info.is_color);
-    assert_eq!(info.serial.as_deref(), Some("direct-simulator"));
+    assert!(
+        info.serial.is_none(),
+        "inventory must not probe device serials"
+    );
     assert_eq!(info.bayer_pattern, autopiercam_camera::BayerPattern::Rg);
     assert_eq!(info.supported_bins, vec![1]);
     let mut camera = driver.open(info).unwrap();
@@ -177,16 +180,32 @@ fn asi662_direct_full_frame_and_centered_roi() {
 }
 
 #[test]
-fn discovered_serials_accept_case_variants_and_reject_mismatches() {
+fn selected_serials_accept_case_variants_and_reject_mismatches() {
     for (backend, serial) in [
         (CameraDriver::ZwoSdk, "SIM00001"),
         (CameraDriver::ZwoDirect, "DIRECT-SIMULATOR"),
     ] {
         let driver = driver(backend, json!({}), Some(serial.into()));
         let info = driver.cameras().unwrap().remove(0);
-        assert!(info.serial.as_deref().unwrap().eq_ignore_ascii_case(serial));
+        assert!(info.serial.is_none());
         let camera = driver.open(info.clone()).unwrap();
+        assert!(
+            camera
+                .info()
+                .serial
+                .as_deref()
+                .unwrap()
+                .eq_ignore_ascii_case(serial)
+        );
+        let verified = camera.info().clone();
         drop(camera);
+        // A new worker reopens the cached selected ID/interface without list.
+        drop(driver.open(verified.clone()).unwrap());
+        if backend == CameraDriver::ZwoDirect {
+            let mut missing = verified;
+            missing.locator = Some("missing-interface".into());
+            assert!(driver.open(missing).is_err());
+        }
         let mut changed = info;
         changed.serial = Some("different-device".into());
         assert!(driver.open(changed).is_err());
@@ -202,6 +221,26 @@ fn blank_serial_filters_open_a_single_matching_camera() {
             let info = driver.cameras().unwrap().remove(0);
             drop(driver.open(info).unwrap());
         }
+    }
+}
+
+#[test]
+fn blank_config_retains_verified_identity_across_driver_replacement() {
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        let first = driver(backend, json!({}), None);
+        let camera = first.open(first.cameras().unwrap().remove(0)).unwrap();
+        let mut verified = camera.info().clone();
+        assert!(verified.serial.is_some());
+        drop(camera);
+        drop(first);
+        let replacement = driver(backend, json!({}), None);
+        drop(replacement.open(verified.clone()).unwrap());
+        verified.serial = Some("different-camera".into());
+        assert!(replacement.open(verified).is_err());
+        assert!(
+            replacement.selected_serial().is_none(),
+            "must not mutate saved selection"
+        );
     }
 }
 
