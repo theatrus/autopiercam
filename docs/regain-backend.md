@@ -1,6 +1,8 @@
 # Regain camera backend
 
-AutoPierCam 0.2.19 adopts Regain 0.5.6 from its `v0.5.6.0` release, including
+Current source pins Regain framing recovery commit `346abbc3d22c` for bounded
+in-worker recovery of a malformed Direct USB video frame. Published
+AutoPierCam 0.2.19 adopted Regain 0.5.6 from its `v0.5.6.0` release, including
 ASI676MC Direct USB video in [Regain PR #13](https://github.com/pulsarfab/regain/pull/13),
 following the ASI662MC video support adopted in AutoPierCam 0.2.18.
 Cargo.toml and Cargo.lock pin the exact upstream commit.
@@ -16,7 +18,7 @@ framed transport, deadlines and process supervision.
 
 ASI662MC/ASI676MC Direct USB uses the worker's advertised video mode for exposures up to
 30 seconds. Longer exposures use retained still capture without lowering the
-configured exposure ceiling. SDK behavior is unchanged.
+configured exposure ceiling. SDK uses still exposures.
 
 Video reuses sensor setup and calibration, honors the configured fractional FPS
 cap on grabs (including settling), and preserves that cap across adaptive exposure
@@ -24,6 +26,50 @@ changes. Intentional worker FPS waits are included in the stall budget. Stopping
 capture cancels video even between frames. No background downloads, discovery
 sweeps or physical USB resets were added. Sensor output is not itself FPS-limited:
 slow consumers can receive buffered frames, not necessarily the newest scene.
+
+When a newer worker advertises `videoFrameRecoveryAttempts: 1`, the adapter
+reserves a second FPS interval plus 15 seconds of stream-restart overhead in
+addition to the existing two-exposure/five-second frame deadline. The allowance
+is retained for an in-flight request even if FPS is edited. Legacy workers and
+still/SDK capture keep their existing budgets. This capability-aware support
+is paired with the upstream framing-recovery commit in the current source pin.
+Invalid pixels are never accepted. This is not a new published release.
+
+### Fault diagnosis and bounded recovery
+
+Current source retries an SDK `ASI_EXP_FAILED` (status 3) once by stopping and
+starting a fresh exposure on the same handle. This is an exposure status, not
+an SDK API error code. The original outer frame deadline remains in force;
+no configuration, disconnect, download or arbitrary SDK API error is silently
+retried. If the fresh exposure also fails, normal 30-second session recovery
+still applies. Direct video similarly discards one malformed frame and restarts
+its stream once; it never delivers malformed pixels or substitutes a replay.
+
+At normal INFO logging, session startup identifies the backend and model.
+Direct USB reports negotiated transport/packet size; SDK reports its
+`usb3Host` flag separately from the camera's USB 3 capability (a capable camera
+can be attached via USB 2). These use already-opened camera information, not
+extra discovery or USB probes. A health summary is emitted on successful frames
+at most once per minute. Routine Regain phases remain DEBUG.
+
+A failed request or interruption of an unfinished capture emits a diagnostic
+snapshot: exposure, gain, ROI, FPS cap, capture mode, elapsed request time, age
+of the last valid frame, frame/recovery counts and the last 24 operational
+breadcrumbs with relative times. Each breadcrumb is capped at 1,024 characters;
+frame pixels and inventory responses are excluded. Worker errors retain the
+operation, parent request deadline and native error chain. Include startup and
+the first fault/recovery lines when reporting a failure, not just the last
+status line. Existing identity logs may contain camera serials: redact these
+before public issue reports. Diagnostics require no special debug build on the
+affected machine once this change is released.
+
+These changes do not establish that USB interference caused the reported
+failure. Local capped ASI662MC USB 2 checks passed seven fixed 60-second frames
+through each backend, including settling and saving. Both the released and
+candidate Direct workers passed the 6.4/25/25/6.4/25-second transition sequence
+without reproducing the reported malformed frame. Synthetic fault tests cover
+the recovery paths; these successful local captures are not evidence that the
+problem machine's cable, hub, power or controller is reliable.
 
 Upstream Windows USB 2 and USB 3 video matrices for each model passed 21 frames covering
 ROI/full-frame, exposures through 30 seconds, fractional FPS, cancellation,

@@ -61,6 +61,43 @@ fn frame(camera: &mut Camera) -> Vec<u8> {
     }
 }
 #[test]
+fn sdk_failed_exposure_retries_once_without_reopening_or_delivering_bad_pixels() {
+    let driver = driver(
+        CameraDriver::ZwoSdk,
+        json!({"instant":true,"failedStatuses":1}),
+        None,
+    );
+    let mut camera = setup(&driver);
+    let mut pixels = vec![123; 7];
+    assert!(camera.poll_frame(&mut pixels, 50).unwrap_err().is_timeout());
+    assert_eq!(pixels, vec![123; 7]);
+    assert!(driver.cameras().is_err());
+    assert_eq!(frame(&mut camera).len(), 64 * 64 * 2);
+    assert_eq!(frame(&mut camera).len(), 64 * 64 * 2);
+}
+
+#[test]
+fn sdk_repeated_failed_exposure_is_bounded_and_can_stop_after_first_failure() {
+    let driver = driver(
+        CameraDriver::ZwoSdk,
+        json!({"instant":true,"failedStatuses":2}),
+        None,
+    );
+    let mut camera = setup(&driver);
+    let mut pixels = vec![123; 7];
+    assert!(camera.poll_frame(&mut pixels, 50).unwrap_err().is_timeout());
+    let error = camera.poll_frame(&mut pixels, 50).unwrap_err();
+    assert!(!error.is_timeout());
+    assert!(error.to_string().contains("state Some(3)"));
+    assert_eq!(pixels, vec![123; 7]);
+    drop(camera);
+    let driver = self::driver(CameraDriver::ZwoSdk, json!({"failedStatuses":1}), None);
+    let mut camera = setup(&driver);
+    assert!(camera.poll_frame(&mut pixels, 50).unwrap_err().is_timeout());
+    camera.stop_capture().unwrap();
+}
+
+#[test]
 fn asi662_video_preserves_fps_across_idle_and_exposure_changes() {
     video_preserves_fps_across_idle_and_exposure_changes("ZWO ASI662MC");
 }
@@ -93,7 +130,7 @@ fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
         assert!(camera.set_max_fps(invalid).is_err());
     }
     assert!(camera.uses_video());
-    assert_eq!(camera.pacing_allowance(), Duration::from_secs(2));
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(19));
     camera.start_capture().unwrap();
     frame(&mut camera);
     let first = Instant::now();
@@ -125,9 +162,10 @@ fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
             .unwrap_err()
             .is_timeout()
     );
-    // Raising FPS does not hide the in-flight 100-second pacing allowance.
+    // Raising FPS does not hide either in-flight 100-second pacing slot or
+    // the advertised stream-recovery overhead.
     camera.set_max_fps(30.0).unwrap();
-    assert_eq!(camera.pacing_allowance(), Duration::from_secs(100));
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(215));
     let stopping = Instant::now();
     camera.stop_capture().unwrap();
     assert!(stopping.elapsed() < Duration::from_secs(3));
