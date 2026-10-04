@@ -212,7 +212,7 @@
                                 <ComboBoxItem Content="Regain · ZWO Direct USB (experimental)" Tag="zwo_direct" />
                             </ComboBox>
                             <TextBox x:Name="CameraSerialTextBox" Header="Camera serial (optional for one matching camera)" PlaceholderText="Verified after connection; optionally enter the expected serial" IsEnabled="False" />
-                            <TextBlock Text="ASI662MC and ASI676MC support Direct USB: RAW16, bin 1, up to 2,000 s. Changing drivers restarts capture."
+                            <TextBlock Text="ASI662MC and ASI676MC support Direct USB over USB 2 or USB 3: RAW16, bin 1, up to 2,000 s. USB 2 has lower throughput. Changing drivers restarts capture."
                                        FontSize="12" TextWrapping="Wrap" />
                             <TextBlock Text="Camera" />
                             <ComboBox

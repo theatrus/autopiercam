@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.16 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.17 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.16)](https://github.com/theatrus/autopiercam/releases/download/v0.2.16/AutoPierCam-0.2.16-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.16)
+[Download the signed Windows x64 installer (0.2.17)](https://github.com/theatrus/autopiercam/releases/download/v0.2.17/AutoPierCam-0.2.17-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.17)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,14 +25,14 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.16 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+Version 0.2.17 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-Version 0.2.16 fixes repeated discovery during recovery: reconnects reuse cached
-camera identity, and failed discovery backs off independently. Automatic startup
-no longer opens every camera to read serials. It retains 0.2.15's opt-in camera-port
-recovery, fractional preview rates down to 0.01 fps, and quieter transition logs.
+Version 0.2.17 adopts Regain 0.5.4, enabling validated USB 2 high-speed Direct USB
+connections and fixing short-exposure retained reads. It retains cached camera
+identity and discovery backoff, opt-in camera-port recovery, fractional preview
+rates down to 0.01 fps, and quieter transition logs.
 Capture still retries after 30 seconds; SDK remains the default. USB recovery
 requires an explicit serial and an administrator-started agent, and is off by default.
 See [driver limits and validation](docs/regain-backend.md).
