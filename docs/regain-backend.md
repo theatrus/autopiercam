@@ -71,6 +71,13 @@ without reproducing the reported malformed frame. Synthetic fault tests cover
 the recovery paths; these successful local captures are not evidence that the
 problem machine's cable, hub, power or controller is reliable.
 
+The updated AutoPierCam USB 2 Direct pipeline also passed a capped gain-300
+adaptive ramp: 6.4 seconds, 25.6 seconds, then four 60-second frames. Exposure
+settled after six total frames (277.8 seconds), saved one still, and exited
+cleanly. This covered the video-to-still transition with a 0.5 FPS cap and USB
+reset disabled. Post-test edits only clarified diagnostic field names and
+preserved full error-chain display; recovery logic was unchanged.
+
 Upstream Windows USB 2 and USB 3 video matrices for each model passed 21 frames covering
 ROI/full-frame, exposures through 30 seconds, fractional FPS, cancellation,
 restart and a still regression. This is not a long-running stability or optical
