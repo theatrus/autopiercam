@@ -62,12 +62,19 @@ fn frame(camera: &mut Camera) -> Vec<u8> {
 }
 #[test]
 fn asi662_video_preserves_fps_across_idle_and_exposure_changes() {
+    video_preserves_fps_across_idle_and_exposure_changes("ZWO ASI662MC");
+}
+#[test]
+fn asi676_video_preserves_fps_across_idle_and_exposure_changes() {
+    video_preserves_fps_across_idle_and_exposure_changes("ZWO ASI676MC");
+}
+fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
     let driver = driver(CameraDriver::ZwoDirect, json!({}), None);
     let info = driver
         .cameras()
         .unwrap()
         .into_iter()
-        .find(|c| c.name == "ZWO ASI662MC")
+        .find(|c| c.name == name)
         .unwrap();
     let mut camera = driver.open(info).unwrap();
     camera

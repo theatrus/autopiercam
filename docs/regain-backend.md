@@ -1,7 +1,8 @@
 # Regain camera backend
 
-AutoPierCam 0.2.18 adopts Regain 0.5.5 from its `v0.5.5.0` release, including
-ASI662MC Direct USB video in [Regain PR #12](https://github.com/pulsarfab/regain/pull/12).
+AutoPierCam 0.2.19 adopts Regain 0.5.6 from its `v0.5.6.0` release, including
+ASI676MC Direct USB video in [Regain PR #13](https://github.com/pulsarfab/regain/pull/13),
+following the ASI662MC video support adopted in AutoPierCam 0.2.18.
 Cargo.toml and Cargo.lock pin the exact upstream commit.
 Published AutoPierCam 0.2.16 used targeted reconnect fixes from Regain PR #10
 but still rejected USB 2 connections to these color cameras.
@@ -13,10 +14,9 @@ framed transport, deadlines and process supervision.
 
 ## Selection
 
-ASI662MC Direct USB uses the worker's advertised video mode for exposures up to
+ASI662MC/ASI676MC Direct USB uses the worker's advertised video mode for exposures up to
 30 seconds. Longer exposures use retained still capture without lowering the
-configured exposure ceiling. ASI676MC remains on still capture until its own
-video validation is complete. SDK behavior is unchanged.
+configured exposure ceiling. SDK behavior is unchanged.
 
 Video reuses sensor setup and calibration, honors the configured fractional FPS
 cap on grabs (including settling), and preserves that cap across adaptive exposure
@@ -25,7 +25,7 @@ capture cancels video even between frames. No background downloads, discovery
 sweeps or physical USB resets were added. Sensor output is not itself FPS-limited:
 slow consumers can receive buffered frames, not necessarily the newest scene.
 
-Upstream Windows USB 2 and USB 3 video matrices each passed 21 frames covering
+Upstream Windows USB 2 and USB 3 video matrices for each model passed 21 frames covering
 ROI/full-frame, exposures through 30 seconds, fractional FPS, cancellation,
 restart and a still regression. This is not a long-running stability or optical
 accuracy guarantee. AutoPierCam adapter/pipeline tests use isolated simulators.

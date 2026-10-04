@@ -389,7 +389,7 @@ impl Driver {
                 );
             }
             let video_limit = if self.is_direct()
-                && actual.name == "ZWO ASI662MC"
+                && matches!(actual.name.as_str(), "ZWO ASI662MC" | "ZWO ASI676MC")
                 && v["captureModes"]
                     .as_array()
                     .is_some_and(|m| m.contains(&json!("video")))
