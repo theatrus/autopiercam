@@ -21,6 +21,12 @@ struct Options {
     backend: String,
     #[arg(long)]
     sdk: Option<PathBuf>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "6400000,25000000,25000000,60000000,234000"
+    )]
+    exposures_us: Vec<i64>,
 }
 
 fn main() -> Result<()> {
@@ -54,11 +60,8 @@ fn main() -> Result<()> {
     camera.set_max_fps(0.5)?;
     camera.start_capture()?;
     let mut pixels = Vec::new();
-    let mut previous_exposure = 6_400_000;
-    for (index, exposure) in [6_400_000, 25_000_000, 25_000_000, 60_000_000, 234_000]
-        .into_iter()
-        .enumerate()
-    {
+    let mut previous_exposure = 0;
+    for (index, exposure) in options.exposures_us.into_iter().enumerate() {
         camera.set_control(ControlType::EXPOSURE, exposure, false)?;
         camera.set_control(
             ControlType::GAIN,
