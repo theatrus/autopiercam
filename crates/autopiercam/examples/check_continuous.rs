@@ -54,6 +54,7 @@ fn main() -> Result<()> {
     camera.set_max_fps(0.5)?;
     camera.start_capture()?;
     let mut pixels = Vec::new();
+    let mut previous_exposure = 6_400_000;
     for (index, exposure) in [6_400_000, 25_000_000, 25_000_000, 60_000_000, 234_000]
         .into_iter()
         .enumerate()
@@ -90,7 +91,8 @@ fn main() -> Result<()> {
                     Err(error) if error.is_timeout() => {
                         // Same base as the production frame watchdog; refresh its
                         // intentional transition/pacing allowance after each poll.
-                        let budget = Duration::from_micros(exposure as u64).saturating_mul(2)
+                        let budget = Duration::from_micros(exposure.max(previous_exposure) as u64)
+                            .saturating_mul(2)
                             + Duration::from_secs(5)
                             + camera.pacing_allowance();
                         ensure!(
@@ -102,6 +104,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        previous_exposure = exposure;
     }
     camera.stop_capture()?;
     Ok(())
