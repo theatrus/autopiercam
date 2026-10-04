@@ -1,7 +1,7 @@
 # Regain camera backend
 
-Current source pins Regain framing recovery commit `346abbc3d22c` for bounded
-in-worker recovery of a malformed Direct USB video frame. Published
+AutoPierCam 0.2.20 adopts Regain 0.5.7 for bounded in-worker recovery of a
+malformed Direct USB video frame and adds SDK failed-exposure recovery. Published
 AutoPierCam 0.2.19 adopted Regain 0.5.6 from its `v0.5.6.0` release, including
 ASI676MC Direct USB video in [Regain PR #13](https://github.com/pulsarfab/regain/pull/13),
 following the ASI662MC video support adopted in AutoPierCam 0.2.18.
@@ -33,7 +33,7 @@ addition to the existing two-exposure/five-second frame deadline. The allowance
 is retained for an in-flight request even if FPS is edited. Legacy workers and
 still/SDK capture keep their existing budgets. This capability-aware support
 is paired with the upstream framing-recovery commit in the current source pin.
-Invalid pixels are never accepted. This is not a new published release.
+Invalid pixels are never accepted.
 
 ### Fault diagnosis and bounded recovery
 
