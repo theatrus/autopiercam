@@ -1,8 +1,9 @@
 # Regain camera backend
 
-Current source pins Regain 0.5.3 plus USB 2 fallback fixes in
-[Regain PR #11](https://github.com/pulsarfab/regain/pull/11), at
-commit `bd4238ad548f173821caef7807a0c01fda903801` in Cargo.toml and Cargo.lock.
+AutoPierCam 0.2.17 adopts Regain 0.5.4 from its `v0.5.4.0` release, including
+the USB 2 fallback and Duo retained-frame fixes in
+[Regain PR #11](https://github.com/pulsarfab/regain/pull/11).
+Cargo.toml and Cargo.lock pin the exact upstream commit.
 Published AutoPierCam 0.2.16 used targeted reconnect fixes from Regain PR #10
 but still rejected USB 2 connections to these color cameras.
 AutoPierCam 0.2.14 used the `v0.5.3.0` release; 0.2.13 used Regain 0.5.2.
@@ -33,9 +34,12 @@ full-resolution frames, 30-second exposures, byte-identical retained replay,
 deliberately interrupted host reads and non-packet-aligned ROI. The ASI676
 production worker also passed close/reopen with cached identity. These are
 not tests of physical USB disconnect/reset, optical accuracy, cold power-up,
-or the installed Viewer's complete SDK-to-Direct handoff. Other Regain camera
-models have the shared transport fallback but await USB 2 hardware validation.
-See [upstream USB 2 evidence](https://github.com/pulsarfab/regain/blob/bd4238ad548f173821caef7807a0c01fda903801/docs/usb2-cameras.md).
+or the installed Viewer's complete SDK-to-Direct handoff. Upstream 2600 P25 and
+Duo USB 2 matrices also passed, with a Duo USB 3 regression after complete-readout
+and tiny-ROI fixes. Both ASI6200 revisions have qualified transfer/recovery
+results: extreme-gain row uniformity remains uncharacterized. These upstream
+results do not expand AutoPierCam's supported color-camera scope.
+See [upstream USB 2 evidence](https://github.com/pulsarfab/regain/blob/v0.5.4.0/docs/usb2-coverage-spike.md).
 
 SDK remains the default; existing configurations do not switch drivers.
 There is no automatic fallback.

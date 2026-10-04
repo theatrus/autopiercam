@@ -514,7 +514,7 @@ function Assert-StagedPayload {
     Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
     Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Regain camera worker'
     $regainVersion = (& $regainPath --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $regainVersion -cne "autopiercam-regain-worker $Version (Regain bd4238ad548f)") {
+    if ($LASTEXITCODE -ne 0 -or $regainVersion -cne "autopiercam-regain-worker $Version (Regain f0c91226523f)") {
         throw 'Regain worker version mismatch.'
     }
 

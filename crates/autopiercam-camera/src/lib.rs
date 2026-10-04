@@ -299,7 +299,7 @@ impl Driver {
         Ok(())
     }
     pub fn version(&self) -> String {
-        format!("Regain 0.5.3 / {:?}", self.backend)
+        format!("Regain 0.5.4 / {:?}", self.backend)
     }
     pub fn is_direct(&self) -> bool {
         self.backend == CameraDriver::ZwoDirect
