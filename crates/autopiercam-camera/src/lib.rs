@@ -137,6 +137,11 @@ impl FlightRecorder {
                 | "video.frame_discarded"
                 | "video.framing_recovered"
                 | "command.failed"
+                | "stream.configured"
+                | "stream.settings_applied"
+                | "stream.first_frame"
+                | "stream.progress"
+                | "stream.failed"
         ) {
             return;
         }
@@ -442,7 +447,18 @@ impl Driver {
                     "invalid camera control bounds"
                 );
             }
-            let video_limit = if self.is_direct()
+            let continuous = v["continuousAcquisition"]["supported"] == true;
+            // Keep compatibility-path recovery tests without ever loading hardware.
+            #[cfg(feature = "simulator")]
+            let continuous = continuous
+                && !self
+                    .runtime
+                    .sdk_simulation
+                    .as_ref()
+                    .is_some_and(|s| s["legacyProtocol"] == true);
+            let video_limit = if !self.is_direct() && continuous {
+                Some(u64::MAX)
+            } else if self.is_direct()
                 && matches!(actual.name.as_str(), "ZWO ASI662MC" | "ZWO ASI676MC")
                 && v["captureModes"]
                     .as_array()
@@ -461,15 +477,17 @@ impl Driver {
                 actual,
                 video_limit,
                 v["videoFrameRecoveryAttempts"].as_u64() == Some(1),
+                continuous,
             ))
         });
-        let (descriptor, controls, serial, info, video_limit, video_recovery) = match parsed {
-            Ok(v) => v,
-            Err(e) => {
-                runtime.block_on(worker.kill());
-                return Err(e);
-            }
-        };
+        let (descriptor, controls, serial, info, video_limit, video_recovery, continuous) =
+            match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    runtime.block_on(worker.kill());
+                    return Err(e);
+                }
+            };
         // Regain's SDK control list contains values, not the persisted auto flag.
         // Explicitly disable SDK auto gain even if the desired numeric value is
         // unchanged. Regain's start command similarly forces manual exposure.
@@ -534,6 +552,8 @@ impl Driver {
             video_active: false,
             max_fps: 1.0,
             pending_pacing: Duration::ZERO,
+            continuous,
+            stream_params: None,
         })
     }
 }
@@ -564,6 +584,8 @@ pub struct Camera {
     video_active: bool,
     max_fps: f64,
     pending_pacing: Duration,
+    continuous: bool,
+    stream_params: Option<Value>,
 }
 impl Camera {
     pub fn set_max_fps(&mut self, fps: f64) -> Result<()> {
@@ -583,6 +605,15 @@ impl Camera {
     }
     /// Pending worker pacing is intentional, not a stalled exposure.
     pub fn pacing_allowance(&self) -> Duration {
+        if self.continuous {
+            return Duration::from_secs_f64(1.0 / self.max_fps)
+                .saturating_add(Duration::from_secs(if self.video_recovery {
+                    45
+                } else {
+                    30
+                }))
+                .max(self.pending_pacing);
+        }
         let next = if self.uses_video() {
             video_wait_allowance(self.max_fps, self.video_recovery)
         } else {
@@ -590,11 +621,10 @@ impl Camera {
         };
         next.max(self.pending_pacing)
     }
-    /// Stop requesting frames without disarming an already configured video
-    /// stream. There are no background downloads; shutdown uses stop_capture.
+    /// Pause delivery; a continuous owner keeps draining its bounded latest slot.
     pub fn pause_between_frames(&mut self) -> Result<()> {
         ensure!(!self.pending, "cannot pause between frames during capture");
-        if self.video_active {
+        if self.video_active || self.stream_params.is_some() {
             self.active = false;
             Ok(())
         } else {
@@ -710,6 +740,15 @@ impl Camera {
             cap.writable && value >= cap.min && value <= cap.max,
             "control outside camera capabilities"
         );
+        if self.continuous
+            && (self.active || self.stream_params.is_some())
+            && matches!(kind.0, 0 | 1)
+        {
+            // Desired settings only. The worker serializes and fences this edit
+            // on the next poll; do not issue raw control calls into a stream.
+            self.values.insert(kind.0, value);
+            return Ok(());
+        }
         if self.pending {
             self.queued.insert(kind.0, value);
             return Ok(());
@@ -795,6 +834,22 @@ impl Camera {
     }
     pub fn stop_capture(&mut self) -> Result<()> {
         self.active = false;
+        if self.continuous && self.stream_params.is_some() {
+            let result = self.call("stream-stop", Value::Null, 3.).and_then(|(status,_)| {
+                ensure!(status["active"] == false,
+                    "capture is draining a non-abortable exposure; close the isolated worker to cancel");
+                Ok(())
+            });
+            self.stream_params = None;
+            self.pending = false;
+            self.video_active = false;
+            self.pending_pacing = Duration::ZERO;
+            if result.is_err() {
+                self.failed = true;
+                self.runtime.block_on(self.worker.borrow_mut().kill());
+            }
+            return result;
+        }
         if self.pending || self.video_active {
             if self.pending {
                 self.log_capture_context(
@@ -834,6 +889,9 @@ impl Camera {
     ) -> std::result::Result<FrameMeta, FrameError> {
         if !self.active || self.failed {
             return Err(anyhow::anyhow!("Regain acquisition is not active").into());
+        }
+        if self.continuous {
+            return self.continuous_frame(data, timeout_ms);
         }
         if !self.pending {
             for (kind, value) in std::mem::take(&mut self.queued) {
@@ -910,6 +968,72 @@ impl Camera {
         }
         self.pending = false;
         self.pending_pacing = Duration::ZERO;
+        Ok(FrameMeta {
+            width: self.roi.width,
+            height: self.roi.height,
+            image_type: self.roi.image_type,
+        })
+    }
+
+    fn continuous_frame(
+        &mut self,
+        data: &mut Vec<u8>,
+        timeout_ms: i32,
+    ) -> std::result::Result<FrameMeta, FrameError> {
+        let exposure = self.exposure()?;
+        regain_core::validate_exposure(&self.descriptor, &self.controls, &exposure)?;
+        let mut params = serde_json::to_value(&exposure).map_err(anyhow::Error::from)?;
+        params["gain"] = json!(self.values[&0]);
+        params["maxFps"] = json!(self.max_fps);
+        if self.stream_params.as_ref() != Some(&params) {
+            let previous = self
+                .stream_params
+                .as_ref()
+                .and_then(|p| p["microseconds"].as_u64())
+                .unwrap_or(0);
+            self.call("stream-start", params.clone(), 5.)?;
+            self.stream_params = Some(params);
+            self.request_started = Some(Instant::now());
+            self.pending_pacing =
+                Duration::from_micros(previous.saturating_add(exposure.microseconds))
+                    .saturating_add(Duration::from_secs(30))
+                    .saturating_add(Duration::from_secs_f64(1.0 / self.max_fps));
+        }
+        self.pending = true;
+        let until = Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 250) as u64);
+        loop {
+            let status = self.call("stream-status", Value::Null, 2.)?.0;
+            if let Some(error) = status["error"].as_str() {
+                return Err(anyhow::anyhow!(
+                    "Regain continuous capture failed: {error}; details={}",
+                    status["errorDetails"]
+                )
+                .into());
+            }
+            self.video_active = status["mode"] == "video";
+            if status["ready"] == true
+                && status["settingsPending"] != true
+                && status["settling"] != true
+            {
+                break;
+            }
+            if Instant::now() >= until {
+                return Err(FrameError::Pending);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (meta, pixels) = self.call("stream-download", Value::Null, 10.)?;
+        decode_frame(&meta, &pixels, &exposure, self.roi.image_type, data)?;
+        self.delivered += 1;
+        self.last_frame = Some(Instant::now());
+        self.pending = false;
+        self.pending_pacing = Duration::ZERO;
+        if self.health_logged.elapsed() >= Duration::from_secs(60) {
+            tracing::info!(backend=?self.driver.backend, frames_delivered=self.delivered,
+                exposure_us=exposure.microseconds, gain=?self.values.get(&0), max_fps=self.max_fps,
+                stream=?meta["continuous"], "continuous camera capture health");
+            self.health_logged = Instant::now();
+        }
         Ok(FrameMeta {
             width: self.roi.width,
             height: self.roi.height,

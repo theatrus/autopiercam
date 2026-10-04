@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.20 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.21 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.20)](https://github.com/theatrus/autopiercam/releases/download/v0.2.20/AutoPierCam-0.2.20-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.20)
+[Download the signed Windows x64 installer (0.2.21)](https://github.com/theatrus/autopiercam/releases/download/v0.2.21/AutoPierCam-0.2.21-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.21)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,17 +25,20 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.20 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+Version 0.2.21 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-Version 0.2.20 adopts Regain 0.5.7 with bounded malformed-frame recovery and uses continuous Direct USB video for
-ASI662MC and ASI676MC exposures up to 30 seconds on USB 2 or USB 3. Longer
-exposures retain still capture. Video grabs honor the configured fractional FPS
-cap, including during settling and exposure changes. It retains cached camera
+Version 0.2.21 adopts Regain 0.5.8 continuous acquisition. The worker drains SDK
+and Direct USB frames independently of preview delivery, keeping only the latest
+frame. The fractional FPS limit caps delivery, not sensor acquisition. Exposure
+and gain changes apply at a frame boundary without restarting native video;
+transition frames are discarded before delivery. Direct ASI662MC/ASI676MC video
+remains limited to 30 seconds; longer exposures use repeated still capture.
+It retains cached camera
 identity and discovery backoff, opt-in camera-port recovery, fractional preview
 rates down to 0.01 fps, and quieter transition logs.
-SDK failed exposures get one fresh-exposure retry on the existing handle.
+Normal SDK video read timeouts back off without restarting capture.
 Bounded fault snapshots retain timing, settings and recent phases without INFO
 phase spam or additional discovery. Persistent capture faults still retry after
 30 seconds; SDK remains the default. USB recovery
