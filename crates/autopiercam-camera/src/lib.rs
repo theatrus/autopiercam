@@ -6,7 +6,7 @@ use regain_core::{CancellationToken, Runtime, Worker};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -114,7 +114,7 @@ pub struct FrameMeta {
 pub enum FrameError {
     #[error("frame is still exposing")]
     Pending,
-    #[error(transparent)]
+    #[error("{0:#}")]
     Failed(#[from] anyhow::Error),
 }
 impl FrameError {
@@ -123,9 +123,52 @@ impl FrameError {
     }
 }
 
-fn diagnostic() -> regain_core::Diagnostic {
-    Arc::new(|level, event, message| {
-        tracing::info!(regain_level = level, regain_event = event, "{message}")
+#[derive(Default)]
+struct FlightRecorder {
+    events: VecDeque<(Instant, String)>,
+}
+impl FlightRecorder {
+    fn record(&mut self, event: &str, message: &str) {
+        // Only operational breadcrumbs, never discovery responses or frame data.
+        if !matches!(
+            event,
+            "capture.phase"
+                | "camera.transport"
+                | "video.frame_discarded"
+                | "video.framing_recovered"
+                | "command.failed"
+        ) {
+            return;
+        }
+        if self.events.len() == 24 {
+            self.events.pop_front();
+        }
+        self.events.push_back((
+            Instant::now(),
+            format!(
+                "{event}: {}",
+                message.chars().take(1024).collect::<String>()
+            ),
+        ));
+    }
+    fn snapshot(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|(time, message)| format!("{} ms ago: {message}", time.elapsed().as_millis()))
+            .collect()
+    }
+}
+fn diagnostic(recorder: Arc<Mutex<FlightRecorder>>) -> regain_core::Diagnostic {
+    Arc::new(move |level, event, message| {
+        if let Ok(mut recorder) = recorder.lock() {
+            recorder.record(event, message);
+        }
+        match level {
+            "error" => tracing::error!(regain_event = event, "{message}"),
+            "warning" | "warn" => tracing::warn!(regain_event = event, "{message}"),
+            "debug" | "trace" => tracing::debug!(regain_event = event, "{message}"),
+            _ => tracing::info!(regain_event = event, "{message}"),
+        }
     })
 }
 fn executor() -> Result<tokio::runtime::Runtime> {
@@ -299,7 +342,11 @@ impl Driver {
         Ok(())
     }
     pub fn version(&self) -> String {
-        format!("Regain 0.5.4 / {:?}", self.backend)
+        format!(
+            "Regain / {:?} (AutoPierCam {})",
+            self.backend,
+            env!("CARGO_PKG_VERSION")
+        )
     }
     pub fn is_direct(&self) -> bool {
         self.backend == CameraDriver::ZwoDirect
@@ -315,7 +362,10 @@ impl Driver {
         );
         let runtime = executor()?;
         let list = runtime.block_on(async {
-            let mut worker = self.runtime.spawn(self.is_direct(), diagnostic()).await?;
+            let mut worker = self
+                .runtime
+                .spawn(self.is_direct(), diagnostic(Arc::default()))
+                .await?;
             let result = worker
                 .call("list", json!({}), 30., &CancellationToken::new())
                 .await;
@@ -339,7 +389,11 @@ impl Driver {
             .map_err(|_| anyhow::anyhow!("camera ownership poisoned"))?;
         ensure!(!*owned, "A camera already owns this driver");
         let runtime = executor()?;
-        let mut worker = runtime.block_on(self.runtime.spawn(self.is_direct(), diagnostic()))?;
+        let recorder = Arc::new(Mutex::new(FlightRecorder::default()));
+        let mut worker = runtime.block_on(
+            self.runtime
+                .spawn(self.is_direct(), diagnostic(Arc::clone(&recorder))),
+        )?;
         let mut selection =
             json!({"name":info.name,"serial":self.serial.as_deref().or(info.serial.as_deref())});
         if self.is_direct() {
@@ -406,9 +460,10 @@ impl Driver {
                 serial.to_owned(),
                 actual,
                 video_limit,
+                v["videoFrameRecoveryAttempts"].as_u64() == Some(1),
             ))
         });
-        let (descriptor, controls, serial, info, video_limit) = match parsed {
+        let (descriptor, controls, serial, info, video_limit, video_recovery) = match parsed {
             Ok(v) => v,
             Err(e) => {
                 runtime.block_on(worker.kill());
@@ -444,7 +499,18 @@ impl Driver {
         }
         *owned = true;
         drop(owned);
+        tracing::info!(backend = ?self.backend, model = %info.name,
+            sdk_usb3_host = ?descriptor["usb3Host"].as_bool(),
+            usb3_camera_capable = ?descriptor["usb3Camera"].as_bool(),
+            video_recovery, "camera session opened; SDK host flag is separate from camera USB capability");
         Ok(Camera {
+            recorder,
+            request_started: None,
+            last_frame: None,
+            delivered: 0,
+            sdk_retried: false,
+            sdk_retry_attempts: 0,
+            health_logged: Instant::now(),
             driver: Arc::clone(self),
             runtime,
             worker: RefCell::new(worker),
@@ -464,6 +530,7 @@ impl Driver {
             pending: false,
             failed: false,
             video_limit,
+            video_recovery,
             video_active: false,
             max_fps: 1.0,
             pending_pacing: Duration::ZERO,
@@ -472,6 +539,13 @@ impl Driver {
 }
 
 pub struct Camera {
+    recorder: Arc<Mutex<FlightRecorder>>,
+    request_started: Option<Instant>,
+    last_frame: Option<Instant>,
+    delivered: u64,
+    sdk_retried: bool,
+    sdk_retry_attempts: u64,
+    health_logged: Instant,
     driver: Arc<Driver>,
     runtime: tokio::runtime::Runtime,
     worker: RefCell<Worker>,
@@ -486,6 +560,7 @@ pub struct Camera {
     pending: bool,
     failed: bool,
     video_limit: Option<u64>,
+    video_recovery: bool,
     video_active: bool,
     max_fps: f64,
     pending_pacing: Duration,
@@ -509,7 +584,7 @@ impl Camera {
     /// Pending worker pacing is intentional, not a stalled exposure.
     pub fn pacing_allowance(&self) -> Duration {
         let next = if self.uses_video() {
-            Duration::from_secs_f64(1.0 / self.max_fps)
+            video_wait_allowance(self.max_fps, self.video_recovery)
         } else {
             Duration::ZERO
         };
@@ -577,12 +652,29 @@ impl Camera {
         self.driver.is_direct()
     }
     fn call(&self, method: &str, params: Value, seconds: f64) -> Result<(Value, Vec<u8>)> {
-        self.runtime.block_on(self.worker.borrow_mut().call(
-            method,
-            params,
-            seconds,
-            &CancellationToken::new(),
-        ))
+        self.runtime
+            .block_on(self.worker.borrow_mut().call(
+                method,
+                params,
+                seconds,
+                &CancellationToken::new(),
+            ))
+            .with_context(|| format!("Regain {method} request failed (deadline {seconds} s)"))
+    }
+    fn log_capture_context(&self, reason: &str) {
+        let recent = self
+            .recorder
+            .lock()
+            .map(|r| r.snapshot())
+            .unwrap_or_default();
+        tracing::warn!(reason, backend = ?self.driver.backend, model = %self.info.name,
+            exposure_us = ?self.values.get(&1), gain = ?self.values.get(&0), roi = ?self.roi,
+            max_fps = self.max_fps, video = self.video_active,
+            request_elapsed_ms = ?self.request_started.map(|t| t.elapsed().as_millis()),
+            last_frame_age_ms = ?self.last_frame.map(|t| t.elapsed().as_millis()),
+            frames_delivered = self.delivered, sdk_retried = self.sdk_retried,
+            sdk_retry_attempts = self.sdk_retry_attempts, recent_phases = ?recent,
+            "camera capture diagnostic snapshot");
     }
     pub fn controls(&self) -> Result<Vec<ControlCaps>> {
         Ok(self
@@ -704,6 +796,11 @@ impl Camera {
     pub fn stop_capture(&mut self) -> Result<()> {
         self.active = false;
         if self.pending || self.video_active {
+            if self.pending {
+                self.log_capture_context(
+                    "stopping an unfinished capture (cancellation or deadline)",
+                );
+            }
             // Direct stop may wait for USB completion; impose a short parent deadline.
             let result = self.call("stop", Value::Null, 2.).map(|_| ());
             self.pending = false;
@@ -723,7 +820,8 @@ impl Camera {
         timeout_ms: i32,
     ) -> std::result::Result<FrameMeta, FrameError> {
         let result = self.next_frame(data, timeout_ms);
-        if matches!(result, Err(FrameError::Failed(_))) {
+        if let Err(FrameError::Failed(error)) = &result {
+            self.log_capture_context(&format!("{error:#}"));
             self.failed = true;
             self.runtime.block_on(self.worker.borrow_mut().kill());
         }
@@ -744,6 +842,8 @@ impl Camera {
         }
         let exposure = self.exposure()?;
         if !self.pending {
+            self.request_started = Some(Instant::now());
+            self.sdk_retried = false;
             regain_core::validate_exposure(&self.descriptor, &self.controls, &exposure)?;
             let video = self.uses_video();
             let mut params = serde_json::to_value(&exposure).map_err(anyhow::Error::from)?;
@@ -756,7 +856,7 @@ impl Camera {
             self.pending = true;
             self.video_active = video;
             self.pending_pacing = if video {
-                Duration::from_secs_f64(1.0 / self.max_fps)
+                video_wait_allowance(self.max_fps, self.video_recovery)
             } else {
                 Duration::ZERO
             };
@@ -766,6 +866,21 @@ impl Camera {
             match self.call("status", Value::Null, 2.)?.0.as_i64() {
                 Some(1) => {}
                 Some(2) => break,
+                Some(3) if !self.is_direct() && !self.sdk_retried => {
+                    // ASI_EXP_FAILED is an exposure result, not an SDK API error.
+                    // Retry one fresh exposure on the same handle. Never retry an
+                    // arbitrary API/configuration error or extend the caller deadline.
+                    self.sdk_retried = true;
+                    self.sdk_retry_attempts += 1;
+                    self.log_capture_context("ASI_EXP_FAILED (3); restarting this exposure once");
+                    self.call("stop", Value::Null, 2.)?;
+                    self.call(
+                        "start",
+                        serde_json::to_value(&exposure).map_err(anyhow::Error::from)?,
+                        5.,
+                    )?;
+                    return Err(FrameError::Pending);
+                }
                 state => {
                     return Err(anyhow::anyhow!("Regain exposure failed: state {state:?}").into());
                 }
@@ -777,6 +892,22 @@ impl Camera {
         }
         let (meta, pixels) = self.call("download", Value::Null, 10.)?;
         decode_frame(&meta, &pixels, &exposure, self.roi.image_type, data)?;
+        self.delivered += 1;
+        self.last_frame = Some(Instant::now());
+        if self.sdk_retried {
+            tracing::info!(
+                sdk_retry_attempts = self.sdk_retry_attempts,
+                "SDK fresh-exposure retry recovered; valid frame delivered"
+            );
+        }
+        if self.health_logged.elapsed() >= Duration::from_secs(60) {
+            tracing::info!(backend = ?self.driver.backend, frames_delivered = self.delivered,
+                exposure_us = exposure.microseconds, gain = ?self.values.get(&0),
+                video = self.video_active, max_fps = self.max_fps,
+                request_elapsed_ms = ?self.request_started.map(|t| t.elapsed().as_millis()),
+                sdk_retry_attempts = self.sdk_retry_attempts, "camera capture health");
+            self.health_logged = Instant::now();
+        }
         self.pending = false;
         self.pending_pacing = Duration::ZERO;
         Ok(FrameMeta {
@@ -784,6 +915,51 @@ impl Camera {
             height: self.roi.height,
             image_type: self.roi.image_type,
         })
+    }
+}
+// FrameWait already allows two exposures. A worker advertising one framing
+// recovery also needs a second paced grab plus bounded stream-restart overhead.
+fn video_wait_allowance(max_fps: f64, recovery: bool) -> Duration {
+    let interval = Duration::from_secs_f64(1.0 / max_fps);
+    if recovery {
+        interval
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(15))
+    } else {
+        interval
+    }
+}
+
+#[cfg(test)]
+mod recovery_timing_tests {
+    use super::*;
+    #[test]
+    fn frame_error_display_keeps_the_native_cause_and_request_context() {
+        let error = FrameError::Failed(
+            anyhow::anyhow!("native SDK code 11")
+                .context("Regain download request failed (deadline 10 s)"),
+        );
+        assert!(error.to_string().contains("native SDK code 11"));
+        assert!(error.to_string().contains("download request failed"));
+    }
+    #[test]
+    fn flight_recorder_is_bounded_and_excludes_inventory_and_frame_data() {
+        let mut recorder = FlightRecorder::default();
+        recorder.record("camera.inventory", "private serial");
+        recorder.record("frame.delivered", "pixels");
+        assert!(recorder.snapshot().is_empty());
+        for _ in 0..30 {
+            recorder.record("capture.phase", &"x".repeat(2048));
+        }
+        assert_eq!(recorder.events.len(), 24);
+        assert!(recorder.events.iter().all(|(_, s)| s.len() < 1100));
+        assert!(recorder.snapshot()[0].contains("ms ago: capture.phase"));
+    }
+    #[test]
+    fn framing_recovery_budget_covers_both_grabs_without_changing_legacy_workers() {
+        assert_eq!(video_wait_allowance(1.0, false), Duration::from_secs(1));
+        assert_eq!(video_wait_allowance(1.0, true), Duration::from_secs(17));
+        assert_eq!(video_wait_allowance(0.01, true), Duration::from_secs(215));
     }
 }
 impl Drop for Camera {

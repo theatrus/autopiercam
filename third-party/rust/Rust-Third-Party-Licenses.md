@@ -158,10 +158,10 @@ reproduced below; its archive checksum is pinned in Cargo.lock.
 - `rand_core 0.10.1` — `MIT OR Apache-2.0`
 - `rand_distr 0.6.0` — `MIT OR Apache-2.0`
 - `rawpointer 0.2.1` — `MIT OR Apache-2.0`
-- `regain-core 0.5.6` — `Apache-2.0`
-- `regain-transport 0.5.6` — `Apache-2.0`
-- `regain-worker 0.5.6` — `Apache-2.0`
-- `regain-zwo 0.5.6` — `Apache-2.0`
+- `regain-core 0.5.7` — `Apache-2.0`
+- `regain-transport 0.5.7` — `Apache-2.0`
+- `regain-worker 0.5.7` — `Apache-2.0`
+- `regain-zwo 0.5.7` — `Apache-2.0`
 - `regex-automata 0.4.18` — `MIT OR Apache-2.0`
 - `regex-syntax 0.8.11` — `MIT OR Apache-2.0`
 - `reqwest 0.13.5` — `MIT OR Apache-2.0`
@@ -484,10 +484,10 @@ Applies to:
 
 Applies to:
 
-- `regain-core 0.5.6`
-- `regain-transport 0.5.6`
-- `regain-worker 0.5.6`
-- `regain-zwo 0.5.6`
+- `regain-core 0.5.7`
+- `regain-transport 0.5.7`
+- `regain-worker 0.5.7`
+- `regain-zwo 0.5.7`
 
 
 ```text
