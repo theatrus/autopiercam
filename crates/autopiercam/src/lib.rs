@@ -935,6 +935,7 @@ impl CaptureProgress {
         self.status.exposure_us = current_exposure(camera, limits.max_exposure_us);
         self.status.gain = current_gain(camera, self.status.gain);
         self.wait.observe_exposure(self.status.exposure_us);
+        self.wait.set_pacing_allowance(camera.pacing_allowance());
     }
 
     fn publish(&self, observer: &CaptureObserver<'_>) {
@@ -989,9 +990,9 @@ impl CaptureProgress {
         if remaining().is_zero() || control.is_some_and(AgentControl::is_shutdown) {
             return Ok(());
         }
-        // Sleeping while the video stream runs only drops frames: the camera
-        // and USB transfer stay busy. Retain the handle and application AE state.
-        camera.stop_capture()?;
+        // Direct video has no background USB downloads. Keep its sensor setup
+        // and pacing history; other modes retain the existing stopped-idle path.
+        camera.pause_between_frames()?;
         loop {
             // Settling cannot apply reloads yet; do not let a pending save
             // disable pacing for the rest of startup.
@@ -1080,9 +1081,9 @@ impl<'a> CaptureObserver<'a> {
         if next == current {
             return Ok(false);
         }
-        // Controls change only after this frame has downloaded. Regain has no
-        // video backlog; the next exposure uses the new settings.
-        camera.stop_capture()?;
+        // Controls change only after download. Regain reconfigures video before
+        // the next grab, preserving its FPS history across exposure changes.
+        camera.pause_between_frames()?;
         camera.set_control(ControlType::EXPOSURE, next.exposure_us, false)?;
         camera.set_control(ControlType::GAIN, next.gain, false)?;
         camera.start_capture()?;
@@ -1381,6 +1382,7 @@ fn run_agent_inner(
         image_type,
     };
     camera.set_roi(roi)?;
+    camera.set_max_fps(config.capture.preview_max_fps)?;
     if let Some(wb) = &config.camera.white_balance {
         camera.configure_white_balance(wb)?;
     }
@@ -1695,6 +1697,8 @@ fn capture_loop(
     state: &mut CaptureLoopState,
 ) -> Result<bool> {
     let mut observer = CaptureObserver::new(bayer, Some(monitor), preview);
+    // Recording-service reloads can also change FPS without reopening camera.
+    camera.set_max_fps(config.capture.preview_max_fps)?;
     observer.preview_max_fps = config.capture.preview_max_fps;
     observer.preview_cadence = state.preview_cadence;
     observer.video = video;
@@ -1763,6 +1767,7 @@ fn capture_loop(
                         "preview rate updated without restarting capture"
                     );
                     observer.preview_max_fps = next.capture.preview_max_fps;
+                    camera.set_max_fps(next.capture.preview_max_fps)?;
                 }
                 *config = next;
             }
@@ -1914,11 +1919,10 @@ fn wait_for_auto_settle(
         if observer.video.is_some_and(video::VideoWorker::is_finished) {
             bail!("video worker stopped while exposure was settling");
         }
-        // Settling needs fresh AE samples even when previews are infrequent.
-        // Publication still honors the configured cap independently.
+        // Settling honors the configured acquisition cap too.
         progress.pace_acquisition(
             camera,
-            observer.preview_max_fps.max(1.0),
+            observer.preview_max_fps,
             control,
             None,
             None,

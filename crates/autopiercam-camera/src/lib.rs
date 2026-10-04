@@ -388,9 +388,27 @@ impl Driver {
                     "invalid camera control bounds"
                 );
             }
-            Ok((v["info"].clone(), controls, serial.to_owned(), actual))
+            let video_limit = if self.is_direct()
+                && actual.name == "ZWO ASI662MC"
+                && v["captureModes"]
+                    .as_array()
+                    .is_some_and(|m| m.contains(&json!("video")))
+            {
+                v["videoMaxExposureMicroseconds"]
+                    .as_u64()
+                    .filter(|v| *v > 0 && *v <= 30_000_000)
+            } else {
+                None
+            };
+            Ok((
+                v["info"].clone(),
+                controls,
+                serial.to_owned(),
+                actual,
+                video_limit,
+            ))
         });
-        let (descriptor, controls, serial, info) = match parsed {
+        let (descriptor, controls, serial, info, video_limit) = match parsed {
             Ok(v) => v,
             Err(e) => {
                 runtime.block_on(worker.kill());
@@ -445,6 +463,10 @@ impl Driver {
             active: false,
             pending: false,
             failed: false,
+            video_limit,
+            video_active: false,
+            max_fps: 1.0,
+            pending_pacing: Duration::ZERO,
         })
     }
 }
@@ -463,8 +485,47 @@ pub struct Camera {
     active: bool,
     pending: bool,
     failed: bool,
+    video_limit: Option<u64>,
+    video_active: bool,
+    max_fps: f64,
+    pending_pacing: Duration,
 }
 impl Camera {
+    pub fn set_max_fps(&mut self, fps: f64) -> Result<()> {
+        ensure!(
+            fps.is_finite() && (0.01..=30.0).contains(&fps),
+            "invalid capture FPS cap"
+        );
+        self.max_fps = fps;
+        Ok(())
+    }
+    pub fn uses_video(&self) -> bool {
+        self.video_limit.is_some_and(|limit| {
+            self.values
+                .get(&1)
+                .is_some_and(|us| *us > 0 && *us as u64 <= limit)
+        })
+    }
+    /// Pending worker pacing is intentional, not a stalled exposure.
+    pub fn pacing_allowance(&self) -> Duration {
+        let next = if self.uses_video() {
+            Duration::from_secs_f64(1.0 / self.max_fps)
+        } else {
+            Duration::ZERO
+        };
+        next.max(self.pending_pacing)
+    }
+    /// Stop requesting frames without disarming an already configured video
+    /// stream. There are no background downloads; shutdown uses stop_capture.
+    pub fn pause_between_frames(&mut self) -> Result<()> {
+        ensure!(!self.pending, "cannot pause between frames during capture");
+        if self.video_active {
+            self.active = false;
+            Ok(())
+        } else {
+            self.stop_capture()
+        }
+    }
     /// Called only by the capture owner before acquisition; disable by reopening.
     /// All estimation/correction stays in Regain, before RAW8 conversion/debayering.
     pub fn configure_white_balance(&mut self, config: &WhiteBalanceConfig) -> Result<()> {
@@ -642,10 +703,12 @@ impl Camera {
     }
     pub fn stop_capture(&mut self) -> Result<()> {
         self.active = false;
-        if self.pending {
+        if self.pending || self.video_active {
             // Direct stop may wait for USB completion; impose a short parent deadline.
             let result = self.call("stop", Value::Null, 2.).map(|_| ());
             self.pending = false;
+            self.video_active = false;
+            self.pending_pacing = Duration::ZERO;
             if result.is_err() {
                 self.failed = true;
             }
@@ -682,12 +745,21 @@ impl Camera {
         let exposure = self.exposure()?;
         if !self.pending {
             regain_core::validate_exposure(&self.descriptor, &self.controls, &exposure)?;
-            self.call(
-                "start",
-                serde_json::to_value(&exposure).map_err(anyhow::Error::from)?,
-                5.,
-            )?;
+            let video = self.uses_video();
+            let mut params = serde_json::to_value(&exposure).map_err(anyhow::Error::from)?;
+            if video {
+                params["mode"] = json!("video");
+                params["maxFps"] = json!(self.max_fps);
+                params["readRetries"] = json!(0);
+            }
+            self.call("start", params, 5.)?;
             self.pending = true;
+            self.video_active = video;
+            self.pending_pacing = if video {
+                Duration::from_secs_f64(1.0 / self.max_fps)
+            } else {
+                Duration::ZERO
+            };
         }
         let until = Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 250) as u64);
         loop {
@@ -706,6 +778,7 @@ impl Camera {
         let (meta, pixels) = self.call("download", Value::Null, 10.)?;
         decode_frame(&meta, &pixels, &exposure, self.roi.image_type, data)?;
         self.pending = false;
+        self.pending_pacing = Duration::ZERO;
         Ok(FrameMeta {
             width: self.roi.width,
             height: self.roi.height,

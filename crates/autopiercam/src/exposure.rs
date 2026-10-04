@@ -115,6 +115,7 @@ pub(crate) struct FrameWait {
     exposure_us: i64,
     observed_exposure_us: i64,
     previous_frame_exposure_us: i64,
+    pacing: Duration,
 }
 
 impl FrameWait {
@@ -125,6 +126,7 @@ impl FrameWait {
             exposure_us,
             observed_exposure_us: exposure_us,
             previous_frame_exposure_us: exposure_us,
+            pacing: Duration::ZERO,
         }
     }
 
@@ -133,6 +135,10 @@ impl FrameWait {
     pub(crate) fn observe_exposure(&mut self, exposure_us: i64) {
         self.exposure_us = exposure_us.max(1);
         self.observed_exposure_us = self.observed_exposure_us.max(self.exposure_us);
+    }
+
+    pub(crate) fn set_pacing_allowance(&mut self, pacing: Duration) {
+        self.pacing = pacing;
     }
 
     pub(crate) fn frame_received(&mut self, now: Duration) {
@@ -159,6 +165,7 @@ impl FrameWait {
             self.observed_exposure_us
                 .max(self.previous_frame_exposure_us),
         )
+        .saturating_add(self.pacing)
     }
 
     pub(crate) fn expired(&self, now: Duration) -> bool {
@@ -259,6 +266,17 @@ impl Settling {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_fps_wait_is_bounded_but_not_a_stalled_exposure() {
+        let mut wait = super::FrameWait::new(1000);
+        wait.set_pacing_allowance(std::time::Duration::from_secs(100));
+        assert!(!wait.expired(std::time::Duration::from_secs(100)));
+        assert!(wait.expired(std::time::Duration::from_secs(106)));
+        wait.frame_received(std::time::Duration::from_secs(100));
+        wait.set_pacing_allowance(std::time::Duration::ZERO);
+        assert!(wait.expired(std::time::Duration::from_secs(106)));
+    }
+
     use super::*;
 
     #[test]

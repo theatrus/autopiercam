@@ -61,6 +61,72 @@ fn frame(camera: &mut Camera) -> Vec<u8> {
     }
 }
 #[test]
+fn asi662_video_preserves_fps_across_idle_and_exposure_changes() {
+    let driver = driver(CameraDriver::ZwoDirect, json!({}), None);
+    let info = driver
+        .cameras()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "ZWO ASI662MC")
+        .unwrap();
+    let mut camera = driver.open(info).unwrap();
+    camera
+        .set_control(ControlType::EXPOSURE, 1000, false)
+        .unwrap();
+    camera
+        .set_roi(Roi {
+            width: 64,
+            height: 64,
+            bin: 1,
+            image_type: ImageType::Raw16,
+        })
+        .unwrap();
+    camera.set_max_fps(0.5).unwrap();
+    for invalid in [0.0, -1.0, 31.0, f64::NAN, f64::INFINITY] {
+        assert!(camera.set_max_fps(invalid).is_err());
+    }
+    assert!(camera.uses_video());
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(2));
+    camera.start_capture().unwrap();
+    frame(&mut camera);
+    let first = Instant::now();
+    camera.pause_between_frames().unwrap();
+    camera
+        .set_control(ControlType::EXPOSURE, 2000, false)
+        .unwrap();
+    camera.start_capture().unwrap();
+    frame(&mut camera);
+    assert!(first.elapsed() >= Duration::from_millis(1950));
+    camera.stop_capture().unwrap();
+    camera
+        .set_control(ControlType::EXPOSURE, 30_000_001, false)
+        .unwrap();
+    assert!(
+        !camera.uses_video(),
+        "long exposures must use still capture"
+    );
+    assert_eq!(camera.pacing_allowance(), Duration::ZERO);
+    camera
+        .set_control(ControlType::EXPOSURE, 1000, false)
+        .unwrap();
+    camera.set_max_fps(0.01).unwrap();
+    camera.start_capture().unwrap();
+    frame(&mut camera);
+    assert!(
+        camera
+            .poll_frame(&mut Vec::new(), 1)
+            .unwrap_err()
+            .is_timeout()
+    );
+    // Raising FPS does not hide the in-flight 100-second pacing allowance.
+    camera.set_max_fps(30.0).unwrap();
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(100));
+    let stopping = Instant::now();
+    camera.stop_capture().unwrap();
+    assert!(stopping.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
 fn sdk_and_direct_capture_without_discovery_while_owned() {
     for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
         let driver = driver(backend, json!({"instant":true}), None);
