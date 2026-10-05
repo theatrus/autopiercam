@@ -2511,7 +2511,7 @@ dependencies = [
 [[package]]
 name = "regain-core"
 version = "0.5.9"
-source = "git+https://github.com/pulsarfab/regain?rev=96a5d05710c9957afde1180f6a4ac4babe005214#96a5d05710c9957afde1180f6a4ac4babe005214"
+source = "git+https://github.com/pulsarfab/regain?rev=76e649816382e1ccd877b1f97d42bdf92cef76c5#76e649816382e1ccd877b1f97d42bdf92cef76c5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2526,7 +2526,7 @@ dependencies = [
 [[package]]
 name = "regain-transport"
 version = "0.5.9"
-source = "git+https://github.com/pulsarfab/regain?rev=96a5d05710c9957afde1180f6a4ac4babe005214#96a5d05710c9957afde1180f6a4ac4babe005214"
+source = "git+https://github.com/pulsarfab/regain?rev=76e649816382e1ccd877b1f97d42bdf92cef76c5#76e649816382e1ccd877b1f97d42bdf92cef76c5"
 dependencies = [
  "anyhow",
  "nusb",
@@ -2539,7 +2539,7 @@ dependencies = [
 [[package]]
 name = "regain-worker"
 version = "0.5.9"
-source = "git+https://github.com/pulsarfab/regain?rev=96a5d05710c9957afde1180f6a4ac4babe005214#96a5d05710c9957afde1180f6a4ac4babe005214"
+source = "git+https://github.com/pulsarfab/regain?rev=76e649816382e1ccd877b1f97d42bdf92cef76c5#76e649816382e1ccd877b1f97d42bdf92cef76c5"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2548,7 +2548,7 @@ dependencies = [
 [[package]]
 name = "regain-zwo"
 version = "0.5.9"
-source = "git+https://github.com/pulsarfab/regain?rev=96a5d05710c9957afde1180f6a4ac4babe005214#96a5d05710c9957afde1180f6a4ac4babe005214"
+source = "git+https://github.com/pulsarfab/regain?rev=76e649816382e1ccd877b1f97d42bdf92cef76c5#76e649816382e1ccd877b1f97d42bdf92cef76c5"
 dependencies = [
  "anyhow",
  "libc",
