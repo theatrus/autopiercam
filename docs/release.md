@@ -40,6 +40,12 @@ Viewer** job on the release PR (as it did for 0.2.6).
 
 ### Check for strays
 
+When updating Regain, keep the worker's `--version` label and the exact
+expectation in `scripts/RegainWorkerVersion.ps1` aligned. Run
+`./scripts/Test-RegainWorkerVersion.ps1`: it exercises the built worker's
+hardware-free version path and the same strict check used by MSI staging.
+Windows PR CI runs this contract before release packaging.
+
 Search for both forms of the old version. The second catches the test's
 `new Version(...)` form:
 

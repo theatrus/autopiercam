@@ -15,6 +15,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'PeImports.ps1')
 . (Join-Path $PSScriptRoot 'IconValidation.ps1')
+. (Join-Path $PSScriptRoot 'RegainWorkerVersion.ps1')
 
 if ($StageOnly -and $PackageOnly) {
     throw 'Specify at most one of -StageOnly and -PackageOnly.'
@@ -514,9 +515,7 @@ function Assert-StagedPayload {
     Assert-AutoPierCamApplicationManifest -Path $regainPath -Version $Version -AssemblyName 'AutoPierCam.Regain'
     Assert-AutoPierCamIconResource -Path $regainPath -ResourceId 1 -Description 'Regain camera worker'
     $regainVersion = (& $regainPath --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $regainVersion -cne "autopiercam-regain-worker $Version (Regain 75c8e93bb9f5)") {
-        throw 'Regain worker version mismatch.'
-    }
+    Assert-RegainWorkerVersion -Output $regainVersion -ExitCode $LASTEXITCODE -Version $Version
 
     $visionPath = Join-Path $stageRoot 'autopiercam-vision.exe'
     Assert-AutoPierCamStaticCrt -Path $visionPath -Description 'Staged vision worker'

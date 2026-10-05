@@ -24,6 +24,9 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --all-targets --locked
+      - name: Regain worker packaging version contract (no hardware)
+        shell: pwsh
+        run: ./scripts/Test-RegainWorkerVersion.ps1
       - run: dotnet build apps/AutoPierCam.Viewer/AutoPierCam.Viewer.csproj --configuration Release -p:Platform=x64
       - run: dotnet test integrations/AutoPierCam.NINA/AutoPierCam.NINA.slnx --configuration Release
       - run: dotnet test apps/AutoPierCam.Viewer.Tests --configuration Release
