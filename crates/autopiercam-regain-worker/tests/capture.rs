@@ -330,6 +330,36 @@ fn selected_serials_accept_case_variants_and_reject_mismatches() {
 }
 
 #[test]
+fn direct_model_candidate_checks_saved_serial_before_capture() {
+    for (serial, should_open) in [("DIRECT-SIMULATOR", true), ("wrong-serial", false)] {
+        let driver = driver(CameraDriver::ZwoDirect, json!({}), Some(serial.into()));
+        let mut candidate = driver
+            .cameras()
+            .unwrap()
+            .into_iter()
+            .find(|camera| camera.name == "ZWO ASI662MC")
+            .unwrap();
+        assert!(candidate.serial.is_none());
+        // The simulated list omits locators; real metadata discovery supplies one.
+        // Use the simulator's exact interface to exercise the selected-open path.
+        candidate.locator = Some("simulated-interface".into());
+        match driver.open(candidate) {
+            Ok(camera) => {
+                assert!(should_open, "must not accept a mismatching saved serial");
+                assert_eq!(camera.info().serial.as_deref(), Some("direct-simulator"));
+                drop(camera);
+            }
+            Err(error) => {
+                assert!(!should_open, "{error:#}");
+                assert!(format!("{error:#}").contains("camera identity differs"));
+            }
+        }
+        // A failed verification must not leave ownership latched either.
+        assert!(driver.cameras().is_ok());
+    }
+}
+
+#[test]
 fn blank_serial_filters_open_a_single_matching_camera() {
     for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
         for serial in ["", "  "] {
