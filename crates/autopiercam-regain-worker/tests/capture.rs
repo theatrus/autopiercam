@@ -64,7 +64,7 @@ fn frame(camera: &mut Camera) -> Vec<u8> {
 fn sdk_failed_exposure_retries_once_without_reopening_or_delivering_bad_pixels() {
     let driver = driver(
         CameraDriver::ZwoSdk,
-        json!({"instant":true,"failedStatuses":1}),
+        json!({"instant":true,"failedStatuses":1,"legacyProtocol":true}),
         None,
     );
     let mut camera = setup(&driver);
@@ -80,7 +80,7 @@ fn sdk_failed_exposure_retries_once_without_reopening_or_delivering_bad_pixels()
 fn sdk_repeated_failed_exposure_is_bounded_and_can_stop_after_first_failure() {
     let driver = driver(
         CameraDriver::ZwoSdk,
-        json!({"instant":true,"failedStatuses":2}),
+        json!({"instant":true,"failedStatuses":2,"legacyProtocol":true}),
         None,
     );
     let mut camera = setup(&driver);
@@ -91,7 +91,11 @@ fn sdk_repeated_failed_exposure_is_bounded_and_can_stop_after_first_failure() {
     assert!(error.to_string().contains("state Some(3)"));
     assert_eq!(pixels, vec![123; 7]);
     drop(camera);
-    let driver = self::driver(CameraDriver::ZwoSdk, json!({"failedStatuses":1}), None);
+    let driver = self::driver(
+        CameraDriver::ZwoSdk,
+        json!({"failedStatuses":1,"legacyProtocol":true}),
+        None,
+    );
     let mut camera = setup(&driver);
     assert!(camera.poll_frame(&mut pixels, 50).unwrap_err().is_timeout());
     camera.stop_capture().unwrap();
@@ -130,7 +134,7 @@ fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
         assert!(camera.set_max_fps(invalid).is_err());
     }
     assert!(camera.uses_video());
-    assert_eq!(camera.pacing_allowance(), Duration::from_secs(19));
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(47));
     camera.start_capture().unwrap();
     frame(&mut camera);
     let first = Instant::now();
@@ -149,7 +153,7 @@ fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
         !camera.uses_video(),
         "long exposures must use still capture"
     );
-    assert_eq!(camera.pacing_allowance(), Duration::ZERO);
+    assert_eq!(camera.pacing_allowance(), Duration::from_secs(47));
     camera
         .set_control(ControlType::EXPOSURE, 1000, false)
         .unwrap();
@@ -162,10 +166,9 @@ fn video_preserves_fps_across_idle_and_exposure_changes(name: &str) {
             .unwrap_err()
             .is_timeout()
     );
-    // Raising FPS does not hide either in-flight 100-second pacing slot or
-    // the advertised stream-recovery overhead.
+    // Delivery cadence is adjustable without a 100-second acquisition sleep.
     camera.set_max_fps(30.0).unwrap();
-    assert_eq!(camera.pacing_allowance(), Duration::from_secs(215));
+    assert!(camera.pacing_allowance() < Duration::from_secs(46));
     let stopping = Instant::now();
     camera.stop_capture().unwrap();
     assert!(stopping.elapsed() < Duration::from_secs(3));
@@ -360,7 +363,9 @@ fn managed_white_balance_is_shared_and_precedes_raw8_conversion() {
     use autopiercam_core::config::{WhiteBalanceConfig, WhiteBalanceMode};
     use regain_core::white_balance::{Gains, Geometry, Mode, Output, Settings, WhiteBalance};
     for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
-        let driver = driver(backend, json!({"instant":true}), None);
+        // This exact per-frame AWB expectation uses the retained still path.
+        // Continuous AWB runs on every acquired frame, including replaced frames.
+        let driver = driver(backend, json!({"instant":true,"legacyProtocol":true}), None);
         let mut camera = setup(&driver);
         let original = frame(&mut camera);
         assert!(
@@ -480,6 +485,55 @@ fn managed_white_balance_is_shared_and_precedes_raw8_conversion() {
     }
 }
 #[test]
+fn continuous_manual_white_balance_precedes_delivery_decimation() {
+    use autopiercam_core::config::{WhiteBalanceConfig, WhiteBalanceMode};
+    use regain_core::white_balance::{Gains, Geometry, Mode, Output, Settings, WhiteBalance};
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        let driver = driver(backend, json!({"instant":true}), None);
+        let mut camera = setup(&driver);
+        let mut expected = frame(&mut camera);
+        camera.stop_capture().unwrap();
+        camera
+            .configure_white_balance(&WhiteBalanceConfig {
+                mode: WhiteBalanceMode::Manual,
+                red: 2.0,
+                blue: 0.5,
+            })
+            .unwrap();
+        let mut engine = WhiteBalance::default();
+        engine
+            .configure(Settings {
+                mode: Mode::Manual,
+                gains: Gains {
+                    red: 2.0,
+                    blue: 0.5,
+                },
+                output: Output::Corrected,
+            })
+            .unwrap();
+        engine
+            .process(
+                &mut expected,
+                Geometry {
+                    width: 64,
+                    height: 64,
+                    x: 0,
+                    y: 0,
+                    bayer: 0,
+                    dark: false,
+                },
+            )
+            .unwrap();
+        camera.set_max_fps(2.0).unwrap();
+        camera.start_capture().unwrap();
+        assert!(frame(&mut camera) == expected);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(frame(&mut camera) == expected);
+        camera.stop_capture().unwrap();
+    }
+}
+
+#[test]
 fn pending_frames_keep_metadata_and_apply_edits_to_next_exposure() {
     let driver = driver(CameraDriver::ZwoSdk, json!({}), None);
     let mut camera = setup(&driver);
@@ -493,7 +547,8 @@ fn pending_frames_keep_metadata_and_apply_edits_to_next_exposure() {
             .is_timeout()
     );
     camera.set_control(ControlType::GAIN, 250, false).unwrap();
-    assert_eq!(camera.control_value(ControlType::GAIN).unwrap().value, 200);
+    // Desired controls update locally; the worker fences old-generation frames.
+    assert_eq!(camera.control_value(ControlType::GAIN).unwrap().value, 250);
     frame(&mut camera);
     frame(&mut camera);
     assert_eq!(camera.control_value(ControlType::GAIN).unwrap().value, 250);

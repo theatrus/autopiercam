@@ -990,8 +990,8 @@ impl CaptureProgress {
         if remaining().is_zero() || control.is_some_and(AgentControl::is_shutdown) {
             return Ok(());
         }
-        // Direct video has no background USB downloads. Keep its sensor setup
-        // and pacing history; other modes retain the existing stopped-idle path.
+        // Continuous workers keep draining their latest-frame slot while this
+        // consumer waits. Legacy modes retain their existing idle behavior.
         camera.pause_between_frames()?;
         loop {
             // Settling cannot apply reloads yet; do not let a pending save

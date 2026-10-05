@@ -1,7 +1,8 @@
 # Regain camera backend
 
-AutoPierCam 0.2.20 adopts Regain 0.5.7 for bounded in-worker recovery of a
-malformed Direct USB video frame and adds SDK failed-exposure recovery. Published
+AutoPierCam 0.2.21 adopts Regain 0.5.8 continuous acquisition, with boundary-safe
+scalar control changes and delivery-side FPS pacing. AutoPierCam 0.2.20 adopted
+Regain 0.5.7 for bounded malformed-frame and SDK failed-exposure recovery. Published
 AutoPierCam 0.2.19 adopted Regain 0.5.6 from its `v0.5.6.0` release, including
 ASI676MC Direct USB video in [Regain PR #13](https://github.com/pulsarfab/regain/pull/13),
 following the ASI662MC video support adopted in AutoPierCam 0.2.18.
@@ -18,26 +19,27 @@ framed transport, deadlines and process supervision.
 
 ASI662MC/ASI676MC Direct USB uses the worker's advertised video mode for exposures up to
 30 seconds. Longer exposures use retained still capture without lowering the
-configured exposure ceiling. SDK uses still exposures.
+configured exposure ceiling. SDK uses native video on its supported cameras.
 
-Video reuses sensor setup and calibration, honors the configured fractional FPS
-cap on grabs (including settling), and preserves that cap across adaptive exposure
-changes. Intentional worker FPS waits are included in the stall budget. Stopping
-capture cancels video even between frames. No background downloads, discovery
-sweeps or physical USB resets were added. Sensor output is not itself FPS-limited:
-slow consumers can receive buffered frames, not necessarily the newest scene.
+The exclusive acquisition owner keeps draining independently of IPC, storage and
+preview pacing. A bounded latest-frame slot replaces older frames; fractional FPS
+limits delivery, not sensor output. Exposure/gain edits are applied after a frame
+drains without restarting native video. Structural edits stop/reconfigure/start.
+Transitions clear old buffers and discard at least two reads for old-plus-new
+exposure time. This conservative fence is not optical proof of a sensor latch.
+No extra discovery sweeps or implicit physical USB resets are added.
 
-When a newer worker advertises `videoFrameRecoveryAttempts: 1`, the adapter
-reserves a second FPS interval plus 15 seconds of stream-restart overhead in
-addition to the existing two-exposure/five-second frame deadline. The allowance
-is retained for an in-flight request even if FPS is edited. Legacy workers and
-still/SDK capture keep their existing budgets. This capability-aware support
-is paired with the upstream framing-recovery commit in the current source pin.
-Invalid pixels are never accepted.
+Watchdogs include delivery cadence, prior exposure, the transition fence and
+advertised framing-recovery overhead. SDK read timeouts back off by 100 ms
+without stop/start; no-frame waits and terminal errors remain bounded. Diagnostic
+status distinguishes acquisition, delivery, replacement and pending settings.
+Replaced frames are consumer decimation, not measured USB drops. Invalid pixels
+are never accepted. The legacy single-exposure path remains available to older
+workers and retains its recovery budget.
 
 ### Fault diagnosis and bounded recovery
 
-Current source retries an SDK `ASI_EXP_FAILED` (status 3) once by stopping and
+The legacy single-exposure path retries SDK `ASI_EXP_FAILED` (status 3) once by stopping and
 starting a fresh exposure on the same handle. This is an exposure status, not
 an SDK API error code. The original outer frame deadline remains in force;
 no configuration, disconnect, download or arbitrary SDK API error is silently

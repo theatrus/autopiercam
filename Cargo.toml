@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.20"
+version = "0.2.21"
 edition = "2024"
 authors = ["Yann Ramin"]
 description = "Unattended capture, monitoring, and upload tools for ZWO ASI planetary cameras"
@@ -23,9 +23,9 @@ repository = "https://github.com/theatrus/autopiercam"
 rust-version = "1.89"
 
 [workspace.dependencies]
-regain-core = { git = "https://github.com/pulsarfab/regain", rev = "b30ee9c53bff84bcbfe1acd415e5e4bfb52d443f" }
-regain-transport = { git = "https://github.com/pulsarfab/regain", rev = "b30ee9c53bff84bcbfe1acd415e5e4bfb52d443f" }
-regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "b30ee9c53bff84bcbfe1acd415e5e4bfb52d443f", default-features = false, features = ["asi-sdk", "asi-direct"] }
+regain-core = { git = "https://github.com/pulsarfab/regain", rev = "987760fb55b7f48e7d5be855ae4a4beb423936cf" }
+regain-transport = { git = "https://github.com/pulsarfab/regain", rev = "987760fb55b7f48e7d5be855ae4a4beb423936cf" }
+regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "987760fb55b7f48e7d5be855ae4a4beb423936cf", default-features = false, features = ["asi-sdk", "asi-direct"] }
 anyhow = "1.0.100"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.5.51", features = ["derive", "env"] }
