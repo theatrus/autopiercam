@@ -219,9 +219,10 @@ Only the capture owner starts or commands a worker. Discovery runs before open,
 never while acquiring, settling or paused. IPC and the Viewer use cached
 inventory and previews; they do not open camera handles.
 
-Frames use Regain's start/status/download API, paced to the configured preview
-rate and still schedule. RAW16 is acquired for both output modes; RAW8 is
-derived from the high byte locally. The adapter validates dimensions, byte
+With the current continuous-capable worker, frames use `stream-start` and
+atomic cached `stream-poll`; acquisition drains independently of delivery FPS.
+Legacy workers retain the start/status/download path. RAW16 is acquired for both
+output modes; RAW8 is derived from the high byte locally. The adapter validates dimensions, byte
 length, ROI alignment, RAW16 support and Bayer phase. Cleanup errors reject
 the frame.
 
@@ -232,9 +233,15 @@ Edits during exposure wait for the next frame, without resetting settling.
 A direct-backend exposure ceiling above its capabilities faults visibly rather
 than silently shortening night exposures.
 
-Regain calls have parent-enforced deadlines (15 s open, 5 s controls/start,
-2 s status/stop/close, 10 s download); frame progress retains AutoPierCam's
-exposure-aware deadline. A poll reporting 'exposing' is not a completed frame.
+Regain calls have parent-enforced deadlines: the legacy defaults are 15 s open,
+5 s controls/start, 2 s status/stop/close and 10 s download. While SDK video or
+a continuous SDK session is active, calls have an 8 s minimum; atomic
+`stream-poll` retains its 10 s parent deadline. These are fault bounds, not
+acceptable routine IPC latency. Cached polls do not wait for camera reads,
+but owner commands such as settings and stop may await the bounded native read.
+A separate 10 s owner-liveness latch rejects stale buffered frames even if IPC
+remains responsive. Frame progress retains AutoPierCam's exposure-aware deadline.
+A poll reporting 'exposing' is not a completed frame.
 Faults terminate the worker. Once the camera-owning thread and its cleanup have
 finished, the tray waits 30 seconds and automatically starts a fresh session with
 the saved backend and camera selection. Repeated failures each wait 30 seconds;
@@ -293,6 +300,11 @@ recorded in [AutoPierCam PR #12](https://github.com/theatrus/autopiercam/pull/12
 and [Regain PR #1](https://github.com/pulsarfab/regain/pull/1).
 
 ## Build and validation
+
+See the [capture timing retrospective and test plan](capture-timing-test-plan.md)
+for the 0.2.22 evidence, assertion gaps, separate timing clocks and prioritized
+remaining tests. Historical hardware results below are not fresh qualification
+of every later release or model.
 
 ```powershell
 cargo build -p autopiercam -p autopiercam-tray -p autopiercam-regain-worker
