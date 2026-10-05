@@ -2269,22 +2269,43 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
                 .is_some_and(|s| s.eq_ignore_ascii_case(serial))
         })
     });
-    let mut cameras = cameras.into_iter().filter(|camera| {
+    let matches_identity = |camera: &CameraInfo| {
         config.serial.as_deref().is_none_or(|serial| {
             camera
                 .serial
                 .as_deref()
                 .map_or(!known_serial, |found| found.eq_ignore_ascii_case(serial))
-        }) && (known_serial
+        }) && config.name_contains.as_ref().is_none_or(|needle| {
+            camera
+                .name
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        })
+    };
+    let matches_id = |camera: &CameraInfo| {
+        known_serial
             || config
                 .camera_id
-                .is_none_or(|camera_id| camera.camera_id == camera_id))
-            && config.name_contains.as_ref().is_none_or(|needle| {
-                camera
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&needle.to_ascii_lowercase())
-            })
+                .is_none_or(|camera_id| camera.camera_id == camera_id)
+    };
+    // Direct inventory is metadata-only: its product IDs are not SDK ordinals,
+    // and the saved serial cannot be verified until we open the chosen locator.
+    // If a stale ID rejects every candidate, permit a unique explicitly named
+    // model with unknown serial. Driver::open still checks the saved serial
+    // before capture. Never turn this fallback into an all-camera serial sweep.
+    let verify_direct_candidate = config.driver == CameraDriver::ZwoDirect
+        && !known_serial
+        && config.serial.as_ref().is_some_and(|s| !s.trim().is_empty())
+        && config
+            .name_contains
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        && !cameras
+            .iter()
+            .any(|camera| matches_identity(camera) && matches_id(camera));
+    let mut cameras = cameras.into_iter().filter(|camera| {
+        matches_identity(camera)
+            && (matches_id(camera) || (verify_direct_candidate && camera.serial.is_none()))
     });
     let selected = cameras
         .next()
@@ -2294,6 +2315,15 @@ fn select_configured_camera(cameras: Vec<CameraInfo>, config: &CameraConfig) -> 
     if cameras.next().is_some() {
         bail!(
             "more than one connected camera matches the configuration; choose a camera in the Viewer and save settings"
+        );
+    }
+    if verify_direct_candidate {
+        if selected.locator.as_deref().is_none_or(str::is_empty) {
+            bail!("matching Direct camera has no interface locator; refresh discovery");
+        }
+        info!(
+            model = selected.name,
+            "Saved camera ID not found; verifying saved serial on the unique matching Direct interface"
         );
     }
     Ok(selected)
@@ -2788,6 +2818,91 @@ mod tests {
         config.serial = Some("explicit-selection".into());
         config.camera_id = Some(99);
         assert!(select_configured_camera(cameras, &config).is_err());
+    }
+
+    #[test]
+    fn direct_startup_uses_unique_model_interface_to_verify_saved_serial() {
+        let mut camera = detected_camera(26155, "ASI662MC");
+        camera.locator = Some("fixture-662-interface".into());
+        let config = CameraConfig {
+            driver: CameraDriver::ZwoDirect,
+            camera_id: Some(0), // SDK ordinal, not the Direct product ID.
+            name_contains: Some("asi662mc".into()),
+            serial: Some("abcdef0123456789".into()),
+            ..CameraConfig::default()
+        };
+        let mut cache = CameraDiscovery::default();
+        let selected = cache
+            .select(&config, Instant::now(), || {
+                Ok(vec![detected_camera(99, "ASI676MC"), camera.clone()])
+            })
+            .unwrap();
+        assert_eq!(selected.locator, camera.locator);
+        // Selection is only a candidate: open must still verify the saved serial.
+        assert!(selected.serial.is_none());
+        assert_eq!(config.camera_id, Some(0));
+        let mut verified = selected;
+        verified.serial = config.serial.clone();
+        cache.remember(&config, &verified);
+        assert_eq!(
+            cache
+                .select(&config, Instant::now(), || panic!("must not rescan"))
+                .unwrap()
+                .serial,
+            config.serial
+        );
+    }
+
+    #[test]
+    fn direct_serial_fallback_requires_model_serial_locator_and_unique_candidate() {
+        let mut camera = detected_camera(26155, "ASI662MC");
+        camera.locator = Some("fixture-one".into());
+        let config = CameraConfig {
+            driver: CameraDriver::ZwoDirect,
+            camera_id: Some(0),
+            name_contains: Some("662".into()),
+            serial: Some("abcdef0123456789".into()),
+            ..CameraConfig::default()
+        };
+        let mut other = camera.clone();
+        other.locator = Some("fixture-two".into());
+        assert!(select_configured_camera(vec![camera.clone(), other], &config).is_err());
+        for invalid in [
+            CameraConfig {
+                driver: CameraDriver::ZwoSdk,
+                ..config.clone()
+            },
+            CameraConfig {
+                serial: None,
+                ..config.clone()
+            },
+            CameraConfig {
+                serial: Some(String::new()),
+                ..config.clone()
+            },
+            CameraConfig {
+                name_contains: None,
+                ..config.clone()
+            },
+            CameraConfig {
+                name_contains: Some(" ".into()),
+                ..config.clone()
+            },
+            CameraConfig {
+                name_contains: Some("676".into()),
+                ..config.clone()
+            },
+        ] {
+            assert!(select_configured_camera(vec![camera.clone()], &invalid).is_err());
+        }
+        let mut no_locator = camera.clone();
+        no_locator.locator = None;
+        assert!(
+            select_configured_camera(vec![camera.clone(), no_locator.clone()], &config).is_err()
+        );
+        assert!(select_configured_camera(vec![no_locator], &config).is_err());
+        camera.serial = Some("different-serial".into());
+        assert!(select_configured_camera(vec![camera], &config).is_err());
     }
 
     #[test]
