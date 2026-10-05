@@ -67,6 +67,13 @@ minimum N.I.N.A. version.
 
 ## 3. Merge through a pull request
 
+For behavioral timing changes, follow the
+[capture timing test plan](capture-timing-test-plan.md). Name the timing or
+blocking regression, record lower and upper bounds and sample counts, and show
+that a negative control fails. Require an independent requirement-derived review
+of the assertions, not just a test count or green CI. Record unexecuted hardware
+or installed-artifact cases explicitly; this checklist does not authorize them.
+
 Open a PR named `Release AutoPierCam X.Y.Z`. Wait for every CI job, including
 **Windows capture, sharing and Viewer**, which runs the N.I.N.A. and Viewer
 tests. Squash-merge it.
