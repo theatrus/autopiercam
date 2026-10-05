@@ -1070,6 +1070,11 @@ impl<'a> CaptureObserver<'a> {
     }
 
     fn adapt(&mut self, camera: &mut Camera, frame: &CompletedFrame) -> Result<bool> {
+        // A live settings write does not identify which integration produced
+        // these pixels. Preview them, but never use them to drive another edit.
+        if !frame.meta.settings_settled {
+            return Ok(false);
+        }
         let Some(controller) = &mut self.adaptive else {
             return Ok(false);
         };
@@ -1092,9 +1097,12 @@ impl<'a> CaptureObserver<'a> {
     }
 
     fn frame_received(&mut self, frame: &CompletedFrame, settling: bool, paused: bool) {
-        let sdk_mode = self
-            .sdk_mode
-            .observe(frame.exposure_us, self.mode_started.elapsed());
+        let sdk_mode = if frame.meta.settings_settled {
+            self.sdk_mode
+                .observe(frame.exposure_us, self.mode_started.elapsed())
+        } else {
+            autopiercam_protocol::PreviewMode::Unknown
+        };
         if let Some(monitor) = self.monitor {
             if settling {
                 monitor.settling_frame_captured();
@@ -1115,7 +1123,13 @@ impl<'a> CaptureObserver<'a> {
                 captured_at_unix_ms: frame.captured_at_unix_ms,
                 exposure_us: frame.exposure_us,
                 gain: frame.gain,
-                mode: match self.adaptive.as_ref().map(AdaptiveExposure::mode) {
+                settings_settled: frame.meta.settings_settled,
+                mode: match self
+                    .adaptive
+                    .as_ref()
+                    .filter(|_| frame.meta.settings_settled)
+                    .map(AdaptiveExposure::mode)
+                {
                     None => sdk_mode,
                     Some(LightMode::Day) => autopiercam_protocol::PreviewMode::Day,
                     Some(LightMode::Night) => autopiercam_protocol::PreviewMode::Night,
@@ -1844,6 +1858,11 @@ fn capture_loop(
             let meta = frame.meta;
             let exposure_us = frame.exposure_us;
             frame_buffer = frame.data;
+            // Keep explicit snapshot requests pending until settings provenance
+            // is settled. Transitional frames have already reached preview.
+            if !meta.settings_settled {
+                continue;
+            }
             let now = Instant::now();
             let capture_generation = control.capture_generation();
             let capture_requested = capture_generation != state.seen_capture_generation;
@@ -1975,8 +1994,14 @@ fn wait_for_auto_settle(
         };
         // The SDK readback is asynchronous. It is a convergence/progress signal,
         // not an assertion that exposure/gain are exact for these sensor bytes.
-        let stats = frame_stats(meta, &frame_buffer)?;
         let frame = progress.completed_frame(meta, &mut frame_buffer);
+        if !frame.meta.settings_settled {
+            observer.frame_received(&frame, true, control.is_some_and(AgentControl::is_paused));
+            progress.publish(observer);
+            frame_buffer = frame.data;
+            continue;
+        }
+        let stats = frame_stats(frame.meta, &frame.data)?;
         let settled =
             settling.observe_frame(progress.started.elapsed(), frame.exposure_us, frame.gain);
         progress.status.settling_frames = settling.received();
@@ -2932,6 +2957,7 @@ mod tests {
             width: 2,
             height: 2,
             image_type: ImageType::Raw8,
+            settings_settled: true,
         };
         let frame = progress.completed_frame(meta, &mut scratch);
         let mut settling = Settling::new(
@@ -2971,6 +2997,7 @@ mod tests {
                 width: 4,
                 height: 4,
                 image_type: ImageType::Raw8,
+                settings_settled: true,
             },
             &mut raw,
         );

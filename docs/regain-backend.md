@@ -25,8 +25,17 @@ The exclusive acquisition owner keeps draining independently of IPC, storage and
 preview pacing. A bounded latest-frame slot replaces older frames; fractional FPS
 limits delivery, not sensor output. Exposure/gain edits are applied after a frame
 drains without restarting native video. Structural edits stop/reconfigure/start.
-Transitions clear old buffers and discard at least two reads for old-plus-new
-exposure time. This conservative fence is not optical proof of a sensor latch.
+Transitions clear old buffers and fence at least two reads for old-plus-new
+exposure time. The source build opts into transition-frame delivery for preview:
+uncertain frames have null exposure/gain metadata and do not drive adaptive
+exposure, count toward startup convergence, or satisfy saved snapshot requests.
+Settled frames resume those consumers. This conservative fence is not optical
+proof of a sensor latch. Raw arrival counters distinguish sensor progress from
+settled-frame delivery.
+SDK video reads have an exposure-derived 500 ms–5 s wait; normal timeout polling
+and the exposure-aware no-progress watchdog remain separate. The adapter allows
+at least 8 s for IPC while SDK video is active, including stop/close, so a valid
+five-second read does not trigger the former two-second IPC deadline.
 No extra discovery sweeps or implicit physical USB resets are added.
 
 Watchdogs include delivery cadence, prior exposure, the transition fence and
