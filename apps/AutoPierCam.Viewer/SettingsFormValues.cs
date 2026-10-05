@@ -40,6 +40,14 @@ internal sealed record SettingsFormValues
             ? Number(value) : "invalid:" + text;
     }
 
+    internal static double ReadNumberText(string? text, CultureInfo culture)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return double.NaN; // optional field unset
+        if (double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands, culture, out double value)
+            && double.IsFinite(value)) return value;
+        throw new InvalidOperationException("Enter a valid number.");
+    }
+
     internal static SettingsFormValues FromConfiguration(AgentConfiguration config) => new() {
         Driver = config.Camera.Driver ?? "zwo_sdk", Serial = Text(config.Camera.Serial),
         UsbResetOnFault = config.Camera.UsbResetOnFault == true,

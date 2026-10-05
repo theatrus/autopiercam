@@ -1,8 +1,6 @@
 using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
 
 namespace AutoPierCam.Viewer;
 
@@ -14,10 +12,9 @@ public sealed partial class MainWindow
 
     private void TrackSettingsEdits()
     {
-        foreach (NumberBox input in new[] { MaxExposureNumberBox, MaxGainNumberBox, MinGainNumberBox, StillIntervalNumberBox,
-            RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox, LatitudeNumberBox, LongitudeNumberBox,
-            WhiteBalanceRedNumberBox, WhiteBalanceBlueNumberBox })
+        foreach (NumberBox input in CaptureNumberBoxes)
         {
+            TrackNumberEditor(input, MarkSettingsEdited);
             input.ValueChanged += (_, _) => MarkSettingsEdited();
             input.LostFocus += (_, _) => MarkSettingsEdited();
             // Text can change before Value commits on Enter/focus loss. Make
@@ -36,9 +33,14 @@ public sealed partial class MainWindow
 
     }
 
+    private NumberBox[] CaptureNumberBoxes => new[] { MaxExposureNumberBox, MaxGainNumberBox, MinGainNumberBox, StillIntervalNumberBox,
+        RetentionMaxMiBNumberBox, RetentionMinFreeMiBNumberBox, PreviewMaxFpsNumberBox, LatitudeNumberBox, LongitudeNumberBox,
+        WhiteBalanceRedNumberBox, WhiteBalanceBlueNumberBox };
+
     private void MarkSettingsEdited()
     {
         if (_operationInProgress || _settingsBaseline is null || _closed || _settingsComparisonQueued) return;
+        _settingsSaveResult = null;
         // NumberBox can notify Text and Value separately during formatting.
         // Compare after the current control update, not its intermediate state.
         _settingsComparisonQueued = DispatcherQueue.TryEnqueue(() => {
@@ -52,8 +54,7 @@ public sealed partial class MainWindow
         });
     }
 
-    private async void CaptureDiscardButton_Click(object sender, RoutedEventArgs e) =>
-        await RunUiOperationAsync("Discarding unsaved settings…", RefreshStatusAndConfigurationAsync);
+    private async void CaptureDiscardButton_Click(object sender, RoutedEventArgs e) => await DiscardAllSettingsAsync();
 
     private async void CaptureKeepEditsButton_Click(object sender, RoutedEventArgs e) =>
         await RunUiOperationAsync("Loading the latest settings to keep your edits…", KeepCaptureEditsAsync);
@@ -88,13 +89,7 @@ public sealed partial class MainWindow
     {
         string Number(NumberBox box)
         {
-            // Focus can belong to the NumberBox's inner TextBox rather than
-            // the NumberBox itself. Include that in pending-text detection.
-            for (var focus = FocusManager.GetFocusedElement(Content.XamlRoot) as DependencyObject;
-                 focus is not null; focus = VisualTreeHelper.GetParent(focus))
-                if (ReferenceEquals(focus, box))
-                    return SettingsFormValues.NumberText(box.Text, CultureInfo.CurrentCulture);
-            return SettingsFormValues.Number(box.Value);
+            return SettingsFormValues.NumberText(LiveNumberText(box), CultureInfo.CurrentCulture);
         }
         return new() {
             Driver = CameraDriverComboBox.SelectedIndex == 1 ? "zwo_direct" : "zwo_sdk",

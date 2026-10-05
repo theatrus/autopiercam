@@ -7,7 +7,7 @@ use crate::{
     },
     service::{Frame, Settings, Shared, random_uuid},
     snapshot::{LocalState, SnapshotFence},
-    triggers::{Scheduler, telescope_summary},
+    triggers::{PeriodicSchedule, Scheduler, telescope_summary},
     vault,
 };
 use anyhow::{Result, bail};
@@ -111,6 +111,7 @@ impl Outbound {
 struct Observations {
     detector: Detector,
     last_new_event: Instant,
+    periodic: PeriodicSchedule,
 }
 
 pub(crate) async fn run(shared: Arc<Shared>) {
@@ -118,6 +119,7 @@ pub(crate) async fn run(shared: Arc<Shared>) {
     let mut outbox = None;
     let mut observations = Observations {
         detector: Detector::default(),
+        periodic: PeriodicSchedule::default(),
         last_new_event: Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now),
@@ -134,6 +136,14 @@ pub(crate) async fn run(shared: Arc<Shared>) {
             return;
         }
         let settings = shared.settings.read().unwrap().clone();
+        observations.periodic.configure(
+            if settings.preferences.enabled {
+                settings.rules().interval_minutes
+            } else {
+                0
+            },
+            now_ms(),
+        );
         if !settings.preferences.enabled || settings.device_id.is_none() {
             status(
                 &shared,
@@ -243,6 +253,7 @@ async fn session(
     let Observations {
         detector,
         last_new_event,
+        periodic,
     } = observations;
     let version = if settings.preferences.interval_minutes > 0
         || settings.preferences.telescope_events
@@ -288,7 +299,8 @@ async fn session(
         send(&mut socket, serde_json::json!({"type":"trigger_capabilities", "chat_configuration":settings.preferences.chat_configuration, "telescope_events":settings.preferences.telescope_events}).to_string()).await?;
     }
     let mut rules = settings.rules();
-    let mut scheduler = Scheduler::new(rules.clone(), Instant::now());
+    periodic.configure(rules.interval_minutes, now_ms());
+    let mut scheduler = Scheduler::new(rules.clone());
     let mut ticks = interval(Duration::from_millis(100));
     let mut last_rx = Instant::now();
     let mut request: Option<SnapshotFence> = None;
@@ -312,7 +324,8 @@ async fn session(
                         let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
                         if accepted {
                             rules = proposed;
-                            scheduler = Scheduler::new(rules.clone(), Instant::now());
+                            periodic.configure(rules.interval_minutes, now_ms());
+                            scheduler = Scheduler::new(rules.clone());
                             *detector = Detector::default();
                             // Clear reconnect-retained bytes before any awaited write.
                             *outbox = None; snapshot_outbox = None;
@@ -401,7 +414,7 @@ async fn session(
                         }
                     }
                 } else if frame.is_none() { *detector = Detector::default(); last_sequence = 0; }
-                let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms());
+                let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms(), periodic);
                 if let Some((kind, summary)) = due && let Some(f) = frame.as_ref()
                     && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
                     let encoded_frame = f.clone();

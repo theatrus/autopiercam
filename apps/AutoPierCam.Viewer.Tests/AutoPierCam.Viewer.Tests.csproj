@@ -17,6 +17,7 @@
     <Compile Include="../../shared/AutoPierCam.Preview/ExposureProgress.cs" Link="ExposureProgress.cs" />
     <Compile Include="../../shared/AutoPierCam.Preview/ExposureProgressClient.cs" Link="ExposureProgressClient.cs" />
     <Compile Include="../AutoPierCam.Viewer/SettingsFormValues.cs" Link="SettingsFormValues.cs" />
+    <Compile Include="../AutoPierCam.Viewer/SettingsSaveBatch.cs" Link="SettingsSaveBatch.cs" />
     <Compile Include="../AutoPierCam.Viewer/StatusPollResult.cs" Link="StatusPollResult.cs" />
     <Compile Include="../AutoPierCam.Viewer/SettingsLayout.cs" Link="SettingsLayout.cs" />
     <Compile Include="../AutoPierCam.Viewer/ViewerPresentation.cs" Link="ViewerPresentation.cs" />

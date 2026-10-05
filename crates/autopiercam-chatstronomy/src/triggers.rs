@@ -60,19 +60,52 @@ struct Burst {
     deadline: Instant,
 }
 
+/// Wall-clock slots anchored at the Unix epoch (UTC), not connection uptime.
+/// Keep this across reconnects/configuration reloads. Missed slots coalesce;
+/// moving the clock backwards never replays an already observed slot.
+#[derive(Default)]
+pub(crate) struct PeriodicSchedule {
+    interval_ms: u64,
+    next_ms: u64,
+}
+
+impl PeriodicSchedule {
+    pub fn configure(&mut self, minutes: u16, wall_ms: u64) {
+        let interval = u64::from(minutes) * 60_000;
+        if interval != self.interval_ms {
+            self.interval_ms = interval;
+            self.next_ms = self.next_boundary(wall_ms);
+        }
+    }
+
+    fn next_boundary(&self, wall_ms: u64) -> u64 {
+        if self.interval_ms == 0 {
+            return u64::MAX;
+        }
+        (wall_ms / self.interval_ms)
+            .saturating_add(1)
+            .saturating_mul(self.interval_ms)
+    }
+
+    fn due(&mut self, wall_ms: u64) -> bool {
+        if self.interval_ms == 0 || wall_ms < self.next_ms {
+            return false;
+        }
+        self.next_ms = self.next_boundary(wall_ms);
+        true
+    }
+}
+
 pub(crate) struct Scheduler {
     rules: TriggerRules,
-    periodic_due: Instant,
     burst: Option<Burst>,
     last_queued: Option<(u64, u64)>,
 }
 
 impl Scheduler {
-    pub fn new(rules: TriggerRules, now: Instant) -> Self {
-        let periodic_due = now + Duration::from_secs(u64::from(rules.interval_minutes) * 60);
+    pub fn new(rules: TriggerRules) -> Self {
         Self {
             rules,
-            periodic_due,
             burst: None,
             last_queued: None,
         }
@@ -113,7 +146,9 @@ impl Scheduler {
         frame: Option<&Frame>,
         now: Instant,
         wall_ms: u64,
+        periodic: &mut PeriodicSchedule,
     ) -> Option<(&'static str, &'static str)> {
+        let periodic_due = periodic.due(wall_ms);
         let Some(frame) = frame else {
             self.burst = None;
             return None;
@@ -125,9 +160,7 @@ impl Scheduler {
         {
             self.burst = None;
         }
-        if self.rules.interval_minutes > 0 && now >= self.periodic_due {
-            self.periodic_due =
-                now + Duration::from_secs(u64::from(self.rules.interval_minutes) * 60);
+        if periodic_due {
             // Periodic sends are single frames; bursts are only for observations/events.
             if self.burst.is_none() {
                 self.trigger("periodic", "Scheduled pier-camera image", frame, now, false);
@@ -163,19 +196,21 @@ mod tests {
     fn burst_storm_is_coalesced_and_sends_at_most_three_distinct_images() {
         let now = Instant::now();
         let mut f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
-        );
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            burst_count: 3,
+            ..Default::default()
+        }));
         s.trigger("scene_change", "original", &f, now, false);
         for index in 0..3 {
             let at = now + Duration::from_secs(index * 60);
             s.trigger("telescope_event", "coalesced", &f, at, false);
             assert_eq!(
-                s.due(Some(&f), at, f.captured_at_unix_ms),
+                s.due(
+                    Some(&f),
+                    at,
+                    f.captured_at_unix_ms,
+                    &mut PeriodicSchedule::default()
+                ),
                 Some(("scene_change", "original"))
             );
             s.queued(&f, at);
@@ -183,7 +218,8 @@ mod tests {
                 s.due(
                     Some(&f),
                     at + Duration::from_secs(60),
-                    f.captured_at_unix_ms
+                    f.captured_at_unix_ms,
+                    &mut PeriodicSchedule::default()
                 )
                 .is_none()
             );
@@ -193,7 +229,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(180),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -234,23 +271,37 @@ mod tests {
     fn bursts_wait_for_new_frames_and_expire_without_backlog() {
         let now = Instant::now();
         let mut f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
-        );
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            burst_count: 3,
+            ..Default::default()
+        }));
         s.trigger("telescope_event", "slew", &f, now, true);
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
+        assert!(
+            s.due(
+                Some(&f),
+                now,
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
+            )
+            .is_none()
+        );
         f.sequence += 1;
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_some());
+        assert!(
+            s.due(
+                Some(&f),
+                now,
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
+            )
+            .is_some()
+        );
         s.queued(&f, now);
         assert!(
             s.due(
                 Some(&f),
                 now + Duration::from_secs(60),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -259,7 +310,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(59),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -267,7 +319,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(60),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_some()
         );
@@ -276,7 +329,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(61),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -285,49 +339,70 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(301),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
     }
     #[test]
-    fn periodic_is_delayed_single_and_stale_frames_are_not_sent() {
+    fn periodic_clock_slots_survive_reconfiguration_and_connection_recreation() {
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(15, 60_000);
+        for minute in 2..15 {
+            clock.configure(15, minute * 60_000); // save / reconnect / identical Hub rules
+            assert!(!clock.due(minute * 60_000));
+        }
+        assert!(clock.due(900_000));
+        clock.configure(15, 900_000);
+        assert!(!clock.due(900_000));
+        assert!(clock.due(1_800_000));
+        assert!(!clock.due(900_000)); // backwards clock: no duplicate slot
+        assert!(clock.due(9_000_000)); // missed slots: one, not a backlog
+        assert!(!clock.due(9_000_000));
+    }
+
+    #[test]
+    fn changed_interval_uses_next_utc_boundary_and_zero_disables() {
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(15, 60_000);
+        clock.configure(5, 240_000);
+        assert!(!clock.due(299_999));
+        assert!(clock.due(300_000));
+        clock.configure(0, 300_000);
+        assert!(!clock.due(900_000));
+        clock.configure(5, 900_000);
+        assert!(!clock.due(900_000));
+        assert!(clock.due(1_200_000));
+    }
+
+    #[test]
+    fn periodic_is_single_fresh_and_skips_slots_without_capture() {
         let now = Instant::now();
-        let f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                interval_minutes: 5,
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
-        );
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
-        assert!(
-            s.due(
-                Some(&f),
-                now + Duration::from_secs(300),
-                f.captured_at_unix_ms + 121_000
-            )
-            .is_none()
-        );
-        assert!(
-            s.due(
-                Some(&f),
-                now + Duration::from_secs(301),
-                f.captured_at_unix_ms
-            )
-            .is_some()
-        );
-        s.queued(&f, now + Duration::from_secs(301));
-        assert!(
-            s.due(
-                Some(&f),
-                now + Duration::from_secs(400),
-                f.captured_at_unix_ms
-            )
-            .is_none()
-        );
+        let rules = TriggerRules::local(&Preferences {
+            interval_minutes: 5,
+            burst_count: 3,
+            ..Default::default()
+        });
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(5, 0);
+        let mut s = Scheduler::new(rules.clone());
+        let mut f = crate::tests::frame(1, false);
+        f.captured_at_unix_ms = 0;
+        assert!(s.due(Some(&f), now, 300_000, &mut clock).is_none());
+        f.captured_at_unix_ms = 300_001;
+        assert!(s.due(Some(&f), now, 300_001, &mut clock).is_some());
+        s.queued(&f, now);
+        s = Scheduler::new(rules); // reconnect must not repeat current slot
+        assert!(s.due(Some(&f), now, 300_002, &mut clock).is_none());
+        assert!(s.due(None, now, 600_000, &mut clock).is_none());
+        f.captured_at_unix_ms = 600_001;
+        assert!(s.due(Some(&f), now, 600_001, &mut clock).is_none());
+        f.captured_at_unix_ms = 900_000;
+        assert!(s.due(Some(&f), now, 900_000, &mut clock).is_some());
+        s.queued(&f, now);
+        f.sequence += 1;
+        assert!(s.due(Some(&f), now, 900_001, &mut clock).is_none());
         assert!(telescope_summary("slew_to_coordinates").is_none());
     }
 }
