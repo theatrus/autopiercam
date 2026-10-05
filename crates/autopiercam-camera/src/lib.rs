@@ -1012,8 +1012,9 @@ impl Camera {
         }
         self.pending = true;
         let until = Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 250) as u64);
-        loop {
-            let status = self.call("stream-status", Value::Null, 2.)?.0;
+        let (meta, pixels) = loop {
+            let (meta, pixels) = self.call("stream-poll", Value::Null, 10.)?;
+            let status = &meta["continuous"];
             if let Some(error) = status["error"].as_str() {
                 return Err(anyhow::anyhow!(
                     "Regain continuous capture failed: {error}; details={}",
@@ -1022,15 +1023,14 @@ impl Camera {
                 .into());
             }
             self.video_active = status["mode"] == "video";
-            if status["ready"] == true && status["settingsPending"] != true {
-                break;
+            if !pixels.is_empty() {
+                break (meta, pixels);
             }
             if Instant::now() >= until {
                 return Err(FrameError::Pending);
             }
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let (meta, pixels) = self.call("stream-download", Value::Null, 10.)?;
+        };
         decode_frame(&meta, &pixels, &exposure, self.roi.image_type, data)?;
         self.delivered += 1;
         self.last_frame = Some(Instant::now());

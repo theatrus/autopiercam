@@ -619,7 +619,16 @@ fn failed_download_faults_instead_of_retrying_or_reopening() {
         );
         let mut camera = setup(&driver);
         let started = Instant::now();
-        let error = camera.poll_frame(&mut Vec::new(), 50).unwrap_err();
+        let error = loop {
+            let error = camera.poll_frame(&mut Vec::new(), 50).unwrap_err();
+            if !error.is_timeout() {
+                break error;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(12),
+                "owner fault was hidden by cached IPC: {fault}"
+            );
+        };
         assert!(
             !error.is_timeout(),
             "only pending exposures may return a poll timeout"

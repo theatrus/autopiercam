@@ -1,6 +1,6 @@
 # Regain camera backend
 
-AutoPierCam 0.2.21 adopts Regain 0.5.8 continuous acquisition, with boundary-safe
+AutoPierCam 0.2.22 adopts Regain 0.5.9 continuous acquisition, with boundary-safe
 scalar control changes and delivery-side FPS pacing. AutoPierCam 0.2.20 adopted
 Regain 0.5.7 for bounded malformed-frame and SDK failed-exposure recovery. Published
 AutoPierCam 0.2.19 adopted Regain 0.5.6 from its `v0.5.6.0` release, including
@@ -26,7 +26,7 @@ preview pacing. A bounded latest-frame slot replaces older frames; fractional FP
 limits delivery, not sensor output. Exposure/gain edits are applied after a frame
 drains without restarting native video. Structural edits stop/reconfigure/start.
 Transitions clear old buffers and fence at least two reads for old-plus-new
-exposure time. The source build opts into transition-frame delivery for preview:
+exposure time. AutoPierCam opts into transition-frame delivery for preview:
 uncertain frames have null exposure/gain metadata and do not drive adaptive
 exposure, count toward startup convergence, or satisfy saved snapshot requests.
 Settled frames resume those consumers. This conservative fence is not optical
@@ -36,6 +36,9 @@ SDK video reads have an exposure-derived 500 ms–5 s wait; normal timeout polli
 and the exposure-aware no-progress watchdog remain separate. The adapter allows
 at least 8 s for IPC while SDK video is active, including stop/close, so a valid
 five-second read does not trigger the former two-second IPC deadline.
+Cached status and frame delivery are published independently of that owner;
+the adapter consumes an atomic frame poll rather than a readiness/download
+round trip. No mutex is held during SDK reads or output-pipe writes.
 No extra discovery sweeps or implicit physical USB resets are added.
 
 Watchdogs include delivery cadence, prior exposure, the transition fence and
