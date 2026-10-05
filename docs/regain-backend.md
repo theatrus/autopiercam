@@ -1,6 +1,9 @@
 # Regain camera backend
 
-AutoPierCam 0.2.22 adopts Regain 0.5.9 continuous acquisition, with boundary-safe
+AutoPierCam 0.2.23 pins the released Regain 0.5.10 source. Its startup selection
+can verify a saved serial on one matching Direct model when a stale camera ID
+rejects that interface. It does not probe other cameras or enable monochrome
+capture. AutoPierCam 0.2.22 adopted Regain 0.5.9 continuous acquisition, with boundary-safe
 scalar control changes and delivery-side FPS pacing. AutoPierCam 0.2.20 adopted
 Regain 0.5.7 for bounded malformed-frame and SDK failed-exposure recovery. Published
 AutoPierCam 0.2.19 adopted Regain 0.5.6 from its `v0.5.6.0` release, including

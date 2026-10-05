@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.22 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.23 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.22)](https://github.com/theatrus/autopiercam/releases/download/v0.2.22/AutoPierCam-0.2.22-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.22)
+[Download the signed Windows x64 installer (0.2.23)](https://github.com/theatrus/autopiercam/releases/download/v0.2.23/AutoPierCam-0.2.23-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.23)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,11 +25,16 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.22 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+Version 0.2.23 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-Version 0.2.22 adopts Regain 0.5.9 continuous acquisition. The worker drains SDK
+Version 0.2.23 fixes Direct USB startup when a stale camera ID prevents selection:
+one matching model can be opened to verify the saved serial before capture.
+Ambiguous matches and serial mismatches remain errors. It pins the released
+Regain 0.5.10 drivers; AutoPierCam still requires a color camera.
+
+The worker retains continuous acquisition and drains SDK
 and Direct USB frames independently of preview delivery, keeping only the latest
 frame. The fractional FPS limit caps delivery, not sensor acquisition. Exposure
 and gain changes apply at a frame boundary without restarting native video;
