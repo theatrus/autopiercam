@@ -19,7 +19,7 @@ try {
     Assert-RegainWorkerVersion -Output $output -ExitCode $LASTEXITCODE -Version $version
     foreach ($case in @(
         @{ Output = "autopiercam-regain-worker $version (Regain 75c8e93bb9f5)"; ExitCode = 0 },
-        @{ Output = "autopiercam-regain-worker 0.0.0 (Regain 0.5.8)"; ExitCode = 0 },
+        @{ Output = "autopiercam-regain-worker 0.0.0 (Regain 0.5.9)"; ExitCode = 0 },
         @{ Output = ''; ExitCode = 0 },
         @{ Output = $output; ExitCode = 1 }
     )) {

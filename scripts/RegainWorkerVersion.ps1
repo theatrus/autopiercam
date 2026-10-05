@@ -5,7 +5,7 @@ function Assert-RegainWorkerVersion {
         [string] $Version
     )
 
-    $expected = "autopiercam-regain-worker $Version (Regain 0.5.8)"
+    $expected = "autopiercam-regain-worker $Version (Regain 0.5.9)"
     if ($ExitCode -ne 0 -or $Output -cne $expected) {
         throw "Regain worker version mismatch: '$Output' (expected '$expected'; exit $ExitCode)."
     }

@@ -109,6 +109,8 @@ pub struct FrameMeta {
     pub width: u32,
     pub height: u32,
     pub image_type: ImageType,
+    /// False during a live settings transition: pixels are valid, settings are not yet settled.
+    pub settings_settled: bool,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -682,6 +684,13 @@ impl Camera {
         self.driver.is_direct()
     }
     fn call(&self, method: &str, params: Value, seconds: f64) -> Result<(Value, Vec<u8>)> {
+        // The SDK owner may be inside a five-second video read when IPC arrives.
+        // Allow that read plus command/transport overhead, including stop/close.
+        let seconds = if !self.is_direct() && (self.video_active || self.stream_params.is_some()) {
+            seconds.max(8.)
+        } else {
+            seconds
+        };
         self.runtime
             .block_on(self.worker.borrow_mut().call(
                 method,
@@ -972,6 +981,7 @@ impl Camera {
             width: self.roi.width,
             height: self.roi.height,
             image_type: self.roi.image_type,
+            settings_settled: true,
         })
     }
 
@@ -985,6 +995,7 @@ impl Camera {
         let mut params = serde_json::to_value(&exposure).map_err(anyhow::Error::from)?;
         params["gain"] = json!(self.values[&0]);
         params["maxFps"] = json!(self.max_fps);
+        params["deliverTransitionFrames"] = json!(true);
         if self.stream_params.as_ref() != Some(&params) {
             let previous = self
                 .stream_params
@@ -1001,8 +1012,9 @@ impl Camera {
         }
         self.pending = true;
         let until = Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 250) as u64);
-        loop {
-            let status = self.call("stream-status", Value::Null, 2.)?.0;
+        let (meta, pixels) = loop {
+            let (meta, pixels) = self.call("stream-poll", Value::Null, 10.)?;
+            let status = &meta["continuous"];
             if let Some(error) = status["error"].as_str() {
                 return Err(anyhow::anyhow!(
                     "Regain continuous capture failed: {error}; details={}",
@@ -1011,18 +1023,14 @@ impl Camera {
                 .into());
             }
             self.video_active = status["mode"] == "video";
-            if status["ready"] == true
-                && status["settingsPending"] != true
-                && status["settling"] != true
-            {
-                break;
+            if !pixels.is_empty() {
+                break (meta, pixels);
             }
             if Instant::now() >= until {
                 return Err(FrameError::Pending);
             }
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let (meta, pixels) = self.call("stream-download", Value::Null, 10.)?;
+        };
         decode_frame(&meta, &pixels, &exposure, self.roi.image_type, data)?;
         self.delivered += 1;
         self.last_frame = Some(Instant::now());
@@ -1038,6 +1046,13 @@ impl Camera {
             width: self.roi.width,
             height: self.roi.height,
             image_type: self.roi.image_type,
+            // Older workers only deliver settled frames and omit this field.
+            settings_settled: match meta.get("settingsSettled") {
+                None => true,
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    anyhow::anyhow!("invalid Regain settingsSettled frame metadata")
+                })?,
+            },
         })
     }
 }

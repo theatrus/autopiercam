@@ -69,7 +69,9 @@ fn main() -> Result<()> {
             false,
         )?;
         let began = Instant::now();
-        for frame in 0..2 {
+        let mut settled_frames = 0;
+        let mut frame = 0;
+        while settled_frames < 2 {
             let waiting = Instant::now();
             loop {
                 match camera.poll_frame(&mut pixels, 100) {
@@ -83,12 +85,15 @@ fn main() -> Result<()> {
                             "wrong frame length"
                         );
                         println!(
-                            "model={} backend={} exposure_us={exposure} frame={frame} elapsed_seconds={:.3} pacing_seconds={:.3}",
+                            "model={} backend={} exposure_us={exposure} frame={frame} settled={} elapsed_seconds={:.3} pacing_seconds={:.3}",
                             options.model,
                             options.backend,
+                            meta.settings_settled,
                             began.elapsed().as_secs_f64(),
                             camera.pacing_allowance().as_secs_f64()
                         );
+                        settled_frames += usize::from(meta.settings_settled);
+                        frame += 1;
                         break;
                     }
                     Err(error) if error.is_timeout() => {
@@ -110,5 +115,7 @@ fn main() -> Result<()> {
         previous_exposure = exposure;
     }
     camera.stop_capture()?;
+    camera.set_control(ControlType::EXPOSURE, 234000, false)?;
+    camera.set_control(ControlType::GAIN, 300, false)?;
     Ok(())
 }

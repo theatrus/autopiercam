@@ -155,6 +155,7 @@ pub(crate) struct PreviewJob {
     pub(crate) captured_at_unix_ms: u64,
     pub(crate) exposure_us: i64,
     pub(crate) gain: i64,
+    pub(crate) settings_settled: bool,
     pub(crate) mode: PreviewMode,
     pub(crate) dropped_frames: u64,
 }
@@ -336,8 +337,8 @@ fn encode_and_publish(job: PreviewJob, session: &PreviewSession) -> Result<()> {
         captured_at_unix_ms: job.captured_at_unix_ms,
         width,
         height,
-        exposure_us: Some(job.exposure_us),
-        gain: Some(job.gain),
+        exposure_us: job.settings_settled.then_some(job.exposure_us),
+        gain: job.settings_settled.then_some(job.gain),
         content_type: PreviewContentType::Jpeg,
         mode: job.mode,
         dropped_frames: job.dropped_frames,
@@ -408,6 +409,11 @@ mod tests {
 
     #[test]
     fn settling_observer_publishes_preview_before_capture_transition() {
+        check_settling_preview(true);
+        check_settling_preview(false);
+    }
+
+    fn check_settling_preview(settings_settled: bool) {
         let monitor = crate::AgentMonitor::new();
         let hub = PreviewHub::new();
         let session = hub.begin_session();
@@ -422,6 +428,7 @@ mod tests {
                 width: 4,
                 height: 4,
                 image_type: autopiercam_camera::ImageType::Raw8,
+                settings_settled,
             },
             data: vec![100; 16],
             captured_at_unix_ms: 1000,
@@ -435,9 +442,20 @@ mod tests {
         encode_and_publish(queued, &session).unwrap();
         let preview = hub.snapshot().frame.unwrap();
         assert_eq!(preview.metadata.session_generation, session.generation());
-        assert_eq!(preview.metadata.exposure_us, Some(60_000_000));
-        assert_eq!(preview.metadata.gain, Some(400));
-        assert_eq!(preview.metadata.mode, PreviewMode::Night);
+        assert_eq!(
+            preview.metadata.exposure_us,
+            settings_settled.then_some(60_000_000)
+        );
+        assert_eq!(preview.metadata.gain, settings_settled.then_some(400));
+        assert_eq!(
+            preview.metadata.mode,
+            if settings_settled {
+                PreviewMode::Night
+            } else {
+                PreviewMode::Unknown
+            }
+        );
+        assert!(image::load_from_memory(&preview.jpeg).is_ok());
         assert_eq!(preview.metadata.captured_at_unix_ms, 1000);
         assert_eq!(
             monitor.snapshot().state,
@@ -474,6 +492,7 @@ mod tests {
             captured_at_unix_ms: u64::from(value),
             exposure_us: 1_000,
             gain: 10,
+            settings_settled: true,
             dropped_frames,
         }
     }

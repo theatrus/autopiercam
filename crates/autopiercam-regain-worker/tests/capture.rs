@@ -24,11 +24,14 @@ fn driver(
     ))
 }
 fn setup(driver: &Arc<Driver>) -> Camera {
+    setup_named(driver, None)
+}
+fn setup_named(driver: &Arc<Driver>, name: Option<&str>) -> Camera {
     let info = driver
         .cameras()
         .unwrap()
         .into_iter()
-        .find(|i| i.is_color)
+        .find(|i| i.is_color && name.is_none_or(|name| i.name == name))
         .unwrap();
     let mut camera = driver.open(info).unwrap();
     camera
@@ -534,6 +537,40 @@ fn continuous_manual_white_balance_precedes_delivery_decimation() {
 }
 
 #[test]
+fn continuous_transition_frames_reach_preview_on_both_backends() {
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        let driver = driver(backend, json!({"instant":true}), None);
+        let direct = backend == CameraDriver::ZwoDirect;
+        let mut camera = setup_named(&driver, direct.then_some("ZWO ASI662MC"));
+        frame(&mut camera);
+        camera
+            .set_control(
+                ControlType::EXPOSURE,
+                if direct { 1_000_000 } else { 20_000_000 },
+                false,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pixels = Vec::new();
+        loop {
+            match camera.poll_frame(&mut pixels, 50) {
+                Ok(meta) => {
+                    assert!(
+                        !meta.settings_settled,
+                        "transition must not claim requested settings"
+                    );
+                    assert_eq!(pixels.len(), 64 * 64 * 2);
+                    break;
+                }
+                Err(error) if error.is_timeout() => assert!(Instant::now() < deadline),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        camera.stop_capture().unwrap();
+    }
+}
+
+#[test]
 fn pending_frames_keep_metadata_and_apply_edits_to_next_exposure() {
     let driver = driver(CameraDriver::ZwoSdk, json!({}), None);
     let mut camera = setup(&driver);
@@ -582,7 +619,16 @@ fn failed_download_faults_instead_of_retrying_or_reopening() {
         );
         let mut camera = setup(&driver);
         let started = Instant::now();
-        let error = camera.poll_frame(&mut Vec::new(), 50).unwrap_err();
+        let error = loop {
+            let error = camera.poll_frame(&mut Vec::new(), 50).unwrap_err();
+            if !error.is_timeout() {
+                break error;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(12),
+                "owner fault was hidden by cached IPC: {fault}"
+            );
+        };
         assert!(
             !error.is_timeout(),
             "only pending exposures may return a poll timeout"
