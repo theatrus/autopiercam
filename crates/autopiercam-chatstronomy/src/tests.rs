@@ -351,7 +351,10 @@ async fn telescope_trigger_waits_for_an_updated_frame_and_local_consent_wins() {
     *fixture.frames.write().unwrap() = Some(frame(2, true));
     let event = text(&mut socket).await;
     assert_eq!(event["event"]["kind"], "telescope_event");
-    assert_eq!(event["event"]["summary"], "Pier camera: mount slew started");
+    assert_eq!(
+        event["event"]["summary"],
+        "Pier camera: Update after mount slew started (image 1 of 1)"
+    );
     let current = client.status();
     client
         .update(
@@ -368,6 +371,58 @@ async fn telescope_trigger_waits_for_an_updated_frame_and_local_consent_wins() {
             .unwrap(),
         Some(Ok(Message::Text(_)))
     ));
+}
+
+#[tokio::test]
+async fn telescope_completion_before_first_frame_reaches_image_caption() {
+    let fixture = Fixture::paired().await;
+    let client = fixture.service.client();
+    let old = client.status();
+    client
+        .update(
+            old.revision,
+            Preferences {
+                telescope_events: true,
+                burst_count: 3,
+                ..old.preferences
+            },
+        )
+        .unwrap();
+    let mut socket = fixture.connect(false, false).await;
+    for name in ["mount_slew_started", "mount_slewed"] {
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "telescope_event", "event": name,
+                    "expires_at": now_ms() / 1000 + 30
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    // A protocol response fences both incoming events without a timing sleep.
+    let id = random_uuid().unwrap();
+    let rules = crate::triggers::TriggerRules::local(&client.status().preferences);
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "configure_triggers", "request_id": id, "rules": rules
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text(&mut socket).await["accepted"], false); // no chat reconfiguration
+    *fixture.frames.write().unwrap() = Some(frame(2, true));
+    let image = text(&mut socket).await;
+    assert_eq!(image["event"]["kind"], "telescope_event");
+    assert_eq!(
+        image["event"]["summary"],
+        "Pier camera: Update after mount slew completed (image 1 of 3)"
+    );
 }
 
 async fn request(socket: &mut WebSocketStream<TcpStream>) -> String {

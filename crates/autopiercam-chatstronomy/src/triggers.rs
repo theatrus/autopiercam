@@ -40,19 +40,40 @@ impl TriggerRules {
     }
 }
 
-pub(crate) fn telescope_summary(event: &str) -> Option<&'static str> {
-    match event {
-        "mount_slew_started" => Some("Pier camera: mount slew started"),
-        "mount_slewed" => Some("Pier camera: mount slew ended"),
-        "sequence_started" => Some("Pier camera: sequence started"),
-        "sequence_finished" => Some("Pier camera: sequence finished"),
-        _ => None,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TelescopeEvent {
+    SlewStarted,
+    SlewCompleted,
+    SequenceStarted,
+    SequenceFinished,
+}
+
+impl TelescopeEvent {
+    fn parse(event: &str) -> Option<Self> {
+        match event {
+            "mount_slew_started" => Some(Self::SlewStarted),
+            "mount_slewed" => Some(Self::SlewCompleted),
+            "sequence_started" => Some(Self::SequenceStarted),
+            "sequence_finished" => Some(Self::SequenceFinished),
+            _ => None,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::SlewStarted => "mount slew started",
+            Self::SlewCompleted => "mount slew completed",
+            Self::SequenceStarted => "sequence started",
+            Self::SequenceFinished => "sequence finished",
+        }
     }
 }
 
 struct Burst {
     kind: &'static str,
     summary: &'static str,
+    telescope: Option<TelescopeEvent>,
+    total: u8,
     session: u64,
     after_sequence: u64,
     remaining: u8,
@@ -92,6 +113,8 @@ impl Scheduler {
         self.burst = Some(Burst {
             kind,
             summary,
+            telescope: None,
+            total: self.rules.burst_count,
             session: frame.session,
             after_sequence: if wait_new {
                 frame.sequence
@@ -108,12 +131,38 @@ impl Scheduler {
         });
     }
 
+    /// Coalesce telescope updates into the existing bounded burst, but retain
+    /// the latest event for captions. Do not reset its quota, spacing or expiry.
+    pub fn telescope_trigger(&mut self, event: &str, frame: &Frame, now: Instant) {
+        let Some(event) = TelescopeEvent::parse(event) else {
+            return;
+        };
+        if self
+            .burst
+            .as_ref()
+            .is_some_and(|b| b.session != frame.session || now >= b.deadline)
+        {
+            self.burst = None;
+        }
+        if self.burst.is_none() {
+            self.trigger("telescope_event", "", frame, now, true);
+            self.burst.as_mut().unwrap().telescope = Some(event);
+        } else if let Some(b) = &mut self.burst
+            && b.telescope.is_some_and(|previous| previous != event)
+        {
+            b.telescope = Some(event);
+            // A new caption must not be attached to a frame already available
+            // before that event. Duplicate events must not starve delivery.
+            b.after_sequence = frame.sequence;
+        }
+    }
+
     pub fn due(
         &mut self,
         frame: Option<&Frame>,
         now: Instant,
         wall_ms: u64,
-    ) -> Option<(&'static str, &'static str)> {
+    ) -> Option<(&'static str, String)> {
         let Some(frame) = frame else {
             self.burst = None;
             return None;
@@ -140,7 +189,21 @@ impl Scheduler {
             && frame.sequence > b.after_sequence
             && wall_ms.saturating_sub(frame.captured_at_unix_ms) <= 120_000
             && frame.captured_at_unix_ms <= wall_ms.saturating_add(30_000))
-        .then_some((b.kind, b.summary))
+        .then(|| {
+            let summary = match b.telescope {
+                Some(event) => {
+                    let index = b.total - b.remaining + 1;
+                    let label = if index == 1 { "Update" } else { "Follow-up" };
+                    format!(
+                        "Pier camera: {label} after {} (image {index} of {})",
+                        event.description(),
+                        b.total
+                    )
+                }
+                None => b.summary.to_owned(),
+            };
+            (b.kind, summary)
+        })
     }
 
     pub fn queued(&mut self, frame: &Frame, now: Instant) {
@@ -160,6 +223,146 @@ impl Scheduler {
 mod tests {
     use super::*;
     #[test]
+    fn slew_completion_updates_followups_without_resetting_quota_or_spacing() {
+        let now = Instant::now();
+        let mut f = crate::tests::frame(1, false);
+        let mut s = Scheduler::new(
+            TriggerRules::local(&Preferences {
+                burst_count: 3,
+                ..Default::default()
+            }),
+            now,
+        );
+        s.telescope_trigger("mount_slew_started", &f, now);
+        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
+        f.sequence += 1;
+        assert_eq!(
+            s.due(Some(&f), now, f.captured_at_unix_ms).unwrap().1,
+            "Pier camera: Update after mount slew started (image 1 of 3)"
+        );
+        s.queued(&f, now);
+        let deadline = s.burst.as_ref().unwrap().deadline;
+        let completion = now + Duration::from_secs(10);
+        f.sequence += 1;
+        s.telescope_trigger("mount_slewed", &f, completion);
+        assert!(
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                f.captured_at_unix_ms
+            )
+            .is_none()
+        );
+        f.sequence += 1;
+        // Repeated notifications must neither move the fence nor restart a burst.
+        for _ in 0..10 {
+            s.telescope_trigger("mount_slewed", &f, completion);
+        }
+        assert_eq!(s.burst.as_ref().unwrap().deadline, deadline);
+        assert_eq!(s.burst.as_ref().unwrap().remaining, 2);
+        assert!(
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(59),
+                f.captured_at_unix_ms
+            )
+            .is_none()
+        );
+        for (seconds, index) in [(60, 2), (120, 3)] {
+            let at = now + Duration::from_secs(seconds);
+            assert_eq!(
+                s.due(Some(&f), at, f.captured_at_unix_ms).unwrap().1,
+                format!("Pier camera: Follow-up after mount slew completed (image {index} of 3)")
+            );
+            s.queued(&f, at);
+            f.sequence += 1;
+        }
+        assert!(
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(180),
+                f.captured_at_unix_ms
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn telescope_captions_identify_each_event_and_do_not_claim_current_motion() {
+        for (event, description) in [
+            ("mount_slew_started", "mount slew started"),
+            ("mount_slewed", "mount slew completed"),
+            ("sequence_started", "sequence started"),
+            ("sequence_finished", "sequence finished"),
+        ] {
+            let now = Instant::now();
+            let mut f = crate::tests::frame(1, false);
+            let mut s = Scheduler::new(
+                TriggerRules::local(&Preferences {
+                    burst_count: 2,
+                    ..Default::default()
+                }),
+                now,
+            );
+            s.telescope_trigger(event, &f, now);
+            f.sequence += 1;
+            assert_eq!(
+                s.due(Some(&f), now, f.captured_at_unix_ms).unwrap().1,
+                format!("Pier camera: Update after {description} (image 1 of 2)")
+            );
+            s.queued(&f, now);
+            f.sequence += 1;
+            assert_eq!(
+                s.due(
+                    Some(&f),
+                    now + Duration::from_secs(60),
+                    f.captured_at_unix_ms
+                )
+                .unwrap()
+                .1,
+                format!("Pier camera: Follow-up after {description} (image 2 of 2)")
+            );
+        }
+    }
+
+    #[test]
+    fn telescope_updates_preserve_other_bursts_and_expired_sessions_are_not_relabelled() {
+        let now = Instant::now();
+        let mut f = crate::tests::frame(1, false);
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()), now);
+        s.trigger("scene_change", "Scene changed", &f, now, false);
+        s.telescope_trigger("mount_slewed", &f, now);
+        assert_eq!(
+            s.due(Some(&f), now, f.captured_at_unix_ms),
+            Some(("scene_change", "Scene changed".into()))
+        );
+        s.queued(&f, now);
+        s.telescope_trigger("unknown", &f, now);
+        assert!(s.burst.is_none());
+        s.telescope_trigger("mount_slew_started", &f, now);
+        f.session += 1;
+        s.telescope_trigger("sequence_started", &f, now);
+        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
+        f.sequence += 1;
+        assert!(
+            s.due(Some(&f), now, f.captured_at_unix_ms)
+                .unwrap()
+                .1
+                .contains("sequence started")
+        );
+        let later = now + Duration::from_secs(181);
+        s.telescope_trigger("mount_slewed", &f, later);
+        assert!(s.due(Some(&f), later, f.captured_at_unix_ms).is_none());
+        f.sequence += 1;
+        assert!(
+            s.due(Some(&f), later, f.captured_at_unix_ms)
+                .unwrap()
+                .1
+                .contains("mount slew completed")
+        );
+    }
+
+    #[test]
     fn burst_storm_is_coalesced_and_sends_at_most_three_distinct_images() {
         let now = Instant::now();
         let mut f = crate::tests::frame(1, false);
@@ -176,7 +379,7 @@ mod tests {
             s.trigger("telescope_event", "coalesced", &f, at, false);
             assert_eq!(
                 s.due(Some(&f), at, f.captured_at_unix_ms),
-                Some(("scene_change", "original"))
+                Some(("scene_change", "original".into()))
             );
             s.queued(&f, at);
             assert!(
@@ -328,6 +531,6 @@ mod tests {
             )
             .is_none()
         );
-        assert!(telescope_summary("slew_to_coordinates").is_none());
+        assert!(TelescopeEvent::parse("slew_to_coordinates").is_none());
     }
 }

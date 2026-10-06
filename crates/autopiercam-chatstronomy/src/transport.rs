@@ -7,7 +7,7 @@ use crate::{
     },
     service::{Frame, Settings, Shared, random_uuid},
     snapshot::{LocalState, SnapshotFence},
-    triggers::{Scheduler, telescope_summary},
+    triggers::Scheduler,
     vault,
 };
 use anyhow::{Result, bail};
@@ -325,9 +325,8 @@ async fn session(
                     ServerMessage::TelescopeEvent { event, expires_at } if version == crate::protocol::TRIGGER_PROTOCOL_VERSION => {
                         let now_seconds = (now_ms() / 1000) as i64;
                         if rules.telescope_events && expires_at > now_seconds && expires_at <= now_seconds + 90
-                            && let Some(summary) = telescope_summary(&event)
                             && let Some(frame) = (shared.source)() {
-                            scheduler.trigger("telescope_event", summary, &frame, Instant::now(), true);
+                            scheduler.telescope_trigger(&event, &frame, Instant::now());
                         }
                     }
                     ServerMessage::SnapshotRequest { ref request_id, .. } => {
@@ -406,7 +405,7 @@ async fn session(
                     && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
                     let encoded_frame = f.clone();
                     if let Ok(jpeg) = tokio::task::spawn_blocking(move || media::jpeg(&encoded_frame, MAX_JPEG_BYTES)).await? {
-                        *outbox = Some(event(f, kind, summary, None, jpeg)?);
+                        *outbox = Some(event(f, kind, &summary, None, jpeg)?);
                         scheduler.queued(f, Instant::now());
                         *last_new_event = Instant::now();
                     }
