@@ -22,6 +22,8 @@ pub use crate::vault::CredentialStore as SecretStore;
 /// A frame from the application's already-running preview encoder.
 #[derive(Clone)]
 pub struct Frame {
+    /// Host-side estimate with a full-frame margin, never an exact sensor time.
+    pub conservative_start_unix_ms: Option<u64>,
     pub session: u64,
     pub sequence: u64,
     pub captured_at_unix_ms: u64,

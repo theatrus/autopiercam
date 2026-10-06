@@ -48,6 +48,7 @@ pub(crate) fn frame(sequence: u64, changed: bool) -> Frame {
         .encode_image(&image)
         .unwrap();
     Frame {
+        conservative_start_unix_ms: Some(now_ms().saturating_sub(120_000)),
         session: 1,
         sequence,
         captured_at_unix_ms: now_ms(),
@@ -374,7 +375,7 @@ async fn telescope_trigger_waits_for_an_updated_frame_and_local_consent_wins() {
 }
 
 #[tokio::test]
-async fn telescope_completion_before_first_frame_reaches_image_caption() {
+async fn telescope_completion_waits_for_estimated_start_not_later_delivery() {
     let fixture = Fixture::paired().await;
     let client = fixture.service.client();
     let old = client.status();
@@ -389,7 +390,7 @@ async fn telescope_completion_before_first_frame_reaches_image_caption() {
         )
         .unwrap();
     let mut socket = fixture.connect(false, false).await;
-    for name in ["mount_slew_started", "mount_slewed"] {
+    for name in ["mount_slewed"] {
         socket
             .send(Message::Text(
                 json!({
@@ -417,11 +418,19 @@ async fn telescope_completion_before_first_frame_reaches_image_caption() {
         .unwrap();
     assert_eq!(text(&mut socket).await["accepted"], false); // no chat reconfiguration
     *fixture.frames.write().unwrap() = Some(frame(2, true));
+    assert!(
+        timeout(Duration::from_millis(300), socket.next())
+            .await
+            .is_err()
+    );
+    let mut fresh = frame(3, true);
+    fresh.conservative_start_unix_ms = Some(now_ms());
+    *fixture.frames.write().unwrap() = Some(fresh);
     let image = text(&mut socket).await;
     assert_eq!(image["event"]["kind"], "telescope_event");
     assert_eq!(
         image["event"]["summary"],
-        "Pier camera: Update after mount slew completed (image 1 of 3)"
+        "Pier camera: Post-slew image after mount slew completed (exposure timing estimated)"
     );
 }
 

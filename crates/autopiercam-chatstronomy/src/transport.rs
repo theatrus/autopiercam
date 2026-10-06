@@ -326,7 +326,7 @@ async fn session(
                         let now_seconds = (now_ms() / 1000) as i64;
                         if rules.telescope_events && expires_at > now_seconds && expires_at <= now_seconds + 90
                             && let Some(frame) = (shared.source)() {
-                            scheduler.telescope_trigger(&event, &frame, Instant::now());
+                            scheduler.telescope_trigger(&event, &frame, Instant::now(), now_ms());
                         }
                     }
                     ServerMessage::SnapshotRequest { ref request_id, .. } => {
