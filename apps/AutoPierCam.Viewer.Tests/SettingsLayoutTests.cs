@@ -110,7 +110,7 @@ public sealed class SettingsLayoutTests
         XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
         var element = Assert.Single(markup.Descendants(), element => (string?)element.Attribute(xaml + "Name") == name);
         Assert.DoesNotContain(element.Ancestors(), ancestor => ancestor.Name.LocalName == "ScrollViewer");
-        if (name == "SaveButton") Assert.Equal("Save settings", (string?)element.Attribute("Content"));
+        if (name == "SaveButton") Assert.Equal("Save all settings", (string?)element.Attribute("Content"));
     }
 
     private static XElement Named(XDocument markup, string name)
@@ -153,18 +153,13 @@ public sealed class SettingsLayoutTests
     }
 
     [Theory]
-    [InlineData(480)]
-    [InlineData(640)]
-    [InlineData(787)] // default 1180px window at 150% scaling
-    [InlineData(980)]
-    [InlineData(1180)]
-    public void ResponsivePaneFitsAvailableWidth(double width)
+    [InlineData(1, 640, 820)]
+    [InlineData(1.5, 960, 1230)]
+    [InlineData(2, 1280, 1640)]
+    public void SettingsWindowHasIndependentDpiAwareSize(double scale, int width, int height)
     {
-        var layout = SettingsLayout.ForWidth(width, true);
-        Assert.InRange(layout.PaneWidth + layout.Gap, 0, width - 32);
-        if (layout.PreviewVisible) Assert.True(width - 32 - layout.PaneWidth - layout.Gap >= 480);
-        else Assert.Equal(width - 32, layout.PaneWidth);
-        Assert.Equal(new SettingsLayout(true, 0, 0), SettingsLayout.ForWidth(width, false));
+        Assert.Equal((width, height), SettingsLayout.SettingsWindowSize(scale, 3840, 2160));
+        Assert.Equal((1228, 691), SettingsLayout.SettingsWindowSize(2, 1365, 768));
     }
 
     [Theory]
@@ -186,35 +181,30 @@ public sealed class SettingsLayoutTests
         Assert.DoesNotContain(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "SharingButton");
         var bar = Named(markup, "SettingsSectionBar");
         Assert.Equal("SelectorBar", bar.Name.LocalName);
-        Assert.Equal(["Capture", "Chatstronomy"], bar.Elements().Select(e => (string?)e.Attribute("Text")));
+        Assert.Equal(["Imaging", "Chatstronomy"], bar.Elements().Select(e => (string?)e.Attribute("Text")));
         foreach (string section in new[] { "CaptureSection", "SharingSection" })
             Assert.Contains(Named(markup, section).Ancestors(), e => (string?)e.Attribute(xaml + "Name") == "SettingsPane");
         Assert.Equal("Collapsed", (string?)Named(markup, "SharingSection").Attribute("Visibility"));
     }
 
-    [Theory]
-    [InlineData("CaptureSection", "RefreshButton", "CaptureDiscardButton", "SaveButton", "ConfigInfoBar", "CaptureKeepEditsButton")]
-    [InlineData("SharingSection", "SharingReloadButton", "SharingDiscardButton", "SharingSaveButton", "SharingInfoBar", "SharingKeepEditsButton")]
-    public void BothSectionsShareReloadDiscardSaveAndReviewLayout(
-        string section, string reload, string discard, string save, string infoBar, string keepEdits)
+    [Fact]
+    public void BothTabsUseOneSharedSaveAndDiscardOutsideTabsAndScrolling()
     {
         var markup = Markup();
         XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
-        foreach (var (name, content) in new[] {
-            (reload, "Reload settings"), (discard, "Discard changes"), (save, "Save settings") })
+        foreach (var (name, label) in new[] { ("SaveButton", "Save all settings"), ("CaptureDiscardButton", "Discard all changes") })
         {
             var button = Named(markup, name);
-            Assert.Equal(content, (string?)button.Attribute("Content"));
-            Assert.Contains(button.Ancestors(), e => (string?)e.Attribute(xaml + "Name") == section);
-            Assert.DoesNotContain(button.Ancestors(), e => e.Name.LocalName == "ScrollViewer");
+            Assert.Equal(label, (string?)button.Attribute("Content"));
+            Assert.Contains(button.Ancestors(), e => (string?)e.Attribute(xaml + "Name") == "SettingsPane");
+            Assert.DoesNotContain(button.Ancestors(), e => e.Name.LocalName == "ScrollViewer" ||
+                (string?)e.Attribute(xaml + "Name") is "CaptureSection" or "SharingSection");
         }
-        Assert.Equal("{StaticResource AccentButtonStyle}", (string?)Named(markup, save).Attribute("Style"));
-        var bar = Named(markup, infoBar);
-        Assert.DoesNotContain(bar.Ancestors(), e => e.Name.LocalName == "ScrollViewer");
-        var keep = Named(markup, keepEdits);
-        Assert.Equal("Keep my edits", (string?)keep.Attribute("Content"));
-        Assert.Equal("Collapsed", (string?)keep.Attribute("Visibility"));
-        Assert.Contains(keep.Ancestors(), e => e == bar);
+        Assert.DoesNotContain(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") is "SharingSaveButton" or "SharingDiscardButton");
+        foreach (string name in new[] { "ConfigInfoBar", "SharingInfoBar", "SettingsSaveSummary" })
+            Assert.DoesNotContain(Named(markup, name).Ancestors(), e => e.Name.LocalName == "ScrollViewer" ||
+                (string?)e.Attribute(xaml + "Name") is "CaptureSection" or "SharingSection");
+        Assert.Equal("{StaticResource AccentButtonStyle}", (string?)Named(markup, "SaveButton").Attribute("Style"));
     }
 
     [Theory]

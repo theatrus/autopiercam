@@ -28,10 +28,11 @@ does not deploy the Hub.
    configured and saved before pairing. A rejected code does not clear them.
 3. In **Choose what to share**, select snapshots and a periodic interval;
    expand **Scene and telescope events** or **Chat control** for other options.
-   Turn on **Enable image sharing** and choose **Save and enable sharing**.
-   The footer's feedback, **Discard changes** and Save stay visible while the
-   settings scroll, as in the Capture section. Later edits use **Save settings**,
-   without restarting capture.
+   Turn on **Enable image sharing** and choose **Save all settings**.
+   Settings opens in its own window, leaving the preview visible. The shared
+   footer saves edits from both Imaging and Chatstronomy, even if one tab is
+   hidden. Numeric edits enable Save while typing; leaving the field is not
+   required. Sharing-only saves do not restart capture.
 4. Connection and delivery status update automatically while the section is
    open, without discarding edits. **Connection details / change Hub** shows the device ID,
    installation ID, and latest confirmed delivery. The Hub's **Snapshot now**
@@ -53,20 +54,38 @@ or pairing fails after consuming a code, generate a new code; pairing is never
 automatically retried. Credentials never appear in command-line arguments,
 ordinary camera configuration, sharing settings, status responses, or logs.
 
-Unsaved changes stay when you hide Settings or switch sections; the Settings
-button shows a dot until you save or choose **Discard changes**. **Reload
+Unsaved changes stay when you switch sections; the Settings button shows a dot
+until you save or choose **Discard all changes**. Closing Settings or the Viewer
+with edits offers Save all, Discard all, or Keep editing. **Reload
 settings** asks before discarding edits. If settings changed elsewhere
 (including chat), the status refresh keeps your draft and the footer asks you to
 either discard it or **Keep my edits** before saving a replacement. An
 unconfirmed agent status blocks pairing/saves until a successful reload.
 
+Both drafts are validated before either save. The agent still stores two
+separately revisioned documents, so this is not an atomic cross-document
+transaction: if Imaging saves but Chatstronomy fails, the footer reports that
+partial result and retains the sharing edits for review and retry.
+
 ## Triggered sharing and chat configuration
 
 The Viewer provides a periodic interval (0 disables, otherwise 1–1440 minutes),
 a telescope-event opt-in, and an event burst size of 1–3 distinct images spaced
-60–600 seconds apart. Periodic sends are single images. The first scheduled send
-waits a full interval; reconnects reset the interval and discard unfinished bursts
-instead of replaying a backlog. The device-wide 60-second cooldown still applies.
+60–600 seconds apart. Periodic sends are single images on fixed UTC clock slots,
+not a countdown from Save or connection time. For example, 15 minutes uses
+:00, :15, :30 and :45. All intervals are anchored to the Unix epoch; an interval
+that does not divide an hour or day continues at that spacing across boundaries.
+This is cron-like alignment, not a field accepting full cron expressions.
+
+Enabling or changing the interval uses the next clock boundary. Reconnecting,
+saving the same interval, or receiving identical Hub rules does not start a new
+full-interval countdown. Missed slots coalesce into at most one current image,
+never a catch-up queue; slots observed without capture are skipped. A backward
+clock adjustment does not repeat an already observed slot within the running
+worker. Process restart uses the next future boundary rather than replaying old
+slots. Reconnects still discard unfinished event bursts. Frame freshness, consent,
+the device-wide 60-second cooldown and Hub delivery limits still apply, so a clock
+slot is an opportunity to send, not a guarantee of an exact Discord post time.
 
 Enable **Allow the camera owner to configure triggers from chat** locally to use
 `/chatstronomy piercam triggers` in a channel receiving that camera. Supply the
@@ -82,8 +101,9 @@ within that local limit. Only the camera owner may invoke these commands; server
 manager privileges alone do not grant access. DMs and unrelated channels fail.
 
 Chat overrides are atomically saved on the camera. **Connection details** shows the
-active rules as well as local permission limits. Any local **Save settings**
-clears overrides. A stale Viewer save fails with a revision conflict instead of
+active rules as well as local permission limits. **Save all settings** clears
+active chat overrides when saving Chatstronomy; a Capture-only save with no
+overrides leaves sharing unchanged. A stale Viewer save fails with a revision conflict instead of
 overwriting a newer chat update. Pairing preserves trigger permissions but keeps
 sharing off; forgetting clears permissions. Both reset chat overrides.
 `/chatstronomy piercam snapshot` uses the existing separate local snapshot gate

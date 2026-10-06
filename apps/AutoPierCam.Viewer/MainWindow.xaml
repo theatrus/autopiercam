@@ -178,20 +178,22 @@
                 </Grid>
             </Grid>
 
-            <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="8" Visibility="Collapsed">
+            <!-- Detached into the dedicated settings Window before it is shown. -->
+            <Grid x:Name="SettingsPane" Grid.Column="1" RowSpacing="8" Padding="16" Visibility="Collapsed" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <StackPanel Spacing="4">
                     <SelectorBar x:Name="SettingsSectionBar" SelectionChanged="SettingsSectionBar_SelectionChanged">
-                        <SelectorBarItem x:Name="CaptureSectionItem" Text="Capture" IsSelected="True" />
+                        <SelectorBarItem x:Name="CaptureSectionItem" Text="Imaging" IsSelected="True" />
                         <SelectorBarItem x:Name="SharingSectionItem" Text="Chatstronomy" />
                     </SelectorBar>
                 </StackPanel>
 
-                <!-- Both sections share one layout: Reload at the top, scrolling
-                     fields, and a fixed footer with feedback, Discard and Save. -->
+                <!-- Both tabs keep their drafts; one common footer below the
+                     tabs shows feedback and saves/discards both documents. -->
                 <Grid x:Name="CaptureSection" Grid.Row="1" RowSpacing="12">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
@@ -502,40 +504,7 @@
                                    TextWrapping="Wrap" />
                     </StackPanel>
                     </ScrollViewer>
-                    <StackPanel Grid.Row="2" Spacing="8">
-                        <InfoBar
-                            x:Name="ConfigInfoBar"
-                            IsClosable="False"
-                            IsOpen="False"
-                            IsIconVisible="False"
-                            Message="Connect to the local agent to load settings."
-                            Severity="Informational">
-                            <InfoBar.ActionButton>
-                                <Button x:Name="CaptureKeepEditsButton" Content="Keep my edits"
-                                        Click="CaptureKeepEditsButton_Click" Visibility="Collapsed" />
-                            </InfoBar.ActionButton>
-                        </InfoBar>
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Button
-                                x:Name="CaptureDiscardButton"
-                                HorizontalAlignment="Stretch"
-                                Click="CaptureDiscardButton_Click"
-                                Content="Discard changes"
-                                IsEnabled="False" />
-                            <Button
-                                x:Name="SaveButton"
-                                Grid.Column="1"
-                                HorizontalAlignment="Stretch"
-                                Click="SaveButton_Click"
-                                Content="Save settings"
-                                IsEnabled="False"
-                                Style="{StaticResource AccentButtonStyle}" />
-                        </Grid>
-                    </StackPanel>
+
                 </Grid>
 
                 <Grid x:Name="SharingSection" Grid.Row="1" RowSpacing="12" Visibility="Collapsed">
@@ -573,7 +542,8 @@
                                 <ToggleSwitch x:Name="SharingSnapshotsToggle" Header="Allow Snapshot now requests" />
                                 <StackPanel Spacing="6">
                                     <TextBlock Text="Send an image every" />
-                                    <NumberBox x:Name="SharingIntervalNumberBox" Header="Minutes · 0 = off"
+                                    <TextBlock Text="Clock-aligned, not time since Save. 15 min uses :00, :15, :30, :45 UTC. Missed slots do not queue a backlog." TextWrapping="Wrap" FontSize="12" />
+                                    <NumberBox x:Name="SharingIntervalNumberBox" Header="Minutes · UTC clock-aligned · 0 = off"
                                                Minimum="0" Maximum="1440" SmallChange="1" SpinButtonPlacementMode="Compact" />
                                 </StackPanel>
                                 <Expander Header="Scene and telescope events" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
@@ -624,40 +594,54 @@
                             </StackPanel>
                         </StackPanel>
                     </ScrollViewer>
-                    <StackPanel Grid.Row="2" Spacing="8">
-                        <InfoBar
-                            x:Name="SharingInfoBar"
-                            IsClosable="False"
-                            IsOpen="False"
-                            IsIconVisible="False"
-                            Severity="Informational">
-                            <InfoBar.ActionButton>
-                                <Button x:Name="SharingKeepEditsButton" Content="Keep my edits"
-                                        Click="SharingKeepEditsButton_Click" Visibility="Collapsed" />
-                            </InfoBar.ActionButton>
-                        </InfoBar>
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Button
-                                x:Name="SharingDiscardButton"
-                                HorizontalAlignment="Stretch"
-                                Click="SharingDiscardButton_Click"
-                                Content="Discard changes"
-                                IsEnabled="False" />
-                            <Button
-                                x:Name="SharingSaveButton"
-                                Grid.Column="1"
-                                HorizontalAlignment="Stretch"
-                                Click="SharingSaveButton_Click"
-                                Content="Save settings"
-                                IsEnabled="False"
-                                Style="{StaticResource AccentButtonStyle}" />
-                        </Grid>
-                    </StackPanel>
+
                 </Grid>
+                <StackPanel Grid.Row="2" Spacing="8">
+                    <TextBlock x:Name="SettingsSaveSummary" TextWrapping="Wrap" Text="Changes in both tabs are saved together." />
+                    <InfoBar
+                        x:Name="ConfigInfoBar"
+                        IsClosable="False"
+                        IsOpen="False"
+                        IsIconVisible="False"
+                        Message="Connect to the local agent to load settings."
+                        Severity="Informational">
+                        <InfoBar.ActionButton>
+                            <Button x:Name="CaptureKeepEditsButton" Content="Keep my edits"
+                                    Click="CaptureKeepEditsButton_Click" Visibility="Collapsed" />
+                        </InfoBar.ActionButton>
+                    </InfoBar>
+                    <InfoBar
+                        x:Name="SharingInfoBar"
+                        IsClosable="False"
+                        IsOpen="False"
+                        IsIconVisible="False"
+                        Severity="Informational">
+                        <InfoBar.ActionButton>
+                            <Button x:Name="SharingKeepEditsButton" Content="Keep my edits"
+                                    Click="SharingKeepEditsButton_Click" Visibility="Collapsed" />
+                        </InfoBar.ActionButton>
+                    </InfoBar>
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button
+                            x:Name="CaptureDiscardButton"
+                            HorizontalAlignment="Stretch"
+                            Click="CaptureDiscardButton_Click"
+                            Content="Discard all changes"
+                            IsEnabled="False" />
+                        <Button
+                            x:Name="SaveButton"
+                            Grid.Column="1"
+                            HorizontalAlignment="Stretch"
+                            Click="SaveButton_Click"
+                            Content="Save all settings"
+                            IsEnabled="False"
+                            Style="{StaticResource AccentButtonStyle}" />
+                    </Grid>
+                </StackPanel>
             </Grid>
         </Grid>
     </Grid>

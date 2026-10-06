@@ -54,6 +54,7 @@ public sealed partial class MainWindow : Window
         _previewFreshnessTimer.IsRepeating = true;
         _previewFreshnessTimer.Tick += PreviewFreshnessTimer_Tick;
         Closed += MainWindow_Closed;
+        AppWindow.Closing += ViewerClosing;
     }
 
     private async void RootGrid_Loaded(object sender, RoutedEventArgs e)
@@ -483,7 +484,7 @@ public sealed partial class MainWindow : Window
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiOperationAsync("Validating and saving configuration…", SaveConfigurationAsync);
+        await SaveAllSettingsAsync();
     }
 
     private async void ManageOutboxButton_Click(object sender, RoutedEventArgs e)
@@ -638,7 +639,7 @@ public sealed partial class MainWindow : Window
         {
             var dialog = new ContentDialog
             {
-                XamlRoot = Content.XamlRoot,
+                XamlRoot = SettingsPane.XamlRoot,
                 Title = "Upload outbox",
                 PrimaryButtonText = "Requeue selected",
                 CloseButtonText = "Close",
@@ -848,7 +849,7 @@ public sealed partial class MainWindow : Window
 
             var confirmation = new ContentDialog
             {
-                XamlRoot = Content.XamlRoot,
+                XamlRoot = SettingsPane.XamlRoot,
                 Title = "Requeue this upload?",
                 Content = new TextBlock
                 {
@@ -1140,6 +1141,7 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.Text = configuration.Upload.Endpoint ?? string.Empty;
         VideoEnabledToggle.IsOn = configuration.Video.Enabled;
         FfmpegPathTextBox.Text = configuration.Video.FfmpegPath ?? string.Empty;
+        ResetNumberEditors(CaptureNumberBoxes);
 
         _configurationSnapshot = snapshot;
         _settingsBaseline = SettingsFormValues.FromConfiguration(configuration);
@@ -1169,7 +1171,7 @@ public sealed partial class MainWindow : Window
         if (_latestAgentStatus?.HasCapability("camera.white_balance") == true)
         {
             whiteBalance = SelectedWhiteBalanceMode() == "disabled" ? null : new AgentWhiteBalanceConfiguration {
-                Mode = SelectedWhiteBalanceMode(), Red = WhiteBalanceRedNumberBox.Value, Blue = WhiteBalanceBlueNumberBox.Value
+                Mode = SelectedWhiteBalanceMode(), Red = ReadNumber(WhiteBalanceRedNumberBox), Blue = ReadNumber(WhiteBalanceBlueNumberBox)
             };
             if (whiteBalance is not null && !whiteBalance.IsValid)
                 throw new UserInputException("White-balance multipliers must be finite numbers from 0.125 to 8.");
@@ -1178,8 +1180,8 @@ public sealed partial class MainWindow : Window
         double? longitude = original.Camera.LongitudeDeg;
         if (_latestAgentStatus?.HasCapability("camera.startup_location") == true)
         {
-            latitude = double.IsNaN(LatitudeNumberBox.Value) ? null : LatitudeNumberBox.Value;
-            longitude = double.IsNaN(LongitudeNumberBox.Value) ? null : LongitudeNumberBox.Value;
+            latitude = double.IsNaN(ReadNumber(LatitudeNumberBox)) ? null : ReadNumber(LatitudeNumberBox);
+            longitude = double.IsNaN(ReadNumber(LongitudeNumberBox)) ? null : ReadNumber(LongitudeNumberBox);
             if ((latitude is null) != (longitude is null) ||
                 latitude is double lat && (!double.IsFinite(lat) || lat < -90 || lat > 90) ||
                 longitude is double lon && (!double.IsFinite(lon) || lon < -180 || lon > 180))
@@ -1188,7 +1190,7 @@ public sealed partial class MainWindow : Window
         double? previewMaxFps = original.Capture.PreviewMaxFps;
         if (_latestAgentStatus?.HasCapability("capture.preview_rate") == true)
         {
-            double value = PreviewMaxFpsNumberBox.Value;
+            double value = ReadNumber(PreviewMaxFpsNumberBox);
             bool fractional = _latestAgentStatus?.HasCapability("capture.preview_rate_fractional") == true;
             if (!AgentCaptureConfiguration.IsSupportedPreviewRate(value, fractional))
                 throw new UserInputException(fractional
@@ -1197,20 +1199,20 @@ public sealed partial class MainWindow : Window
             previewMaxFps = value;
         }
         long maxExposureUs = ReadScaledInt64(
-            MaxExposureNumberBox.Value,
+            ReadNumber(MaxExposureNumberBox),
             1000,
             "Max exposure");
-        long maxGain = ReadScaledInt64(MaxGainNumberBox.Value, 1, "Max gain");
+        long maxGain = ReadScaledInt64(ReadNumber(MaxGainNumberBox), 1, "Max gain");
         bool gainEditingSupported = _latestAgentStatus?.HasCapability("camera.gain_range") == true;
         long? minGain = gainEditingSupported
-            ? ReadScaledInt64(MinGainNumberBox.Value, 1, "Minimum gain") : original.Camera.MinGain;
+            ? ReadScaledInt64(ReadNumber(MinGainNumberBox), 1, "Minimum gain") : original.Camera.MinGain;
         bool? preferShort = gainEditingSupported ? PreferShortExposuresToggle.IsOn : original.Camera.PreferShortExposures;
         if ((minGain ?? 0) < 0 || (minGain ?? 0) > maxGain)
             throw new UserInputException("Minimum gain must be between zero and Max gain.");
         if (!AdaptiveExposureToggle.IsOn && ((minGain ?? 0) > 0 || preferShort == true))
             throw new UserInputException("Enable application control, or set minimum gain to 0 and turn off Prefer shorter exposures.");
         ulong intervalMs = ReadScaledUInt64(
-            StillIntervalNumberBox.Value,
+            ReadNumber(StillIntervalNumberBox),
             1000,
             "Still interval");
         bool retentionEditingSupported =
@@ -1221,12 +1223,12 @@ public sealed partial class MainWindow : Window
         // or change one unless the explicit capability is present.
         ulong? retentionMaxBytes = retentionEditingSupported
             ? ReadOptionalMebibytes(
-                RetentionMaxMiBNumberBox.Value,
+                ReadNumber(RetentionMaxMiBNumberBox),
                 "Managed image limit")
             : original.Capture.RetentionMaxBytes;
         ulong? retentionMinFreeBytes = retentionEditingSupported
             ? ReadOptionalMebibytes(
-                RetentionMinFreeMiBNumberBox.Value,
+                ReadNumber(RetentionMinFreeMiBNumberBox),
                 "Minimum disk free")
             : original.Capture.RetentionMinFreeBytes;
 
@@ -1648,7 +1650,7 @@ public sealed partial class MainWindow : Window
 
     private void SetControlsForOperation(bool inProgress)
     {
-        bool generalControlsEnabled = !inProgress && !_closed;
+        bool generalControlsEnabled = !inProgress && !_closed && !_sharingBusy && !_savingAll;
         RefreshButton.IsEnabled = generalControlsEnabled;
         SettingsButton.IsEnabled = generalControlsEnabled;
         CaptureButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
@@ -1680,9 +1682,6 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
         FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
-        SaveButton.IsEnabled = configurationControlsEnabled && !_liveStatusUnavailable && _hasUnsavedSettings;
-        CaptureDiscardButton.IsEnabled = generalControlsEnabled && _configurationSnapshot is not null &&
-            (_hasUnsavedSettings || _captureNeedsReview);
         CaptureKeepEditsButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();
@@ -1734,7 +1733,7 @@ public sealed partial class MainWindow : Window
             ? Visibility.Visible
             : Visibility.Collapsed;
         ManageOutboxButton.IsEnabled =
-            serviceAvailable && !_operationInProgress && !_closed;
+            serviceAvailable && !_operationInProgress && !_sharingBusy && !_savingAll && !_closed;
         OutboxAvailabilityText.Visibility = supported && !serviceAvailable
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -1755,7 +1754,7 @@ public sealed partial class MainWindow : Window
             _latestAgentStatus?.HasCapability(
                 AgentPipeClient.StorageRetentionCapability) == true;
         bool editingEnabled =
-            settingsLoaded && supported && !_operationInProgress && !_closed;
+            settingsLoaded && supported && !_operationInProgress && !_sharingBusy && !_savingAll && !_closed;
         RetentionMaxMiBNumberBox.IsEnabled = editingEnabled;
         RetentionMinFreeMiBNumberBox.IsEnabled = editingEnabled;
 
@@ -1911,6 +1910,7 @@ public sealed partial class MainWindow : Window
     private async void MainWindow_Closed(object sender, WindowEventArgs args)
     {
         _closed = true;
+        _settingsWindow?.Close();
         _previewFreshnessTimer.Stop();
         _lifetime.Cancel();
         _skyModel?.Dispose();

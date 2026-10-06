@@ -2,15 +2,11 @@ using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
 using Windows.Globalization.NumberFormatting;
 
 namespace AutoPierCam.Viewer;
 
-// The Chatstronomy section of Settings. It follows the Capture section's
-// pattern: Reload at the top, a draft that survives hiding the panel, and a
-// footer with feedback, Discard and Save. The agent stores sharing apart from
-// capture configuration, with its own revision, so each section saves alone.
+// Both tabs retain independent revisioned drafts, with one shared Save footer.
 public sealed partial class MainWindow
 {
     private SharingSetupState? _sharing;
@@ -24,17 +20,15 @@ public sealed partial class MainWindow
 
     private bool SharingHasEdits => _sharing is { } setup && (setup.IsDirty || _sharingInvalidDraft);
     private bool SharingSupported => _latestAgentStatus?.HasCapability("sharing.get") == true;
-    private bool SharingSectionVisible =>
-        SettingsPane.Visibility == Visibility.Visible && SharingSection.Visibility == Visibility.Visible;
 
     private void InitializeSharingSection()
     {
         foreach (NumberBox box in SharingNumberBoxes)
         {
-            box.NumberFormatter = new DecimalFormatter {
-                FractionDigits = 0, IntegerDigits = 1,
-                NumberRounder = new IncrementNumberRounder { Increment = 1 },
-            };
+            TrackNumberEditor(box, SharingChanged);
+            // Do not round a fractional draft into a different integer on blur.
+            // WholeNumber validates the actual text on save.
+            box.NumberFormatter = new DecimalFormatter { FractionDigits = 0, IntegerDigits = 1 };
             box.ValueChanged += (_, _) => SharingChanged();
             // Text can change before Value commits; track both, as Capture does.
             box.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => SharingChanged());
@@ -71,20 +65,14 @@ public sealed partial class MainWindow
     private void UpdateSharingPolling()
     {
         if (!_sharingInitialized) return;
-        _sharingPollWanted = SharingSectionVisible && SharingSupported;
-        if (_sharingPollWanted && _sharing is null && !_sharingBusy)
+        _sharingPollWanted = SettingsPane.Visibility == Visibility.Visible && SharingSupported;
+        if (_sharingPollWanted && _sharing is null && !_sharingBusy && !_sharingStatusUnknown)
             _ = RunSharingOperationAsync("Loading Chatstronomy settings…", LoadSharingAsync);
     }
 
     private ushort SharingNumber(NumberBox box, ushort minimum, ushort maximum, string label)
     {
-        // Read pending text while the box has focus, otherwise its committed
-        // Value. Value is reliable even while collapsed content is untemplated.
-        for (var focus = FocusManager.GetFocusedElement(Content.XamlRoot) as DependencyObject;
-             focus is not null; focus = VisualTreeHelper.GetParent(focus))
-            if (ReferenceEquals(focus, box))
-                return SharingSetupState.WholeNumber(box.Text, minimum, maximum, label);
-        return SharingSetupState.WholeNumber(box.Value, minimum, maximum, label);
+        return SharingSetupState.WholeNumber(LiveNumberText(box), minimum, maximum, label);
     }
 
     private SharingPreferences SharingInputs() => new() {
@@ -117,6 +105,7 @@ public sealed partial class MainWindow
         SharingBurstNumberBox.Value = p.BurstCount;
         SharingSpacingNumberBox.Value = p.SpacingSeconds;
         SharingChatToggle.IsOn = p.ChatConfiguration;
+        ResetNumberEditors(SharingNumberBoxes);
         _sharingInvalidDraft = false;
         _sharingLoading = false;
         RenderSharing();
@@ -125,6 +114,7 @@ public sealed partial class MainWindow
     private void SharingChanged()
     {
         if (_sharingLoading || _sharingBusy || _sharing is not { } setup) return;
+        _settingsSaveResult = null;
         try { setup.Draft = SharingInputs(); _sharingInvalidDraft = false; }
         catch (InvalidOperationException) { _sharingInvalidDraft = true; }
         _sharingFeedback = null;
@@ -137,7 +127,7 @@ public sealed partial class MainWindow
         bool supported = SharingSupported;
         bool loaded = _sharing is not null;
         bool paired = _sharing?.Status.DeviceId is not null;
-        bool idle = !_sharingBusy && supported && loaded;
+        bool idle = !_sharingBusy && !_operationInProgress && !_savingAll && supported && loaded;
         bool review = _sharing?.NeedsReview == true;
 
         SharingPairingGroup.Visibility = paired ? Visibility.Collapsed : Visibility.Visible;
@@ -150,14 +140,9 @@ public sealed partial class MainWindow
             !string.IsNullOrWhiteSpace(SharingOriginTextBox.Text) && !string.IsNullOrWhiteSpace(SharingCodePasswordBox.Password);
         SharingForgetConsentCheckBox.IsEnabled = idle && paired;
         SharingForgetButton.IsEnabled = idle && paired && !_sharingStatusUnknown && SharingForgetConsentCheckBox.IsChecked == true;
-        SharingStopButton.IsEnabled = !_sharingBusy && supported && loaded &&
+        SharingStopButton.IsEnabled = idle &&
             (_sharing!.Status.Preferences.Enabled || _sharingStatusUnknown);
-        SharingReloadButton.IsEnabled = !_sharingBusy && supported;
-        SharingDiscardButton.IsEnabled = idle && (SharingHasEdits || review);
-        SharingSaveButton.IsEnabled = idle && !_sharingStatusUnknown && !review &&
-            (SharingHasEdits || _sharing!.HasChatOverrides);
-        SharingSaveButton.Content = SharingEnabledToggle.IsOn && _sharing?.Status.Preferences.Enabled == false
-            ? "Save and enable sharing" : "Save settings";
+        SharingReloadButton.IsEnabled = !_sharingBusy && !_operationInProgress && !_savingAll && supported;
         SharingKeepEditsButton.Visibility = review ? Visibility.Visible : Visibility.Collapsed;
         SharingKeepEditsButton.IsEnabled = idle && !_sharingStatusUnknown;
 
@@ -173,9 +158,7 @@ public sealed partial class MainWindow
             !supported ? ("Unavailable", "Update the AutoPierCam agent to share images with Chatstronomy.", InfoBarSeverity.Warning)
             : _sharingStatusUnknown ? ("Status unknown", "Reload settings before saving or pairing.", InfoBarSeverity.Warning)
             : review ? ("Settings changed elsewhere", "Discard to load the new settings. Keep edits to overwrite them on Save.", InfoBarSeverity.Error)
-            : SharingHasEdits ? ("Unsaved changes", "Save applies changes and clears chat overrides.", InfoBarSeverity.Informational)
             : _sharing?.HasChatOverrides == true ? ("Chat overrides active", "Save settings to restore your local trigger choices.", InfoBarSeverity.Informational)
-            : loaded && !paired ? ("Not paired", "Pair above, then enable sharing and save.", InfoBarSeverity.Informational)
             : null;
         if (_sharingFeedback is { } feedback && !review && !_sharingStatusUnknown) state = feedback;
         SharingInfoBar.IsOpen = state is not null;
@@ -212,14 +195,14 @@ public sealed partial class MainWindow
         PopulateSharing();
     }
 
-    private async Task RunSharingOperationAsync(string working, Func<CancellationToken, Task> action, bool pairing = false)
+    private async Task<bool> RunSharingOperationAsync(string working, Func<CancellationToken, Task> action, bool pairing = false)
     {
-        if (_sharingBusy || _closed) return;
+        if (_sharingBusy || _closed) return false;
         _sharingBusy = true;
         _sharingFeedback = ("Working", working, InfoBarSeverity.Informational);
-        RenderSharing();
-        try { await action(_lifetime.Token); }
-        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { return; }
+        SetControlsForOperation(_operationInProgress);
+        try { await action(_lifetime.Token); return true; }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { return false; }
         catch (Exception error)
         {
             string message = error is OperationCanceledException ? "Operation cancelled." : error.Message;
@@ -234,21 +217,23 @@ public sealed partial class MainWindow
                 }
                 catch { _sharingStatusUnknown = true; }
             }
+            else _sharingStatusUnknown = true;
             if (pairing) message += " A code may have been consumed; get a new code from the Hub before retrying.";
             SetSharingFeedback("Not completed", message, InfoBarSeverity.Error);
+            return false;
         }
         finally
         {
             _sharingBusy = false;
-            if (!_closed) RenderSharing();
+            if (!_closed) SetControlsForOperation(_operationInProgress);
         }
     }
 
-    // Called by the status loop while the Chatstronomy section is open, so
+    // Called by the status loop while the settings window is open, so
     // connection state stays current the way Capture status does.
     private void ApplyPolledSharing(SharingStatus latest)
     {
-        if (_sharingBusy || _sharing is not { } setup || _closed) return;
+        if (_sharingBusy || _savingAll || _sharing is not { } setup || _closed) return;
         var shown = setup.Draft;
         setup.Refresh(latest, _sharingInvalidDraft);
         _sharingStatusUnknown = false;
@@ -262,15 +247,6 @@ public sealed partial class MainWindow
         await RunSharingOperationAsync("Reloading Chatstronomy settings…", LoadSharingAsync);
     }
 
-    private void SharingDiscardButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (_sharing is not { } setup) return;
-        setup.Discard();
-        PopulateSharing();
-        SetSharingFeedback("Changes discarded", "Showing the saved Chatstronomy settings.", InfoBarSeverity.Informational);
-        RenderSharing();
-    }
-
     private void SharingKeepEditsButton_Click(object sender, RoutedEventArgs e)
     {
         if (_sharing is not { } setup) return;
@@ -279,19 +255,17 @@ public sealed partial class MainWindow
         RenderSharing();
     }
 
-    private async void SharingSaveButton_Click(object sender, RoutedEventArgs e)
+    private async Task SaveSharingAsync(CancellationToken ct)
     {
         if (_sharing is not { } setup) return;
-        await RunSharingOperationAsync("Saving Chatstronomy settings…", async ct => {
-            // Always validate the current text, never a cached load-time error.
-            setup.Draft = SharingInputs();
-            _sharingInvalidDraft = false;
-            setup.Accept(await _agentClient.ConfigureSharingAsync(setup.ExpectedRevision, setup.ForSave(), ct));
-            PopulateSharing();
-            SetSharingFeedback("Settings saved", setup.Status.Preferences.Enabled
-                ? "Connecting to the Hub. Connection status updates automatically."
-                : "Sharing is off.");
-        });
+        // Always validate the current text, never a cached load-time error.
+        setup.Draft = SharingInputs();
+        _sharingInvalidDraft = false;
+        setup.Accept(await _agentClient.ConfigureSharingAsync(setup.ExpectedRevision, setup.ForSave(), ct));
+        PopulateSharing();
+        SetSharingFeedback("Settings saved", setup.Status.Preferences.Enabled
+            ? "Connecting to the Hub. Connection status updates automatically."
+            : "Sharing is off.");
     }
 
     private async void SharingStopButton_Click(object sender, RoutedEventArgs e)
@@ -352,14 +326,20 @@ public sealed partial class MainWindow
     // Shared by both sections' Reload buttons.
     private async Task<bool> ConfirmDiscardAsync()
     {
-        var confirm = new ContentDialog {
-            XamlRoot = Content.XamlRoot,
-            Title = "Discard unsaved settings?",
-            Content = "Reloading settings from the agent will discard your unsaved changes.",
-            PrimaryButtonText = "Discard and reload",
-            CloseButtonText = "Keep editing",
-            DefaultButton = ContentDialogButton.Close,
-        };
-        return await confirm.ShowAsync() == ContentDialogResult.Primary;
+        if (_closingSettingsDialog) return false;
+        _closingSettingsDialog = true;
+        try
+        {
+            var confirm = new ContentDialog {
+                XamlRoot = SettingsPane.XamlRoot,
+                Title = "Discard unsaved settings?",
+                Content = "Reloading this tab from the agent will discard its unsaved changes. Edits in the other tab are kept.",
+                PrimaryButtonText = "Discard and reload",
+                CloseButtonText = "Keep editing",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            return await confirm.ShowAsync() == ContentDialogResult.Primary;
+        }
+        finally { _closingSettingsDialog = false; }
     }
 }

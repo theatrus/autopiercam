@@ -19,13 +19,14 @@ public sealed partial class MainWindow
     }
 
     private void SettingsButton_Click(object sender, RoutedEventArgs args) =>
-        SetSettingsVisible(SettingsPane.Visibility != Visibility.Visible);
+        SetSettingsVisible(true);
 
     private void SetSettingsVisible(bool visible)
     {
-        // Collapsing never reloads controls or discards pending changes.
+        if (visible) EnsureSettingsWindow();
         SettingsPane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        UpdateSettingsLayout();
+        if (visible) _settingsWindow!.Activate();
+        else _settingsWindow?.AppWindow.Hide();
         UpdateSettingsButton();
         UpdateSharingPolling();
         if (!visible) SettingsButton.Focus(FocusState.Programmatic);
@@ -35,16 +36,18 @@ public sealed partial class MainWindow
 
     private void UpdateSettingsLayout()
     {
-        if (SettingsPane is null) return;
-        var layout = SettingsLayout.ForWidth(WorkspaceGrid.ActualWidth, SettingsPane.Visibility == Visibility.Visible);
-        PreviewPane.Visibility = layout.PreviewVisible ? Visibility.Visible : Visibility.Collapsed;
-        PreviewColumn.Width = layout.PreviewVisible ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
-        SettingsColumn.Width = new GridLength(layout.PaneWidth);
-        WorkspaceGrid.ColumnSpacing = layout.Gap;
+        // Settings has its own window; opening it never hides or shrinks preview.
+        PreviewPane.Visibility = Visibility.Visible;
+        PreviewColumn.Width = new GridLength(1, GridUnitType.Star);
+        SettingsColumn.Width = new GridLength(0);
+        WorkspaceGrid.ColumnSpacing = 0;
     }
 
-    private void UpdateSettingsButton() => SettingsButton.Content =
-        (SettingsPane.Visibility == Visibility.Visible ? "Hide settings" : "Settings") + (_hasUnsavedSettings || SharingHasEdits ? " •" : "");
+    private void UpdateSettingsButton()
+    {
+        SettingsButton.Content = "Settings" + (_hasUnsavedSettings || SharingHasEdits ? " •" : "");
+        UpdateSharedSave();
+    }
 
     private void SetConfigurationFeedback(InfoBarSeverity severity, bool show, bool openSettings = false)
     {

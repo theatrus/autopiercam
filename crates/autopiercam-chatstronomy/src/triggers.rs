@@ -81,6 +81,42 @@ struct Burst {
     deadline: Instant,
 }
 
+/// Wall-clock slots anchored at the Unix epoch (UTC), not connection uptime.
+/// Keep this across reconnects/configuration reloads. Missed slots coalesce;
+/// moving the clock backwards never replays an already observed slot.
+#[derive(Default)]
+pub(crate) struct PeriodicSchedule {
+    interval_ms: u64,
+    next_ms: u64,
+}
+
+impl PeriodicSchedule {
+    pub fn configure(&mut self, minutes: u16, wall_ms: u64) {
+        let interval = u64::from(minutes) * 60_000;
+        if interval != self.interval_ms {
+            self.interval_ms = interval;
+            self.next_ms = self.next_boundary(wall_ms);
+        }
+    }
+
+    fn next_boundary(&self, wall_ms: u64) -> u64 {
+        if self.interval_ms == 0 {
+            return u64::MAX;
+        }
+        (wall_ms / self.interval_ms)
+            .saturating_add(1)
+            .saturating_mul(self.interval_ms)
+    }
+
+    fn due(&mut self, wall_ms: u64) -> bool {
+        if self.interval_ms == 0 || wall_ms < self.next_ms {
+            return false;
+        }
+        self.next_ms = self.next_boundary(wall_ms);
+        true
+    }
+}
+
 struct SlewFinish {
     session: u64,
     after_sequence: u64,
@@ -93,20 +129,17 @@ pub(crate) struct Scheduler {
     finish_ready: bool,
     last_queued_at: Option<Instant>,
     rules: TriggerRules,
-    periodic_due: Instant,
     burst: Option<Burst>,
     last_queued: Option<(u64, u64)>,
 }
 
 impl Scheduler {
-    pub fn new(rules: TriggerRules, now: Instant) -> Self {
-        let periodic_due = now + Duration::from_secs(u64::from(rules.interval_minutes) * 60);
+    pub fn new(rules: TriggerRules) -> Self {
         Self {
             slew_finish: None,
             finish_ready: false,
             last_queued_at: None,
             rules,
-            periodic_due,
             burst: None,
             last_queued: None,
         }
@@ -209,7 +242,9 @@ impl Scheduler {
         frame: Option<&Frame>,
         now: Instant,
         wall_ms: u64,
+        periodic: &mut PeriodicSchedule,
     ) -> Option<(&'static str, String)> {
+        let periodic_due = periodic.due(wall_ms);
         self.finish_ready = false;
         let Some(frame) = frame else {
             self.burst = None;
@@ -246,9 +281,7 @@ impl Scheduler {
         {
             self.burst = None;
         }
-        if self.rules.interval_minutes > 0 && now >= self.periodic_due {
-            self.periodic_due =
-                now + Duration::from_secs(u64::from(self.rules.interval_minutes) * 60);
+        if periodic_due {
             // Periodic sends are single frames; bursts are only for observations/events.
             if self.burst.is_none() {
                 self.trigger("periodic", "Scheduled pier-camera image", frame, now, false);
@@ -313,17 +346,15 @@ mod tests {
     fn long_exposure_finish_waits_without_suppressing_motion_images() {
         for seconds in [30, 60] {
             let now = Instant::now();
+            let mut clock = PeriodicSchedule::default();
             let wall = 1_000_000;
             let mut f = crate::tests::frame(1, false);
             f.captured_at_unix_ms = wall;
             f.exposure_us = Some(seconds * 1_000_000);
-            let mut s = Scheduler::new(
-                TriggerRules::local(&Preferences {
-                    burst_count: 3,
-                    ..Default::default()
-                }),
-                now,
-            );
+            let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+                burst_count: 3,
+                ..Default::default()
+            }));
             s.telescope_trigger("mount_slew_started", &f, now, wall);
             s.telescope_trigger("mount_slewed", &f, now, wall);
             let deadline = s.slew_finish.as_ref().unwrap().deadline;
@@ -331,7 +362,7 @@ mod tests {
             f.sequence += 1;
             f.conservative_start_unix_ms = Some(wall - 1);
             assert_eq!(
-                s.due(Some(&f), now, wall).unwrap().1,
+                s.due(Some(&f), now, wall, &mut clock).unwrap().1,
                 "Pier camera: Update after mount slew started (image 1 of 3)"
             );
             s.queued(&f, now);
@@ -343,7 +374,7 @@ mod tests {
             s.telescope_trigger("mount_slewed", &f, later, wall + 120_000);
             assert_eq!(s.slew_finish.as_ref().unwrap().deadline, deadline);
             assert!(
-                s.due(Some(&f), later, wall + 120_000)
+                s.due(Some(&f), later, wall + 120_000, &mut clock)
                     .unwrap()
                     .1
                     .contains("Follow-up after mount slew started")
@@ -353,19 +384,31 @@ mod tests {
             f.conservative_start_unix_ms = Some(wall + 1);
             f.captured_at_unix_ms = wall + 180_000;
             assert!(
-                s.due(Some(&f), later + Duration::from_secs(59), wall + 180_000)
-                    .is_none()
+                s.due(
+                    Some(&f),
+                    later + Duration::from_secs(59),
+                    wall + 180_000,
+                    &mut clock
+                )
+                .is_none()
             );
             let ready = later + Duration::from_secs(60);
             assert_eq!(
-                s.due(Some(&f), ready, wall + 180_000).unwrap().1,
+                s.due(Some(&f), ready, wall + 180_000, &mut clock)
+                    .unwrap()
+                    .1,
                 "Pier camera: Post-slew image after mount slew completed (exposure timing estimated)"
             );
             s.queued(&f, ready);
             f.sequence += 1;
             assert!(
-                s.due(Some(&f), ready + Duration::from_secs(60), wall + 180_000)
-                    .is_none()
+                s.due(
+                    Some(&f),
+                    ready + Duration::from_secs(60),
+                    wall + 180_000,
+                    &mut clock
+                )
+                .is_none()
             );
         }
     }
@@ -373,33 +416,49 @@ mod tests {
     #[test]
     fn finish_requires_known_timing_and_survives_exhausted_motion_burst() {
         let now = Instant::now();
+        let mut clock = PeriodicSchedule::default();
         let wall = 1_000_000;
         let mut f = crate::tests::frame(1, false);
         f.captured_at_unix_ms = wall;
-        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()), now);
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()));
         s.telescope_trigger("mount_slew_started", &f, now, wall);
         f.sequence += 1;
-        s.due(Some(&f), now, wall).unwrap();
+        s.due(Some(&f), now, wall, &mut clock).unwrap();
         s.queued(&f, now); // one-image burst is exhausted
         s.telescope_trigger("mount_slewed", &f, now, wall);
         f.sequence += 1;
         for timing in [None, Some(wall - 1), Some(wall), Some(wall + 999_999)] {
             f.conservative_start_unix_ms = timing;
             assert!(
-                s.due(Some(&f), now + Duration::from_secs(60), wall + 60_000)
-                    .is_none()
+                s.due(
+                    Some(&f),
+                    now + Duration::from_secs(60),
+                    wall + 60_000,
+                    &mut clock
+                )
+                .is_none()
             );
             assert!(s.slew_finish.is_some());
         }
         f.conservative_start_unix_ms = Some(wall + 1);
         assert!(
-            s.due(Some(&f), now + Duration::from_secs(60), wall + 60_000)
-                .is_some()
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                wall + 60_000,
+                &mut clock
+            )
+            .is_some()
         );
         f.session += 1;
         assert!(
-            s.due(Some(&f), now + Duration::from_secs(60), wall + 60_000)
-                .is_none()
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                wall + 60_000,
+                &mut clock
+            )
+            .is_none()
         );
         assert!(s.slew_finish.is_none());
     }
@@ -407,21 +466,22 @@ mod tests {
     #[test]
     fn completion_expiry_and_other_bursts_remain_bounded() {
         let now = Instant::now();
+        let mut clock = PeriodicSchedule::default();
         let wall = 1_000_000;
         let mut f = crate::tests::frame(1, false);
         f.captured_at_unix_ms = wall;
-        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()), now);
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()));
         s.trigger("scene_change", "Scene changed", &f, now, false);
         s.telescope_trigger("mount_slewed", &f, now, wall);
         assert_eq!(
-            s.due(Some(&f), now, wall),
+            s.due(Some(&f), now, wall, &mut clock),
             Some(("scene_change", "Scene changed".into()))
         );
         s.queued(&f, now);
         f.sequence += 1;
         f.conservative_start_unix_ms = None;
         assert!(
-            s.due(Some(&f), now + Duration::from_secs(421), wall)
+            s.due(Some(&f), now + Duration::from_secs(421), wall, &mut clock)
                 .is_none()
         );
         assert!(s.slew_finish.is_none());
@@ -431,10 +491,15 @@ mod tests {
             ("sequence_started", "sequence started"),
             ("sequence_finished", "sequence finished"),
         ] {
-            let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()), now);
+            let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()));
             s.telescope_trigger(event, &f, now, wall);
             f.sequence += 1;
-            assert!(s.due(Some(&f), now, wall).unwrap().1.contains(description));
+            assert!(
+                s.due(Some(&f), now, wall, &mut clock)
+                    .unwrap()
+                    .1
+                    .contains(description)
+            );
         }
     }
 
@@ -442,19 +507,21 @@ mod tests {
     fn burst_storm_is_coalesced_and_sends_at_most_three_distinct_images() {
         let now = Instant::now();
         let mut f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
-        );
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            burst_count: 3,
+            ..Default::default()
+        }));
         s.trigger("scene_change", "original", &f, now, false);
         for index in 0..3 {
             let at = now + Duration::from_secs(index * 60);
             s.trigger("telescope_event", "coalesced", &f, at, false);
             assert_eq!(
-                s.due(Some(&f), at, f.captured_at_unix_ms),
+                s.due(
+                    Some(&f),
+                    at,
+                    f.captured_at_unix_ms,
+                    &mut PeriodicSchedule::default()
+                ),
                 Some(("scene_change", "original".into()))
             );
             s.queued(&f, at);
@@ -462,7 +529,8 @@ mod tests {
                 s.due(
                     Some(&f),
                     at + Duration::from_secs(60),
-                    f.captured_at_unix_ms
+                    f.captured_at_unix_ms,
+                    &mut PeriodicSchedule::default()
                 )
                 .is_none()
             );
@@ -472,7 +540,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(180),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -513,23 +582,37 @@ mod tests {
     fn bursts_wait_for_new_frames_and_expire_without_backlog() {
         let now = Instant::now();
         let mut f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
-        );
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            burst_count: 3,
+            ..Default::default()
+        }));
         s.trigger("telescope_event", "slew", &f, now, true);
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
+        assert!(
+            s.due(
+                Some(&f),
+                now,
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
+            )
+            .is_none()
+        );
         f.sequence += 1;
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_some());
+        assert!(
+            s.due(
+                Some(&f),
+                now,
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
+            )
+            .is_some()
+        );
         s.queued(&f, now);
         assert!(
             s.due(
                 Some(&f),
                 now + Duration::from_secs(60),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -538,7 +621,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(59),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -546,7 +630,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(60),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_some()
         );
@@ -555,7 +640,8 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(61),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
@@ -564,49 +650,123 @@ mod tests {
             s.due(
                 Some(&f),
                 now + Duration::from_secs(301),
-                f.captured_at_unix_ms
+                f.captured_at_unix_ms,
+                &mut PeriodicSchedule::default()
             )
             .is_none()
         );
     }
     #[test]
-    fn periodic_is_delayed_single_and_stale_frames_are_not_sent() {
+    fn post_slew_image_wins_a_clock_slot_without_replaying_periodic_or_motion() {
         let now = Instant::now();
-        let f = crate::tests::frame(1, false);
-        let mut s = Scheduler::new(
-            TriggerRules::local(&Preferences {
-                interval_minutes: 5,
-                burst_count: 3,
-                ..Default::default()
-            }),
-            now,
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(5, 240_000);
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            interval_minutes: 5,
+            burst_count: 3,
+            ..Default::default()
+        }));
+        let mut f = crate::tests::frame(1, false);
+        f.captured_at_unix_ms = 240_000;
+        f.exposure_us = Some(60_000_000);
+        s.telescope_trigger("mount_slew_started", &f, now, 240_000);
+        s.telescope_trigger("mount_slewed", &f, now, 240_000);
+        f.sequence += 1;
+        f.captured_at_unix_ms = 300_000;
+        f.conservative_start_unix_ms = Some(240_001);
+        let at_slot = now + Duration::from_secs(60);
+        assert!(
+            s.due(Some(&f), at_slot, 300_000, &mut clock)
+                .unwrap()
+                .1
+                .contains("Post-slew")
         );
-        assert!(s.due(Some(&f), now, f.captured_at_unix_ms).is_none());
+        s.queued(&f, at_slot);
+        f.sequence += 1;
         assert!(
             s.due(
                 Some(&f),
-                now + Duration::from_secs(300),
-                f.captured_at_unix_ms + 121_000
+                at_slot + Duration::from_secs(60),
+                360_000,
+                &mut clock
             )
             .is_none()
         );
-        assert!(
+        clock.configure(5, 599_999); // Saving unchanged settings must not move the next slot.
+        assert!(s.due(Some(&f), at_slot, 599_999, &mut clock).is_none());
+        f.captured_at_unix_ms = 600_000;
+        assert_eq!(
             s.due(
                 Some(&f),
-                now + Duration::from_secs(301),
-                f.captured_at_unix_ms
-            )
-            .is_some()
+                now + Duration::from_secs(360),
+                600_000,
+                &mut clock
+            ),
+            Some(("periodic", "Scheduled pier-camera image".into()))
         );
-        s.queued(&f, now + Duration::from_secs(301));
-        assert!(
-            s.due(
-                Some(&f),
-                now + Duration::from_secs(400),
-                f.captured_at_unix_ms
-            )
-            .is_none()
-        );
+    }
+
+    #[test]
+    fn periodic_clock_slots_survive_reconfiguration_and_connection_recreation() {
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(15, 60_000);
+        for minute in 2..15 {
+            clock.configure(15, minute * 60_000); // save / reconnect / identical Hub rules
+            assert!(!clock.due(minute * 60_000));
+        }
+        clock.configure(15, 900_000); // A save exactly on the due slot cannot skip it.
+        assert!(clock.due(900_000));
+        clock.configure(15, 900_000);
+        assert!(!clock.due(900_000));
+        clock.configure(15, 450_000); // Nor may a save after a clock rollback replay it.
+        assert!(!clock.due(900_000));
+        assert!(clock.due(1_800_000));
+        assert!(!clock.due(900_000)); // backwards clock: no duplicate slot
+        assert!(clock.due(9_000_000)); // missed slots: one, not a backlog
+        assert!(!clock.due(9_000_000));
+    }
+
+    #[test]
+    fn changed_interval_uses_next_utc_boundary_and_zero_disables() {
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(15, 60_000);
+        clock.configure(5, 240_000);
+        assert!(!clock.due(299_999));
+        assert!(clock.due(300_000));
+        clock.configure(0, 300_000);
+        assert!(!clock.due(900_000));
+        clock.configure(5, 900_000);
+        assert!(!clock.due(900_000));
+        assert!(clock.due(1_200_000));
+    }
+
+    #[test]
+    fn periodic_is_single_fresh_and_skips_slots_without_capture() {
+        let now = Instant::now();
+        let rules = TriggerRules::local(&Preferences {
+            interval_minutes: 5,
+            burst_count: 3,
+            ..Default::default()
+        });
+        let mut clock = PeriodicSchedule::default();
+        clock.configure(5, 0);
+        let mut s = Scheduler::new(rules.clone());
+        let mut f = crate::tests::frame(1, false);
+        f.captured_at_unix_ms = 0;
+        assert!(s.due(Some(&f), now, 300_000, &mut clock).is_none());
+        f.captured_at_unix_ms = 300_001;
+        assert!(s.due(Some(&f), now, 300_001, &mut clock).is_some());
+        s.queued(&f, now);
+        s = Scheduler::new(rules); // reconnect must not repeat current slot
+        assert!(s.due(Some(&f), now, 300_002, &mut clock).is_none());
+        assert!(s.due(None, now, 600_000, &mut clock).is_none());
+        f.captured_at_unix_ms = 600_001;
+        assert!(s.due(Some(&f), now, 600_001, &mut clock).is_none());
+        f.captured_at_unix_ms = 900_000;
+        assert!(s.due(Some(&f), now, 900_000, &mut clock).is_some());
+        s.queued(&f, now);
+        f.sequence += 1;
+        assert!(s.due(Some(&f), now, 900_001, &mut clock).is_none());
         assert!(TelescopeEvent::parse("slew_to_coordinates").is_none());
     }
 }
