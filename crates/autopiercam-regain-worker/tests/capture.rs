@@ -567,6 +567,30 @@ fn continuous_manual_white_balance_precedes_delivery_decimation() {
 }
 
 #[test]
+fn continuous_timing_estimate_crosses_real_worker_adapter_on_both_backends() {
+    for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
+        let driver = driver(backend, json!({"instant":true}), None);
+        let mut camera = setup_named(
+            &driver,
+            (backend == CameraDriver::ZwoDirect).then_some("ZWO ASI662MC"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match camera.poll_frame(&mut Vec::new(), 50) {
+                Ok(meta) => {
+                    assert!(meta.settings_settled);
+                    assert!(meta.conservative_start_unix_ms.is_some_and(|ms| ms > 0));
+                    break;
+                }
+                Err(e) if e.is_timeout() => assert!(Instant::now() < deadline),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        camera.stop_capture().unwrap();
+    }
+}
+
+#[test]
 fn continuous_transition_frames_reach_preview_on_both_backends() {
     for backend in [CameraDriver::ZwoSdk, CameraDriver::ZwoDirect] {
         let driver = driver(backend, json!({"instant":true}), None);
@@ -590,6 +614,7 @@ fn continuous_transition_frames_reach_preview_on_both_backends() {
                         "transition must not claim requested settings"
                     );
                     assert_eq!(pixels.len(), 64 * 64 * 2);
+                    assert_eq!(meta.conservative_start_unix_ms, None);
                     break;
                 }
                 Err(error) if error.is_timeout() => assert!(Instant::now() < deadline),

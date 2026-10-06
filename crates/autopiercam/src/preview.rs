@@ -16,6 +16,7 @@ const PREVIEW_JPEG_QUALITY: u8 = 75;
 
 #[derive(Clone, Debug)]
 pub struct PreviewFrame {
+    pub conservative_start_unix_ms: Option<u64>,
     pub metadata: PreviewMetadata,
     pub jpeg: Arc<[u8]>,
 }
@@ -74,6 +75,7 @@ impl PreviewHub {
         session_generation: u64,
         mut metadata: PreviewMetadata,
         jpeg: Vec<u8>,
+        conservative_start_unix_ms: Option<u64>,
     ) -> Result<bool> {
         if jpeg.is_empty() || jpeg.len() > MAX_PREVIEW_JPEG_SIZE {
             bail!(
@@ -95,6 +97,7 @@ impl PreviewHub {
         }
         state.change_generation = state.change_generation.wrapping_add(1);
         state.frame = Some(Arc::new(PreviewFrame {
+            conservative_start_unix_ms,
             metadata,
             jpeg: Arc::from(jpeg),
         }));
@@ -132,10 +135,18 @@ impl PreviewSession {
         self.inner.generation
     }
 
-    fn publish(&self, metadata: PreviewMetadata, jpeg: Vec<u8>) -> Result<bool> {
-        self.inner
-            .hub
-            .publish(self.inner.generation, metadata, jpeg)
+    fn publish(
+        &self,
+        metadata: PreviewMetadata,
+        jpeg: Vec<u8>,
+        conservative_start_unix_ms: Option<u64>,
+    ) -> Result<bool> {
+        self.inner.hub.publish(
+            self.inner.generation,
+            metadata,
+            jpeg,
+            conservative_start_unix_ms,
+        )
     }
 }
 
@@ -147,6 +158,7 @@ impl Drop for PreviewSessionInner {
 
 #[derive(Debug)]
 pub(crate) struct PreviewJob {
+    pub(crate) conservative_start_unix_ms: Option<u64>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) bayer: BayerPattern,
@@ -343,7 +355,11 @@ fn encode_and_publish(job: PreviewJob, session: &PreviewSession) -> Result<()> {
         mode: job.mode,
         dropped_frames: job.dropped_frames,
     };
-    let _ = session.publish(metadata, jpeg)?;
+    let timing = job
+        .settings_settled
+        .then_some(job.conservative_start_unix_ms)
+        .flatten();
+    let _ = session.publish(metadata, jpeg, timing)?;
     Ok(())
 }
 
@@ -425,6 +441,7 @@ mod tests {
             crate::CaptureObserver::new(BayerPattern::Rg, Some(&monitor), Some(&sink));
         let frame = crate::CompletedFrame {
             meta: autopiercam_camera::FrameMeta {
+                conservative_start_unix_ms: Some(500),
                 width: 4,
                 height: 4,
                 image_type: autopiercam_camera::ImageType::Raw8,
@@ -458,6 +475,10 @@ mod tests {
         assert!(image::load_from_memory(&preview.jpeg).is_ok());
         assert_eq!(preview.metadata.captured_at_unix_ms, 1000);
         assert_eq!(
+            preview.conservative_start_unix_ms,
+            settings_settled.then_some(500)
+        );
+        assert_eq!(
             monitor.snapshot().state,
             autopiercam_protocol::AgentState::Starting
         );
@@ -483,6 +504,7 @@ mod tests {
 
     fn job(value: u8, dropped_frames: u64) -> PreviewJob {
         PreviewJob {
+            conservative_start_unix_ms: None,
             raw16: false,
             mode: PreviewMode::Unknown,
             width: 2,
@@ -503,7 +525,7 @@ mod tests {
         let first = hub.begin_session();
         assert!(
             first
-                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9])
+                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9], None)
                 .unwrap()
         );
         let first_snapshot = hub.snapshot();
@@ -521,12 +543,12 @@ mod tests {
         assert!(hub.snapshot().frame.is_none());
         assert!(
             !first
-                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9])
+                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9], None)
                 .unwrap()
         );
         assert!(
             second
-                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9])
+                .publish(metadata(), vec![0xff, 0xd8, 0xff, 0xd9], None)
                 .unwrap()
         );
         drop(second);
