@@ -8,14 +8,14 @@ system tray, adapts between bright days and dark nights, saves debayered stills,
 and can upload completed artifacts. Optional H.264 security-video segments use
 a separately installed FFmpeg executable.
 
-AutoPierCam 0.2.24 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.25 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.24)](https://github.com/theatrus/autopiercam/releases/download/v0.2.24/AutoPierCam-0.2.24-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.24)
+[Download the signed Windows x64 installer (0.2.25)](https://github.com/theatrus/autopiercam/releases/download/v0.2.25/AutoPierCam-0.2.25-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.25)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately; optional video recording also needs FFmpeg.
@@ -25,11 +25,17 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.24 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
+Version 0.2.25 uses [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.
 
-Version 0.2.24 improves Chatstronomy slew-image captions and keeps a separate
+Version 0.2.25 opens settings in a separate window, with one Save for Imaging and
+Chatstronomy. Numeric edits enable Save while you type, and closing with unsaved
+changes prompts you to save, discard or keep editing. Periodic sharing follows
+UTC clock slots instead of restarting a countdown after saves or reconnects.
+See the [release notes](docs/releases/0.2.25.md) for scheduling details.
+
+Version 0.2.24 improved Chatstronomy slew-image captions and keeps a separate
 post-slew request while motion images continue. Regain 0.5.11 supplies explicitly
 estimated exposure timing with a conservative full-frame margin, so a late
 delivery alone cannot qualify as a post-slew image. No exposure is aborted or

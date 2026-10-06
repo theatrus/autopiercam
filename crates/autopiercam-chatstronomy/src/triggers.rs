@@ -714,8 +714,11 @@ mod tests {
             clock.configure(15, minute * 60_000); // save / reconnect / identical Hub rules
             assert!(!clock.due(minute * 60_000));
         }
+        clock.configure(15, 900_000); // A save exactly on the due slot cannot skip it.
         assert!(clock.due(900_000));
         clock.configure(15, 900_000);
+        assert!(!clock.due(900_000));
+        clock.configure(15, 450_000); // Nor may a save after a clock rollback replay it.
         assert!(!clock.due(900_000));
         assert!(clock.due(1_800_000));
         assert!(!clock.due(900_000)); // backwards clock: no duplicate slot

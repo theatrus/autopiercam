@@ -30,7 +30,7 @@ does not deploy the Hub.
    expand **Scene and telescope events** or **Chat control** for other options.
    Turn on **Enable image sharing** and choose **Save all settings**.
    Settings opens in its own window, leaving the preview visible. The shared
-   footer saves edits from both Capture and Chatstronomy, even if one tab is
+   footer saves edits from both Imaging and Chatstronomy, even if one tab is
    hidden. Numeric edits enable Save while typing; leaving the field is not
    required. Sharing-only saves do not restart capture.
 4. Connection and delivery status update automatically while the section is
@@ -64,7 +64,7 @@ unconfirmed agent status blocks pairing/saves until a successful reload.
 
 Both drafts are validated before either save. The agent still stores two
 separately revisioned documents, so this is not an atomic cross-document
-transaction: if Capture saves but Chatstronomy fails, the footer reports that
+transaction: if Imaging saves but Chatstronomy fails, the footer reports that
 partial result and retains the sharing edits for review and retry.
 
 ## Triggered sharing and chat configuration

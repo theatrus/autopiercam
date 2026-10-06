@@ -95,6 +95,7 @@ public sealed partial class MainWindow
         bool capture = _hasUnsavedSettings;
         bool sharing = SharingHasEdits || _sharing?.HasChatOverrides == true;
         _settingsSaveResult = null;
+        if (ConfigInfoBar.Severity == InfoBarSeverity.Success) ConfigInfoBar.IsOpen = false;
         _savingAll = true;
         SetControlsForOperation(false);
         try
@@ -120,6 +121,12 @@ public sealed partial class MainWindow
                 },
                 saveSharing: () => RunSharingOperationAsync("Saving Chatstronomy settings…", SaveSharingAsync));
             _settingsSaveResult = result.Message;
+            if (result.Success)
+            {
+                // The common result replaces per-tab success banners.
+                ConfigInfoBar.IsOpen = false;
+                _sharingFeedback = null;
+            }
             return result.Success;
         }
         finally { _savingAll = false; SetControlsForOperation(false); }

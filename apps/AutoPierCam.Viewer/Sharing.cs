@@ -158,9 +158,7 @@ public sealed partial class MainWindow
             !supported ? ("Unavailable", "Update the AutoPierCam agent to share images with Chatstronomy.", InfoBarSeverity.Warning)
             : _sharingStatusUnknown ? ("Status unknown", "Reload settings before saving or pairing.", InfoBarSeverity.Warning)
             : review ? ("Settings changed elsewhere", "Discard to load the new settings. Keep edits to overwrite them on Save.", InfoBarSeverity.Error)
-            : SharingHasEdits ? ("Unsaved changes", "Save applies changes and clears chat overrides.", InfoBarSeverity.Informational)
             : _sharing?.HasChatOverrides == true ? ("Chat overrides active", "Save settings to restore your local trigger choices.", InfoBarSeverity.Informational)
-            : loaded && !paired ? ("Not paired", "Pair above, then enable sharing and save.", InfoBarSeverity.Informational)
             : null;
         if (_sharingFeedback is { } feedback && !review && !_sharingStatusUnknown) state = feedback;
         SharingInfoBar.IsOpen = state is not null;

@@ -82,7 +82,9 @@ public sealed partial class MainWindow
         ConfigInfoBar.Message = _hasUnsavedSettings
             ? "Save applies changes. Camera, RAW format or white-balance changes restart capture."
             : "Settings match the saved configuration.";
-        SetConfigurationFeedback(InfoBarSeverity.Informational, _hasUnsavedSettings);
+        // The shared footer already reports dirty tabs. Opening a second banner
+        // while typing shrinks the viewport and can hide the focused editor.
+        SetConfigurationFeedback(InfoBarSeverity.Informational, false);
     }
 
     private SettingsFormValues ReadSettingsForm()

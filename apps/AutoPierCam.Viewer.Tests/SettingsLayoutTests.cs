@@ -181,7 +181,7 @@ public sealed class SettingsLayoutTests
         Assert.DoesNotContain(markup.Descendants(), e => (string?)e.Attribute(xaml + "Name") == "SharingButton");
         var bar = Named(markup, "SettingsSectionBar");
         Assert.Equal("SelectorBar", bar.Name.LocalName);
-        Assert.Equal(["Capture", "Chatstronomy"], bar.Elements().Select(e => (string?)e.Attribute("Text")));
+        Assert.Equal(["Imaging", "Chatstronomy"], bar.Elements().Select(e => (string?)e.Attribute("Text")));
         foreach (string section in new[] { "CaptureSection", "SharingSection" })
             Assert.Contains(Named(markup, section).Ancestors(), e => (string?)e.Attribute(xaml + "Name") == "SettingsPane");
         Assert.Equal("Collapsed", (string?)Named(markup, "SharingSection").Attribute("Visibility"));

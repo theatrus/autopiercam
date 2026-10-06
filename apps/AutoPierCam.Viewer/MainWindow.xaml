@@ -187,7 +187,7 @@
                 </Grid.RowDefinitions>
                 <StackPanel Spacing="4">
                     <SelectorBar x:Name="SettingsSectionBar" SelectionChanged="SettingsSectionBar_SelectionChanged">
-                        <SelectorBarItem x:Name="CaptureSectionItem" Text="Capture" IsSelected="True" />
+                        <SelectorBarItem x:Name="CaptureSectionItem" Text="Imaging" IsSelected="True" />
                         <SelectorBarItem x:Name="SharingSectionItem" Text="Chatstronomy" />
                     </SelectorBar>
                 </StackPanel>
