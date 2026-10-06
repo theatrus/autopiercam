@@ -114,13 +114,32 @@ Telescope triggers currently cover slew start/end and sequence start/finish.
 The Hub admits only fresh (up to 30 seconds), new, chat-enabled events from a
 telescope with the **same owner and at least one shared guild/channel route**.
 Startup history, disabled events and cross-owner telescopes do not trigger posts.
-Camera event bursts wait for a frame completed after receipt; subsequent images
-must have new sequence numbers in the same capture session. Long exposures can
-delay delivery beyond the selected spacing. There is no pre-event image buffer.
-An active burst coalesces additional triggers; the next event cannot create an
-unbounded queue. A burst expires after 180 seconds plus its configured spacing
-between images; pause/session/consent changes cancel it. Failed delivery can
-reduce the number of images actually posted. This is not a security alarm.
+Motion and sequence-event bursts wait for a frame completed after receipt;
+subsequent images must have new sequence numbers in the same capture session.
+Motion-blurred slew images remain useful updates and keep their slew-start
+caption, including after the completion event arrives. Follow-ups identify the
+original event and their image number. There is no pre-event image buffer.
+An active burst coalesces additional triggers and expires after 180 seconds plus
+its configured spacing between images.
+
+Slew completion adds one separate, bounded post-slew request. It does not cancel
+an exposure or suppress motion images while waiting. Regain supplies a host
+receipt-time exposure-start estimate; AutoPierCam subtracts another full
+exposure or observed frame interval, whichever is longer, and requires that
+conservative estimate to follow receipt of the completion event. Unknown or
+transitional timing is ineligible. The caption explicitly says **exposure timing
+estimated**: SDK buffering, readout and wall-clock uncertainty mean this is not
+a sensor timestamp or a guaranteed start-time bound. With 30–60-second exposures,
+the wait can take several exposure cycles, not just the next delivered frame.
+The normal spacing and device cooldown still apply. Once the post-slew image is
+queued, remaining slew-start follow-ups are retired; already queued images keep
+their original caption and bytes.
+
+The completion request expires after four exposure durations plus 180 seconds,
+bounded to 5–60 minutes (an unknown exposure uses 60 seconds). Duplicate completion
+events do not extend it; a new slew supersedes it. Pause/session/consent changes
+clear both plans without changing capture. Failed delivery can reduce the number
+of images actually posted. This is not a security alarm.
 
 Periodic/chat/telescope features require the companion
 [Hub protocol-v2 update (#186)](https://github.com/theatrus/chatstronomy/pull/186).
@@ -214,8 +233,9 @@ image that arrives too soon as `elided`; AutoPierCam drops it without retrying,
 shows "image skipped" in its status, and does not advance the scene reference,
 so a lasting change is sent once the minute has passed. The Hub then posts a
 notice with the number of skipped images.
-Only one immutable automatic image and one bounded burst plan are retained in
-memory; new triggers are coalesced while that burst is active. A retry or lost acknowledgment resends the exact
+Only one immutable automatic image, one bounded burst plan and one pending
+post-slew request are retained in memory; new triggers are coalesced while that
+burst is active. A retry or lost acknowledgment resends the exact
 event UUID and payload after at least 60 seconds. Events expire after five
 minutes. Snapshots and their retries stay within their original request and
 connection. Consent changes, pause/restart and session changes clear pending

@@ -63,6 +63,7 @@ pub fn sharing_frame(
     }
     let frame = preview.snapshot().frame?;
     Some(autopiercam_chatstronomy::service::Frame {
+        conservative_start_unix_ms: frame.conservative_start_unix_ms,
         session: frame.metadata.session_generation,
         sequence: frame.metadata.sequence,
         captured_at_unix_ms: frame.metadata.captured_at_unix_ms,
@@ -1115,6 +1116,7 @@ impl<'a> CaptureObserver<'a> {
             && self.preview_cadence.take_slot(now, self.preview_max_fps)
         {
             let _ = preview.try_publish(|dropped_frames| PreviewJob {
+                conservative_start_unix_ms: frame.meta.conservative_start_unix_ms,
                 width: frame.meta.width,
                 height: frame.meta.height,
                 bayer: self.bayer,
@@ -3069,6 +3071,7 @@ mod tests {
         progress.started = Instant::now() - Duration::from_secs(600);
         let mut scratch = vec![1, 2, 3, 4];
         let meta = FrameMeta {
+            conservative_start_unix_ms: None,
             width: 2,
             height: 2,
             image_type: ImageType::Raw8,
@@ -3109,6 +3112,7 @@ mod tests {
         let mut raw = vec![100; 16];
         let frame = progress.completed_frame(
             FrameMeta {
+                conservative_start_unix_ms: None,
                 width: 4,
                 height: 4,
                 image_type: ImageType::Raw8,

@@ -327,6 +327,7 @@ mod tests {
         jpeg.resize(jpeg_payload_size + 2, 0x42);
         jpeg.extend_from_slice(&[0xff, 0xd9]);
         PreviewFrame {
+            conservative_start_unix_ms: None,
             metadata: PreviewMetadata {
                 version: PROTOCOL_VERSION,
                 session_generation: 1,

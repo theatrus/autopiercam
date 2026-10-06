@@ -106,6 +106,9 @@ pub struct Roi {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameMeta {
+    /// Regain host-receipt start estimate minus its full-frame freshness margin.
+    /// Not a sensor timestamp or guaranteed bound; absent for uncertain settings.
+    pub conservative_start_unix_ms: Option<u64>,
     pub width: u32,
     pub height: u32,
     pub image_type: ImageType,
@@ -978,6 +981,7 @@ impl Camera {
         self.pending = false;
         self.pending_pacing = Duration::ZERO;
         Ok(FrameMeta {
+            conservative_start_unix_ms: None,
             width: self.roi.width,
             height: self.roi.height,
             image_type: self.roi.image_type,
@@ -1043,6 +1047,7 @@ impl Camera {
             self.health_logged = Instant::now();
         }
         Ok(FrameMeta {
+            conservative_start_unix_ms: conservative_start(&meta),
             width: self.roi.width,
             height: self.roi.height,
             image_type: self.roi.image_type,
@@ -1116,6 +1121,23 @@ impl Drop for Camera {
         }
     }
 }
+fn conservative_start(meta: &Value) -> Option<u64> {
+    if meta["settingsSettled"] != true {
+        return None;
+    }
+    let t = &meta["exposureTiming"];
+    if t["basis"] != "host-receipt-estimate" {
+        return None;
+    }
+    let received = t["receivedUnixMilliseconds"].as_u64()?;
+    let start = t["estimatedStartUnixMilliseconds"].as_u64()?;
+    let margin = t["freshnessMarginMilliseconds"].as_u64()?;
+    if start >= received || margin == 0 {
+        return None;
+    }
+    start.checked_sub(margin).filter(|t| *t > 0)
+}
+
 fn decode_frame(
     meta: &Value,
     pixels: &[u8],
@@ -1208,6 +1230,22 @@ fn parse_info(v: &Value) -> Result<CameraInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conservative_timing_rejects_unknown_transition_and_malformed_provenance() {
+        let mut meta = json!({"settingsSettled":true,"exposureTiming":{
+            "basis":"host-receipt-estimate","receivedUnixMilliseconds":200_000,
+            "estimatedStartUnixMilliseconds":140_000,"freshnessMarginMilliseconds":60_000}});
+        assert_eq!(conservative_start(&meta), Some(80_000));
+        meta["settingsSettled"] = json!(false);
+        assert_eq!(conservative_start(&meta), None);
+        meta["settingsSettled"] = json!(true);
+        meta["exposureTiming"]["basis"] = json!("unknown");
+        assert_eq!(conservative_start(&meta), None);
+        meta["exposureTiming"]["basis"] = json!("host-receipt-estimate");
+        meta["exposureTiming"]["estimatedStartUnixMilliseconds"] = json!(200_001);
+        assert_eq!(conservative_start(&meta), None);
+        assert_eq!(conservative_start(&json!({})), None);
+    }
     #[test]
     fn malformed_inventory_is_rejected() {
         let valid = json!({"name":"camera","id":0,"width":64,"height":64,
