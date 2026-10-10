@@ -1,5 +1,17 @@
 # Regain camera backend
 
+AutoPierCam 0.2.26 pins Regain 0.5.15.1 at
+`c6d0c463192eb4912f9d03d8808df5cca77525e1`; the four Rust crates report 0.5.15.
+This includes the intervening maintenance updates to recovery diagnostics and
+Direct cooling regulation. AutoPierCam uses the low-level worker adapter, not
+Regain's shared `Session` supervisor or NINA/ASCOM frontends: those frontends'
+cooling-recovery restoration, charts and Driver Info changes are not new
+AutoPierCam features. Existing color-camera selection, continuous-frame timing,
+post-slew estimates and recovery policy remain unchanged. This dependency update
+is qualified with hardware-free tests, not new physical-camera validation.
+Regain's new Direct host-read sizing remains at its 1024 KiB default in
+AutoPierCam; this update does not add a Viewer control or change USB Traffic.
+
 AutoPierCam 0.2.23 pins the released Regain 0.5.10 source. Its startup selection
 can verify a saved serial on one matching Direct model when a stale camera ID
 rejects that interface. It does not probe other cameras or enable monochrome

@@ -125,7 +125,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autopiercam"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "autopiercam-camera",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-camera"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "autopiercam-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-chatstronomy"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "base64",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-core"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "chrono",
  "serde",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-protocol"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-regain-worker"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "autopiercam",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-tray"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "autopiercam",
  "autopiercam-camera",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "autopiercam-vision"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "clap",
@@ -2510,8 +2510,8 @@ dependencies = [
 
 [[package]]
 name = "regain-core"
-version = "0.5.11"
-source = "git+https://github.com/pulsarfab/regain?rev=3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f#3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f"
+version = "0.5.15"
+source = "git+https://github.com/pulsarfab/regain?rev=c6d0c463192eb4912f9d03d8808df5cca77525e1#c6d0c463192eb4912f9d03d8808df5cca77525e1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2525,8 +2525,8 @@ dependencies = [
 
 [[package]]
 name = "regain-transport"
-version = "0.5.11"
-source = "git+https://github.com/pulsarfab/regain?rev=3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f#3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f"
+version = "0.5.15"
+source = "git+https://github.com/pulsarfab/regain?rev=c6d0c463192eb4912f9d03d8808df5cca77525e1#c6d0c463192eb4912f9d03d8808df5cca77525e1"
 dependencies = [
  "anyhow",
  "nusb",
@@ -2538,8 +2538,8 @@ dependencies = [
 
 [[package]]
 name = "regain-worker"
-version = "0.5.11"
-source = "git+https://github.com/pulsarfab/regain?rev=3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f#3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f"
+version = "0.5.15"
+source = "git+https://github.com/pulsarfab/regain?rev=c6d0c463192eb4912f9d03d8808df5cca77525e1#c6d0c463192eb4912f9d03d8808df5cca77525e1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2547,8 +2547,8 @@ dependencies = [
 
 [[package]]
 name = "regain-zwo"
-version = "0.5.11"
-source = "git+https://github.com/pulsarfab/regain?rev=3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f#3cfda30a0ff42ef359d95f2da4acdfd5fb9bdd2f"
+version = "0.5.15"
+source = "git+https://github.com/pulsarfab/regain?rev=c6d0c463192eb4912f9d03d8808df5cca77525e1#c6d0c463192eb4912f9d03d8808df5cca77525e1"
 dependencies = [
  "anyhow",
  "libc",
