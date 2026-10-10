@@ -25,7 +25,7 @@ operation. Its canonical vector source and reproducible Windows icon outputs
 live in [`assets/branding`](assets/branding); see
 [`tools/icons`](tools/icons/README.md) before changing generated artwork.
 
-Version 0.2.26 pins the released Regain 0.5.14.0 source for its
+Version 0.2.26 pins the released Regain 0.5.15.1 source for its
 [Regain camera drivers](docs/regain-backend.md) in a supervised
 worker. ASI662MC and ASI676MC support experimental Direct USB. Optional Viewer sky estimates
 use a local Rust CPU worker and a user-supplied model; they never trigger actions.

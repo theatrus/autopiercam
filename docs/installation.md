@@ -48,7 +48,7 @@ cameras require an exact serial number for persistent selection.
 matches still fault instead of choosing another imaging camera.
 **Pause recording** pauses scheduled stills, video and sharing while keeping the
 preview live; **Save next frame** remains an explicit request for a still.
-Version 0.2.26 uses Regain 0.5.14 continuous acquisition and application-controlled
+Version 0.2.26 uses Regain 0.5.15 continuous acquisition and application-controlled
 exposure for both driver choices. The worker keeps draining while preview
 delivery obeys the fractional FPS limit. SDK uses native video; ASI662MC/ASI676MC
 Direct USB uses video through 30 seconds, then repeated still capture.

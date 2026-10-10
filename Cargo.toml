@@ -23,9 +23,9 @@ repository = "https://github.com/theatrus/autopiercam"
 rust-version = "1.89"
 
 [workspace.dependencies]
-regain-core = { git = "https://github.com/pulsarfab/regain", rev = "e9b7c46751c26035c2a7853aa5f75e6e9b09ed06" }
-regain-transport = { git = "https://github.com/pulsarfab/regain", rev = "e9b7c46751c26035c2a7853aa5f75e6e9b09ed06" }
-regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "e9b7c46751c26035c2a7853aa5f75e6e9b09ed06", default-features = false, features = ["asi-sdk", "asi-direct"] }
+regain-core = { git = "https://github.com/pulsarfab/regain", rev = "c6d0c463192eb4912f9d03d8808df5cca77525e1" }
+regain-transport = { git = "https://github.com/pulsarfab/regain", rev = "c6d0c463192eb4912f9d03d8808df5cca77525e1" }
+regain-zwo = { git = "https://github.com/pulsarfab/regain", rev = "c6d0c463192eb4912f9d03d8808df5cca77525e1", default-features = false, features = ["asi-sdk", "asi-direct"] }
 anyhow = "1.0.100"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.5.51", features = ["derive", "env"] }
