@@ -168,11 +168,11 @@ reproduced below; its archive checksum is pinned in Cargo.lock.
 - `ring 0.17.14` — `Apache-2.0 AND ISC`
 - `rusqlite 0.40.2` — `MIT`
 - `rustfft 6.4.1` — `MIT OR Apache-2.0`
-- `rustls 0.23.45` — `Apache-2.0 OR ISC OR MIT`
+- `rustls 0.23.46` — `Apache-2.0 OR ISC OR MIT`
 - `rustls-native-certs 0.8.4` — `Apache-2.0 OR ISC OR MIT`
 - `rustls-pki-types 1.15.1` — `MIT OR Apache-2.0`
 - `rustls-platform-verifier 0.7.0` — `MIT OR Apache-2.0`
-- `rustls-webpki 0.103.15` — `ISC`
+- `rustls-webpki 0.103.16` — `ISC`
 - `same-file 1.0.6` — `Unlicense OR MIT`
 - `schannel 0.1.29` — `MIT`
 - `scopeguard 1.2.0` — `MIT OR Apache-2.0`
@@ -253,7 +253,7 @@ reproduced below; its archive checksum is pinned in Cargo.lock.
 - `utf8parse 0.2.2` — `Apache-2.0 OR MIT`
 - `walkdir 2.5.0` — `Unlicense OR MIT`
 - `want 0.3.1` — `MIT`
-- `webpki-roots 1.0.9` — `CDLA-Permissive-2.0`
+- `webpki-roots 1.0.10` — `CDLA-Permissive-2.0`
 - `winapi-util 0.1.11` — `Unlicense OR MIT`
 - `windows 0.61.3` — `MIT OR Apache-2.0`
 - `windows-collections 0.2.0` — `MIT OR Apache-2.0`
@@ -1737,7 +1737,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Applies to:
 
-- `webpki-roots 1.0.9`
+- `webpki-roots 1.0.10`
 
 
 ```text
@@ -1880,7 +1880,7 @@ THIS SOFTWARE.
 
 Applies to:
 
-- `rustls-webpki 0.103.15`
+- `rustls-webpki 0.103.16`
 
 
 ```text
@@ -2870,7 +2870,7 @@ Applies to:
 
 - `hyper-rustls 0.27.10`
 - `rustls-native-certs 0.8.4`
-- `rustls 0.23.45`
+- `rustls 0.23.46`
 
 
 ```text
