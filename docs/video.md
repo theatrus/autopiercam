@@ -57,9 +57,17 @@ enabled run; it does not create a partial-day movie or backfill older stills.
 
 Private samples live in `.autopiercam-timelapse/<UTC epoch day>/` under the capture
 directory. Their total is capped at 1 GiB, each sample at 512 KiB, and each day at
-1,440 samples. This cache is separate from the managed-artifact retention quota;
-allow additional free space for it and the encoded output. Sampling stops with
-a warning when the cache is full. Failures never remove the already saved still.
+1,440 samples. Both private video spools, metadata, abandoned staging files and
+in-progress movie output count toward the shared retention byte quota as
+protected storage. Retention never deletes unfinished samples to make room.
+Video writers check current usage and the minimum-free-space rule before new
+samples; encoders check before starting, once a second, and before publication.
+Pressure skips samples, discards an unfinished security segment, or defers a
+daily clip while retaining its samples. Failed daily output is removed before
+retry. These are retention limits, not hard filesystem reservations: concurrent
+writes, encoder buffering and the checking interval can briefly overshoot.
+Sampling also stops with a warning when the private sample cap is full.
+Failures never remove the already saved still.
 Stills can be retained/deleted independently once their sampled pixels are copied.
 
 The spool survives restart, skips occupied minute slots, and seals closed days

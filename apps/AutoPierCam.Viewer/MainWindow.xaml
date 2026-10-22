@@ -502,7 +502,7 @@
                                    TextWrapping="Wrap" />
                         <ToggleSwitch x:Name="DailyTimelapseToggle" Header="Daily timelapse from saved stills"
                                       IsEnabled="False" OffContent="Disabled" OnContent="Enabled" />
-                        <TextBlock Text="One saved still per minute, 24 fps, 1280 × 720. Finishes after midnight UTC; keeps up to 1 GiB of private samples across restarts. No separate encoder installation."
+                        <TextBlock Text="One saved still per minute, 24 fps, 1280 × 720. Finishes after midnight UTC; keeps up to 1 GiB of private samples across restarts, counted within storage limits. No separate encoder installation."
                                    TextWrapping="Wrap" />
                     </StackPanel>
                     </ScrollViewer>

@@ -139,14 +139,25 @@ pub fn encode_atomic(
     output: &Path,
     timeout: std::time::Duration,
 ) -> Result<()> {
+    encode_atomic_checked(executable, input, output, timeout, || Ok(()))
+}
+
+pub(crate) fn encode_atomic_checked(
+    executable: &Path,
+    input: &Path,
+    output: &Path,
+    timeout: Duration,
+    check_space: impl FnMut() -> Result<()>,
+) -> Result<()> {
     let temporary = crate::temporary_artifact_path(output)?;
     let result = (|| {
-        run_encoder(
+        run_encoder_checked(
             executable,
             input,
             &temporary,
             &std::sync::atomic::AtomicBool::new(false),
             timeout,
+            check_space,
         )?;
         let file = fs::OpenOptions::new()
             .read(true)
@@ -167,13 +178,15 @@ pub fn encode_atomic(
     result
 }
 
-pub(crate) fn run_encoder(
+pub(crate) fn run_encoder_checked(
     executable: &Path,
     input: &Path,
     output: &Path,
     stop: &AtomicBool,
     timeout: Duration,
+    mut check_space: impl FnMut() -> Result<()>,
 ) -> Result<()> {
+    check_space()?;
     let mut command = Command::new(executable);
     command
         .arg("encode-video")
@@ -210,14 +223,21 @@ pub(crate) fn run_encoder(
         String::from_utf8_lossy(&tail).into_owned()
     });
     let started = Instant::now();
+    let mut checked = Instant::now();
     let result = loop {
         if stop.load(Ordering::Acquire) || started.elapsed() >= timeout {
             break Err(anyhow!(
                 "native video encoder cancelled or exceeded deadline"
             ));
         }
+        if checked.elapsed() >= Duration::from_secs(1) {
+            if let Err(error) = check_space() {
+                break Err(error);
+            }
+            checked = Instant::now();
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break check_space().map(|()| status),
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => break Err(error.into()),
         }
@@ -238,6 +258,53 @@ pub(crate) fn run_encoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn storage_pressure_prevents_spawn_and_cleans_output_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("clip.mp4");
+        let error = encode_atomic_checked(
+            Path::new("must-not-launch.exe"),
+            root.path(),
+            &output,
+            Duration::from_secs(20),
+            || Err(crate::retention::VideoStoragePressure.into()),
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::retention::VideoStoragePressure>());
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+        image::RgbImage::from_pixel(64, 48, image::Rgb([20, 40, 60]))
+            .save(root.path().join("sample.jpg"))
+            .unwrap();
+        write_manifest(
+            root.path(),
+            &[Sample {
+                file: "sample.jpg".into(),
+                duration: 1_000_000,
+            }],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let error = encode_atomic_checked(
+            &executable().unwrap(),
+            root.path(),
+            &output,
+            Duration::from_secs(20),
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(())
+                } else {
+                    Err(crate::retention::VideoStoragePressure.into())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::retention::VideoStoragePressure>());
+        assert!(calls >= 2);
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
     #[test]
     fn manifest_rejects_paths_empty_jobs_and_unbounded_durations() {
         assert!(validate(&[]).is_err());

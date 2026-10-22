@@ -49,6 +49,7 @@ impl VideoWorker {
                 let mut segment: Option<Segment> = None;
                 let mut last_sequence = 0;
                 let mut sequence = 0;
+                let mut storage_warning = false;
                 let cadence = Duration::from_secs_f64(1.0 / f64::from(config.frames_per_second));
                 loop {
                     if cancelled.load(Ordering::Acquire) {
@@ -62,6 +63,14 @@ impl VideoWorker {
                         && frame.metadata.sequence != last_sequence
                     {
                         last_sequence = frame.metadata.sequence;
+                        let admission = retention.as_ref().map_or(Ok(()), |sink| sink.check_video_space(frame.jpeg.len() as u64));
+                        if let Err(error) = admission {
+                            if !storage_warning {
+                                tracing::warn!(%error, "security video samples skipped under storage pressure");
+                                storage_warning = true;
+                            }
+                        } else {
+                            storage_warning = false;
                         if segment.is_none() {
                             segment = Some(Segment::new(&directory)?);
                         }
@@ -83,6 +92,7 @@ impl VideoWorker {
                             segment = Some(Segment::new(&directory)?);
                         }
                         segment.as_mut().unwrap().push(&frame.jpeg)?;
+                        }
                     }
                     if segment.as_ref().is_some_and(|s| {
                         s.started.elapsed()
@@ -192,7 +202,7 @@ fn timed_samples(frames: &[Duration], end: Duration) -> Vec<crate::native_video:
                 .copied()
                 .unwrap_or(end)
                 .saturating_sub(*at)
-                .max(Duration::from_millis(40));
+                .max(Duration::from_nanos(33_333_300));
             crate::native_video::Sample {
                 file: format!("sample-{index:06}.jpg"),
                 duration: (duration.as_nanos() / 100).min(i64::MAX as u128) as i64,
@@ -217,7 +227,16 @@ fn finish_segment(
     let output = directory
         .join(capture_filename(nonce, sequence))
         .with_extension("mp4");
-    encode_segment(&segment, executable, &output)?;
+    let result = encode_segment(&segment, executable, &output, retention);
+    if let Err(error) = &result
+        && error
+            .downcast_ref::<crate::retention::VideoStoragePressure>()
+            .is_some()
+    {
+        tracing::warn!(%error, "security segment discarded under storage pressure");
+        return Ok(());
+    }
+    result?;
     if let Some(upload) = upload {
         ensure!(
             upload.try_enqueue(output.clone())? != UploadEnqueueResult::WorkerStopped,
@@ -234,27 +253,38 @@ fn finish_segment(
     Ok(())
 }
 
-fn encode_segment(segment: &Segment, executable: &Path, output: &Path) -> Result<()> {
-    encode_segment_with_timeout(segment, executable, output, ENCODER_TIMEOUT)
-}
-
-fn encode_segment_with_timeout(
+fn encode_segment(
     segment: &Segment,
     executable: &Path,
     output: &Path,
-    timeout: Duration,
+    retention: Option<&RetentionSink>,
 ) -> Result<()> {
     ensure!(!segment.frames.is_empty(), "cannot encode an empty segment");
     crate::native_video::write_manifest(
         segment.directory.path(),
         &timed_samples(&segment.frames, segment.started.elapsed()),
     )?;
-    crate::native_video::encode_atomic(executable, segment.directory.path(), output, timeout)
+    crate::native_video::encode_atomic_checked(
+        executable,
+        segment.directory.path(),
+        output,
+        ENCODER_TIMEOUT,
+        || retention.map_or(Ok(()), |sink| sink.check_video_space(0)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn thirty_fps_samples_are_not_stretched_to_twenty_five_fps() {
+        let frames = (0..30)
+            .map(|n| Duration::from_nanos(n * 1_000_000_000 / 30))
+            .collect::<Vec<_>>();
+        let samples = timed_samples(&frames, Duration::from_secs(1));
+        let total: i64 = samples.iter().map(|s| s.duration).sum();
+        assert!((total - 10_000_000).abs() < 30);
+    }
     #[test]
     fn manifest_preserves_elapsed_gaps_without_duplicate_last_frame() {
         let samples = timed_samples(

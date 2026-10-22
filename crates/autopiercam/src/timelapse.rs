@@ -108,6 +108,7 @@ struct Cache {
     root: PathBuf,
     bytes: u64,
     last_warning_minute: Option<u64>,
+    retention: Option<RetentionSink>,
 }
 
 impl Cache {
@@ -128,6 +129,7 @@ impl Cache {
             root,
             bytes,
             last_warning_minute: None,
+            retention: None,
         })
     }
 
@@ -174,6 +176,9 @@ impl Cache {
             jpeg.len() as u64 <= MAX_JPEG,
             "timelapse sample exceeds 512 KiB"
         );
+        if let Some(retention) = &self.retention {
+            retention.check_video_space(jpeg.len() as u64)?;
+        }
         fs::create_dir_all(&dir)?;
         ensure!(regular(&dir)?.is_dir(), "invalid timelapse day directory");
         let mut staging = tempfile::NamedTempFile::new_in(&dir)?;
@@ -181,6 +186,9 @@ impl Cache {
         staging.as_file().sync_all()?;
         staging.persist_noclobber(&output)?;
         self.bytes += jpeg.len() as u64;
+        if let Some(retention) = &self.retention {
+            let _ = retention.try_wake();
+        }
         Ok(())
     }
 
@@ -215,6 +223,54 @@ impl Cache {
 mod tests {
     use super::*;
     #[test]
+    fn shared_quota_skips_new_samples_and_defers_closed_day_without_losing_sources() {
+        use crate::retention::{
+            LocalOnlyRetentionAuthority, RetentionPolicy, RetentionWorker, VideoStoragePressure,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = Cache::open(root.path()).unwrap();
+        cache.record(DAY_MS, thumbnail).unwrap();
+        let (worker, sink) = RetentionWorker::start(
+            RetentionPolicy::from_capture_config(&autopiercam_core::config::CaptureConfig {
+                retention_max_bytes: Some(1),
+                ..Default::default()
+            }),
+            root.path().into(),
+            Arc::new(parse_generated_capture_filename),
+            Arc::new(LocalOnlyRetentionAuthority),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        assert!(sink.capture_suspended());
+        cache.retention = Some(sink.clone());
+        assert!(
+            cache
+                .record(DAY_MS + 60_000, thumbnail)
+                .unwrap_err()
+                .is::<VideoStoragePressure>()
+        );
+        let input = cache.pending(2 * DAY_MS).unwrap().remove(0).1;
+        let original = fs::read(input.join("0000.jpg")).unwrap();
+        let output = root.path().join(output_name(1));
+        // The quota gate must run before launching this deliberately absent encoder.
+        let error = finish_day(
+            Path::new("must-not-launch.exe"),
+            &input,
+            &output,
+            &AtomicBool::new(false),
+            None,
+            Some(&sink),
+        )
+        .unwrap_err();
+        assert!(error.is::<VideoStoragePressure>());
+        assert_eq!(samples(&input).unwrap().len(), 1);
+        assert_eq!(fs::read(input.join("0000.jpg")).unwrap(), original);
+        assert!(!output.exists());
+        assert!(!input.join("encoding.mp4").exists());
+        assert!(!input.join("done").exists());
+        worker.stop_and_join().unwrap();
+    }
+    #[test]
     #[cfg(windows)]
     fn closed_daily_spool_retries_failed_encode_then_publishes_a_decodable_native_movie() {
         let root = tempfile::tempdir().unwrap();
@@ -231,6 +287,7 @@ mod tests {
         assert!(error.to_string().contains("injected"));
         assert!(!output.exists());
         assert!(!day.join("done").exists());
+        assert!(!day.join("encoding.mp4").exists());
         assert_eq!(samples(&day).unwrap().len(), 2);
         // Resume from the persistent cache, replacing only the private partial.
         drop(cache);
@@ -433,7 +490,9 @@ impl DailyWorker {
         upload: Option<UploadSink>,
         retention: Option<RetentionSink>,
     ) -> Result<Self> {
-        let sink = DailySink(Arc::new(Mutex::new(Cache::open(directory)?)));
+        let mut initial_cache = Cache::open(directory)?;
+        initial_cache.retention = retention.clone();
+        let sink = DailySink(Arc::new(Mutex::new(initial_cache)));
         let cache = sink.clone();
         let directory = directory.to_owned();
         let executable = crate::native_video::executable()?;
@@ -530,12 +589,13 @@ fn finish_day(
     retention: Option<&RetentionSink>,
 ) -> Result<()> {
     finish_day_with(input, output, upload, retention, |input, temporary| {
-        crate::native_video::run_encoder(
+        crate::native_video::run_encoder_checked(
             executable,
             input,
             temporary,
             stop,
             Duration::from_secs(600),
+            || retention.map_or(Ok(()), |sink| sink.check_video_space(0)),
         )
     })
 }
@@ -571,7 +631,14 @@ fn finish_day_with(
             })
             .collect::<Vec<_>>();
         crate::native_video::write_manifest(input, &manifest)?;
-        encode(input, &temporary)?;
+        if let Err(error) = encode(input, &temporary) {
+            // Reaped encoder no longer owns the partial. Keep samples, but do
+            // not let a failed output consume the space needed by the retry.
+            if temporary.exists() && regular(&temporary)?.is_file() {
+                fs::remove_file(&temporary)?;
+            }
+            return Err(error);
+        }
         let file = OpenOptions::new().read(true).write(true).open(&temporary)?;
         ensure!(
             file.metadata()?.len() > 0,
