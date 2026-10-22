@@ -1,19 +1,15 @@
 //! Independent, bounded latest-preview sampler and segmented H.264 encoder.
-//! FFmpeg is an explicitly configured external executable, never a shell command.
+//! Windows native encoding runs in an isolated, deadline-bounded worker process.
 use crate::{
     AgentControl, CaptureSessionNonce, PreviewSession, capture_filename,
-    publish_temporary_artifact,
     retention::{RetentionSink, RetentionWakeResult},
-    temporary_artifact_path,
     upload::{UploadEnqueueResult, UploadSink},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use autopiercam_core::config::VideoConfig;
 use std::{
-    fs::{self, File},
-    io::{Read, Write},
+    fs,
     path::Path,
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -42,16 +38,7 @@ impl VideoWorker {
         retention: Option<RetentionSink>,
         control: AgentControl,
     ) -> Result<Self> {
-        let executable = config
-            .ffmpeg_path
-            .as_ref()
-            .context("video.ffmpeg_path is required")?;
-        ensure!(
-            executable.is_absolute() && executable.is_file(),
-            "video.ffmpeg_path must identify an installed FFmpeg executable: {}",
-            executable.display()
-        );
-        let executable = executable.clone();
+        let executable = crate::native_video::executable()?;
         let directory = directory.to_owned();
         let config = config.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -193,29 +180,25 @@ impl Segment {
         self.bytes += jpeg.len() as u64;
         Ok(())
     }
-    fn concat(&self) -> String {
-        concat_manifest(&self.frames, self.started.elapsed())
-    }
 }
 
-fn concat_manifest(frames: &[Duration], end: Duration) -> String {
-    let mut text = String::from("ffconcat version 1.0\n");
-    for (index, at) in frames.iter().enumerate() {
-        let duration = frames
-            .get(index + 1)
-            .copied()
-            .unwrap_or(end)
-            .saturating_sub(*at)
-            .max(Duration::from_millis(40));
-        text.push_str(&format!(
-            "file 'sample-{index:06}.jpg'\nduration {:.6}\n",
-            duration.as_secs_f64()
-        ));
-    }
-    if !frames.is_empty() {
-        text.push_str(&format!("file 'sample-{:06}.jpg'\n", frames.len() - 1));
-    }
-    text
+fn timed_samples(frames: &[Duration], end: Duration) -> Vec<crate::native_video::Sample> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(index, at)| {
+            let duration = frames
+                .get(index + 1)
+                .copied()
+                .unwrap_or(end)
+                .saturating_sub(*at)
+                .max(Duration::from_millis(40));
+            crate::native_video::Sample {
+                file: format!("sample-{index:06}.jpg"),
+                duration: (duration.as_nanos() / 100).min(i64::MAX as u128) as i64,
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,123 +245,26 @@ fn encode_segment_with_timeout(
     timeout: Duration,
 ) -> Result<()> {
     ensure!(!segment.frames.is_empty(), "cannot encode an empty segment");
-    let mut manifest = File::create(segment.directory.path().join("frames.ffconcat"))?;
-    manifest.write_all(segment.concat().as_bytes())?;
-    manifest.sync_all()?;
-    drop(manifest);
-    let temporary = temporary_artifact_path(output)?;
-    let result = (|| -> Result<()> {
-        let mut command = Command::new(executable);
-        command
-            .current_dir(segment.directory.path())
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-protocol_whitelist",
-                "file",
-                "-f",
-                "concat",
-                "-safe",
-                "1",
-                "-i",
-                "frames.ffconcat",
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "28",
-                "-threads",
-                "2",
-                "-vf",
-                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                "-pix_fmt",
-                "yuv420p",
-                "-fps_mode",
-                "vfr",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                "-n",
-            ])
-            .arg(&temporary)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let mut child = command.spawn().context("starting configured FFmpeg")?;
-        let stderr = child.stderr.take().context("FFmpeg stderr missing")?;
-        let reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.take(16 * 1024).read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
-        });
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
-                Ok(None) => {
-                    break Err(anyhow!(
-                        "FFmpeg exceeded the segment encoding deadline ({} ms)",
-                        timeout.as_millis()
-                    ));
-                }
-                Err(error) => break Err(error.into()),
-            }
-        };
-        if status.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let errors = reader
-            .join()
-            .unwrap_or_else(|_| "stderr reader failed".into());
-        ensure!(
-            status?.success(),
-            "FFmpeg encoding failed: {}",
-            errors.trim()
-        );
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&temporary)?;
-        ensure!(
-            file.metadata()?.len() > 0,
-            "FFmpeg produced an empty segment"
-        );
-        file.sync_all()?;
-        drop(file);
-        publish_temporary_artifact(&temporary, output)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::native_video::write_manifest(
+        segment.directory.path(),
+        &timed_samples(&segment.frames, segment.started.elapsed()),
+    )?;
+    crate::native_video::encode_atomic(executable, segment.directory.path(), output, timeout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     #[test]
-    fn manifest_uses_safe_names_and_real_elapsed_gaps() {
-        let manifest = concat_manifest(
+    fn manifest_preserves_elapsed_gaps_without_duplicate_last_frame() {
+        let samples = timed_samples(
             &[Duration::ZERO, Duration::from_secs(30)],
             Duration::from_secs(90),
         );
-        assert!(manifest.contains("duration 30.000000"));
-        assert!(manifest.contains("duration 60.000000"));
-        assert!(manifest.ends_with("file 'sample-000001.jpg'\n"));
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].duration, 300_000_000);
+        assert_eq!(samples[1].duration, 600_000_000);
+        assert_eq!(samples[1].file, "sample-000001.jpg");
     }
     #[test]
     fn spool_rejects_oversized_segments_before_writing() {
@@ -387,83 +273,5 @@ mod tests {
         segment.bytes = MAX_SPOOL_BYTES;
         assert!(segment.push(&[1]).is_err());
         assert_eq!(fs::read_dir(segment.directory.path()).unwrap().count(), 0);
-    }
-    #[test]
-    #[ignore = "requires AUTOPIERCAM_TEST_FFMPEG pointing to a verified FFmpeg executable"]
-    fn real_encoder_finalizes_mp4_without_overwriting() {
-        let executable = PathBuf::from(
-            std::env::var_os("AUTOPIERCAM_TEST_FFMPEG").expect("set test FFmpeg path"),
-        );
-        let root = tempfile::tempdir().unwrap();
-        let mut segment = Segment::new(root.path()).unwrap();
-        for value in [30, 60, 90] {
-            let mut jpeg = Vec::new();
-            image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
-                .encode(
-                    &[value; 32 * 32 * 3],
-                    32,
-                    32,
-                    image::ExtendedColorType::Rgb8,
-                )
-                .unwrap();
-            segment.push(&jpeg).unwrap();
-            thread::sleep(Duration::from_millis(100));
-        }
-        let output = root.path().join("clip.mp4");
-        encode_segment(&segment, &executable, &output).unwrap();
-        let before = fs::read(&output).unwrap();
-        assert!(before.windows(4).any(|bytes| bytes == b"ftyp"));
-        assert!(before.windows(4).any(|bytes| bytes == b"moov"));
-        let decoded = Command::new(&executable)
-            .args(["-nostdin", "-v", "error", "-i"])
-            .arg(&output)
-            .args(["-f", "null", "-"])
-            .output()
-            .unwrap();
-        assert!(
-            decoded.status.success(),
-            "{}",
-            String::from_utf8_lossy(&decoded.stderr)
-        );
-        assert!(encode_segment(&segment, &executable, &output).is_err());
-        assert_eq!(fs::read(output).unwrap(), before);
-    }
-
-    #[test]
-    #[ignore = "requires AUTOPIERCAM_TEST_FFMPEG pointing to a verified FFmpeg executable"]
-    fn encoder_failure_never_publishes_partial_recording() {
-        let executable = PathBuf::from(
-            std::env::var_os("AUTOPIERCAM_TEST_FFMPEG").expect("set test FFmpeg path"),
-        );
-        let root = tempfile::tempdir().unwrap();
-        let mut segment = Segment::new(root.path()).unwrap();
-        segment.push(b"invalid JPEG").unwrap();
-        let output = root.path().join("clip.mp4");
-        assert!(encode_segment(&segment, &executable, &output).is_err());
-        assert!(!output.exists());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1); // private spool only
-    }
-
-    #[test]
-    #[ignore = "requires AUTOPIERCAM_TEST_FFMPEG pointing to a verified FFmpeg executable"]
-    fn encoder_deadline_kills_and_reaps_the_process_without_publishing() {
-        let executable = PathBuf::from(
-            std::env::var_os("AUTOPIERCAM_TEST_FFMPEG").expect("set test FFmpeg path"),
-        );
-        let root = tempfile::tempdir().unwrap();
-        let mut segment = Segment::new(root.path()).unwrap();
-        let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
-            .encode(&[80; 32 * 32 * 3], 32, 32, image::ExtendedColorType::Rgb8)
-            .unwrap();
-        segment.push(&jpeg).unwrap();
-        let output = root.path().join("clip.mp4");
-        let started = Instant::now();
-        let error = encode_segment_with_timeout(&segment, &executable, &output, Duration::ZERO)
-            .unwrap_err();
-        assert!(error.to_string().contains("deadline"));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(!output.exists());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

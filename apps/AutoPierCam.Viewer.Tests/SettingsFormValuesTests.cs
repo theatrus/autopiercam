@@ -6,6 +6,34 @@ using Xunit;
 public sealed class SettingsFormValuesTests
 {
     [Fact]
+    public void NativeVideoAndDailyTimelapseAreIndependentTrackedEdits()
+    {
+        var baseline = SettingsFormValues.FromConfiguration(Config);
+        Assert.False(baseline.DailyTimelapse);
+        var daily = Config with { Video = Config.Video with { DailyTimelapse = true } };
+        var form = SettingsFormValues.FromConfiguration(daily);
+        Assert.True(form.DailyTimelapse);
+        Assert.Equal(baseline.Video, form.Video);
+        Assert.NotEqual(baseline, form);
+        var json = JsonSerializer.Serialize(daily);
+        Assert.DoesNotContain("ffmpeg_path", json);
+        Assert.True(JsonSerializer.Deserialize<AgentConfiguration>(json)!.Video.DailyTimelapse);
+        Assert.DoesNotContain("daily_timelapse", JsonSerializer.Serialize(Config with {
+            Video = Config.Video with { DailyTimelapse = null }
+        })); // old agent compatibility
+    }
+
+    [Fact]
+    public void OldAgentEncoderPathSurvivesUnrelatedSavesButIsNotAnEditableField()
+    {
+        var legacy = JsonSerializer.Deserialize<AgentVideoConfiguration>("""
+            {"enabled":true,"segment_seconds":60,"frames_per_second":2,"ffmpeg_path":"C:/old/encoder.exe"}
+            """)!;
+        var json = JsonSerializer.Serialize(legacy with { SegmentSeconds = 120 });
+        Assert.Contains("C:/old/encoder.exe", json);
+        Assert.DoesNotContain("daily_timelapse", json);
+    }
+    [Fact]
     public void UsbRecoveryIsDisabledByDefaultAndTrackedAsAnEdit()
     {
         var baseline = SettingsFormValues.FromConfiguration(Config);

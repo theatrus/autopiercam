@@ -29,7 +29,7 @@ internal sealed record SettingsFormValues
     internal bool Upload { get; init; }
     internal string Endpoint { get; init; } = "";
     internal bool Video { get; init; }
-    internal string Ffmpeg { get; init; } = "";
+    internal bool DailyTimelapse { get; init; }
 
     internal static string Text(string? value) => value?.Trim() ?? "";
     internal static string Number(double value) => double.IsNaN(value) ? "disabled" : value == 0 ? "0" : value.ToString("R", CultureInfo.InvariantCulture);
@@ -65,6 +65,6 @@ internal sealed record SettingsFormValues
         CameraId = config.Camera.CameraId, CameraFilter = Text(config.Camera.NameContains),
         Adaptive = true, Raw16 = config.Camera.Raw16 == true,
         Upload = config.Upload.Enabled, Endpoint = Text(config.Upload.Endpoint),
-        Video = config.Video.Enabled, Ffmpeg = Text(config.Video.FfmpegPath)
+        Video = config.Video.Enabled, DailyTimelapse = config.Video.DailyTimelapse == true
     };
 }

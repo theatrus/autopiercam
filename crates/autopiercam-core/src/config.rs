@@ -159,15 +159,9 @@ impl Config {
                 "video segment_seconds must be in 1..=600 and frames_per_second in 1..=30",
             ));
         }
-        if self.video.enabled
-            && self
-                .video
-                .ffmpeg_path
-                .as_ref()
-                .is_none_or(|path| !path.is_absolute())
-        {
+        if (self.video.enabled || self.video.daily_timelapse) && !cfg!(windows) {
             return Err(ConfigError::Validation(
-                "video.ffmpeg_path must be an absolute FFmpeg executable path when video is enabled",
+                "video recording requires Windows Media Foundation",
             ));
         }
         if self.upload.enabled && self.upload.endpoint.is_none() {
@@ -453,7 +447,11 @@ impl Default for UploadConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Sample saved stills into one native H.264 clip per UTC day.
+    pub daily_timelapse: bool,
+    // Read legacy configurations without breaking startup; never execute or
+    // re-serialize this obsolete external-encoder setting.
+    #[serde(skip_serializing)]
     pub ffmpeg_path: Option<PathBuf>,
     pub enabled: bool,
     pub segment_seconds: u32,
@@ -463,6 +461,7 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
+            daily_timelapse: false,
             ffmpeg_path: None,
             enabled: false,
             segment_seconds: 300,
@@ -734,21 +733,38 @@ mod tests {
     }
 
     #[test]
-    fn video_requires_explicit_executable_and_bounded_sampling() {
+    fn video_uses_native_encoder_and_accepts_legacy_config_without_executing_it() {
         let mut config = Config::default();
         config.video.enabled = true;
-        assert!(config.validate().is_err());
-        config.video.ffmpeg_path = Some(PathBuf::from("ffmpeg.exe"));
-        assert!(config.validate().is_err());
-        config.video.ffmpeg_path = Some(std::env::current_dir().unwrap().join("ffmpeg.exe"));
-        config.validate().unwrap();
+        assert_eq!(config.validate().is_ok(), cfg!(windows));
+        config.video.ffmpeg_path = Some(PathBuf::from("obsolete.exe"));
+        assert_eq!(config.validate().is_ok(), cfg!(windows));
         let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(restored.video.ffmpeg_path, config.video.ffmpeg_path);
+        assert!(restored.video.ffmpeg_path.is_none());
+        assert!(!toml::to_string(&config).unwrap().contains("ffmpeg_path"));
+        let legacy: Config =
+            toml::from_str("[video]\nffmpeg_path = 'obsolete.exe'\nenabled = true").unwrap();
+        assert!(legacy.video.enabled);
         config.video.segment_seconds = 601;
         assert!(config.validate().is_err());
         config.video.segment_seconds = 60;
         config.video.frames_per_second = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn daily_timelapse_is_opt_in_and_reloads_recorders_without_restarting_camera() {
+        let original = Config::default();
+        assert!(!original.video.daily_timelapse);
+        let mut next = original.clone();
+        next.video.daily_timelapse = true;
+        assert!(original.requires_recording_reload(&next));
+        assert!(!original.requires_camera_restart(&next));
+        assert_eq!(next.validate().is_ok(), cfg!(windows));
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&next).unwrap()).unwrap(),
+            next
+        );
     }
 
     #[test]

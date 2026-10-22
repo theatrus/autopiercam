@@ -498,9 +498,11 @@
                             IsEnabled="False"
                             OffContent="Disabled"
                             OnContent="Enabled" />
-                        <TextBox x:Name="FfmpegPathTextBox" Header="FFmpeg executable (installed separately)"
-                                 PlaceholderText="C:\Tools\ffmpeg\bin\ffmpeg.exe" IsEnabled="False" />
-                        <TextBlock Text="Records H.264 MP4 at preview resolution. Pauses with recording or storage limits."
+                        <TextBlock Text="Windows-native H.264 MP4 at preview resolution, with real elapsed timing. Pauses with recording or storage limits. Requires an updated Windows agent."
+                                   TextWrapping="Wrap" />
+                        <ToggleSwitch x:Name="DailyTimelapseToggle" Header="Daily timelapse from saved stills"
+                                      IsEnabled="False" OffContent="Disabled" OnContent="Enabled" />
+                        <TextBlock Text="One saved still per minute, 24 fps, 1280 × 720. Finishes after midnight UTC; keeps up to 1 GiB of private samples across restarts. No separate encoder installation."
                                    TextWrapping="Wrap" />
                     </StackPanel>
                     </ScrollViewer>

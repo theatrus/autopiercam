@@ -12,9 +12,9 @@ session.
   includes the reviewed `ASICamera2.dll` SDK runtime, but hardware drivers are
   supplied separately by ZWO.
 - Close any developer build of AutoPierCam that is already using the camera.
-- Optional security recording requires a separately installed FFmpeg executable
-  with libx264 support; see [video setup](video.md). Stills and live preview do
-  not need FFmpeg.
+- Native security recording and daily timelapses require Windows Media Foundation
+  (the Media Feature Pack on Windows N), not a separate encoder installation.
+  See [video setup](video.md); these development features postdate 0.2.26.
 
 Open `AutoPierCam-<version>-x64.msi` and review the Apache-2.0 license. The
 feature page includes **Start AutoPierCam when I sign in (recommended)**,

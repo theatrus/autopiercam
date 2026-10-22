@@ -138,7 +138,9 @@ dependencies = [
  "fs4",
  "getrandom 0.4.3",
  "image",
+ "libloading",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -147,6 +149,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

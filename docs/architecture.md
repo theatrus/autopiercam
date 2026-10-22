@@ -316,11 +316,18 @@ waits are interrupted, and all other intents remain durable. The full contract
 and operator caveats are in `docs/upload.md`.
 
 Security video samples the bounded latest JPEG preview into a bounded private
-spool and invokes an explicitly configured external FFmpeg executable to encode
-H.264 MP4. Completed segments are synced, published without overwrite, and
+spool and invokes an isolated AutoPierCam native encoder child to produce
+H.264 MP4 through Windows Media Foundation. Completed segments are synced, published without overwrite, and
 ledgered. Encoding runs off the camera thread with a deadline and bounded
 diagnostics. Pause and retention pressure suspend sampling. See [video](video.md)
 for limits, configuration, and the incomplete-segment crash limitation.
+
+Daily timelapses sample saved still pixels on the bounded writer thread, at most
+once per UTC minute, into a persistent 1 GiB JPEG cache. A separate worker seals
+past days, encodes fixed-rate playback, verifies publication receipts, and then
+releases completed samples. It never opens a camera or depends on preview cadence.
+Native media DLLs are resolved from System32 at encode time; missing optional
+media support does not prevent ordinary capture startup.
 
 Retention starts with a synchronous sweep before the camera is opened, then runs
 every 60 seconds and after each writer result has been published and durably
@@ -455,7 +462,7 @@ Task with restart-on-failure is appropriate for an unattended pier machine.
 4. WinUI preview and configuration.
 5. Deterministic day/night controller and RAW16 characterization.
 6. Atomic still spool and durable HTTP upload queue.
-7. FFmpeg segmented recording, recovery, and packaging.
+7. Native segmented recording, daily timelapses, recovery, and packaging.
 
 The repository has completed item 1 and the reusable-buffer, bounded-writer,
 auto-settling, host-control, and reconnect portions of item 2. Item 3 now has a
@@ -467,5 +474,6 @@ restart recovery and revision-fenced operator list/requeue, and safe automated
 retention with age/byte policies, upload-ledger protection, pressure telemetry,
 and scheduled-capture suspension. Item 5 includes opt-in adaptive exposure and
 RAW16 PNG output, tested on ASI676MC; ASI662MC and physical optical-transition
-validation remain. Item 7 includes bounded external-FFmpeg MP4 recording and
-signed installer packaging; unfinished-segment crash recovery remains.
+validation remain. Item 7 includes bounded Windows-native MP4 recording, durable
+daily timelapse spools, and signed installer packaging; unfinished security-segment
+crash recovery remains.

@@ -50,9 +50,9 @@ enum Mode {
         adaptive: bool,
         #[arg(long)]
         raw16: bool,
-        /// Also exercise production segmented recording using this installed FFmpeg.
+        /// Also exercise production Windows-native segmented recording.
         #[arg(long)]
-        ffmpeg: Option<std::path::PathBuf>,
+        video: bool,
     },
 }
 
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
             stills,
             adaptive,
             raw16,
-            ffmpeg,
+            video,
         } => check_agent(
             &sdk,
             options.camera_id,
@@ -90,7 +90,7 @@ fn main() -> Result<()> {
             stills,
             adaptive,
             raw16,
-            ffmpeg.as_deref(),
+            video,
             &control,
         ),
     }
@@ -339,7 +339,7 @@ fn check_agent(
     stills: u64,
     adaptive: bool,
     raw16: bool,
-    ffmpeg: Option<&std::path::Path>,
+    video: bool,
     control: &AgentControl,
 ) -> Result<()> {
     ensure!(
@@ -360,9 +360,8 @@ fn check_agent(
     config.camera.max_exposure_us = i64::from(max_seconds) * 1_000_000;
     config.capture.interval_ms = 1;
     config.capture.retention_days = 0;
-    if let Some(ffmpeg) = ffmpeg {
+    if video {
         config.video.enabled = true;
-        config.video.ffmpeg_path = Some(ffmpeg.to_path_buf());
         config.video.segment_seconds = 10;
     }
     let capture_directory = temporary.path().join(&config.capture.directory);
@@ -462,7 +461,7 @@ fn check_agent(
     let result = (|| -> Result<()> {
         observation_result?;
         worker_result?;
-        if let Some(ffmpeg) = ffmpeg {
+        if video {
             let clips: Vec<_> = std::fs::read_dir(&capture_directory)?
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
@@ -473,16 +472,7 @@ fn check_agent(
                 "video enabled but no MP4 segments were published"
             );
             for clip in &clips {
-                let decoded = std::process::Command::new(ffmpeg)
-                    .args(["-nostdin", "-v", "error", "-i"])
-                    .arg(clip)
-                    .args(["-f", "null", "-"])
-                    .output()?;
-                ensure!(
-                    decoded.status.success(),
-                    "recorded MP4 could not be decoded: {}",
-                    String::from_utf8_lossy(&decoded.stderr)
-                );
+                autopiercam::native_video::verify(clip)?;
             }
             println!(
                 "Validated {} published H.264 video segments by decoding them",

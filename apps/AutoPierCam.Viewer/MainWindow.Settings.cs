@@ -21,9 +21,9 @@ public sealed partial class MainWindow
             // Save available during editing, not only after tabbing away.
             input.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => MarkSettingsEdited());
         }
-        foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox, FfmpegPathTextBox })
+        foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
-        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle, UsbResetOnFaultToggle })
+        foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, DailyTimelapseToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle, UsbResetOnFaultToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
         CameraDriverComboBox.SelectionChanged += (_, _) => MarkSettingsEdited();
         WhiteBalanceModeComboBox.SelectionChanged += (_, _) => {
@@ -111,7 +111,7 @@ public sealed partial class MainWindow
             CameraFilter = SettingsFormValues.Text(CameraNameFilterTextBox.Text),
             Adaptive = AdaptiveExposureToggle.IsOn, Raw16 = Raw16Toggle.IsOn,
             Upload = UploadEnabledToggle.IsOn, Endpoint = SettingsFormValues.Text(UploadEndpointTextBox.Text),
-            Video = VideoEnabledToggle.IsOn, Ffmpeg = SettingsFormValues.Text(FfmpegPathTextBox.Text)
+            Video = VideoEnabledToggle.IsOn, DailyTimelapse = DailyTimelapseToggle.IsOn
         };
     }
 }
