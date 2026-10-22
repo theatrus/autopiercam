@@ -117,12 +117,11 @@ jobs:
       - name: Test Viewer camera selection and control protocol
         run: dotnet test apps/AutoPierCam.Viewer.Tests --configuration Release
 
-      - name: Test external H.264 encoder integration
+      - name: Test Windows native H.264 encoder integration (synthetic frames only)
         shell: pwsh
         run: |
-          $env:AUTOPIERCAM_TEST_FFMPEG = ./scripts/Get-FFmpegForTests.ps1
-          cargo test -p autopiercam video::tests --locked -- --ignored
-          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg integration tests failed.' }
+          cargo test -p autopiercam --test native_video --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Native video integration tests failed.' }
 
       - name: Verify dependency license inventory
         shell: pwsh

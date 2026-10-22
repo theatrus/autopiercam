@@ -28,6 +28,7 @@
     "queue_capacity": 32
   },
   "video": {
+    "daily_timelapse": false,
     "enabled": false,
     "segment_seconds": 300,
     "frames_per_second": 4

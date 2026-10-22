@@ -32,6 +32,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Encode a private daily spool without loading a camera driver.
+    #[command(hide = true)]
+    EncodeVideo {
+        #[arg(long)]
+        input_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Enumerate connected cameras without opening them.
     List {
         #[arg(long)]
@@ -107,6 +115,9 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let command = match cli.command {
+        Command::EncodeVideo { input_dir, output } => {
+            return autopiercam::native_video::encode(&input_dir, &output);
+        }
         Command::UploadLedger {
             command: UploadLedgerCommand::Migrate { config },
         } => {
@@ -206,7 +217,9 @@ fn main() -> Result<()> {
             jpeg_quality,
         ),
         Command::Run { config, max_frames } => run_agent(&sdk, &config, max_frames),
-        Command::UploadLedger { .. } | Command::ShutdownAgent { .. } => {
+        Command::UploadLedger { .. }
+        | Command::ShutdownAgent { .. }
+        | Command::EncodeVideo { .. } => {
             unreachable!("non-camera command returned before SDK load")
         }
     }

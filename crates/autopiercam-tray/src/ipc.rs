@@ -1191,7 +1191,8 @@ mod tests {
                 "camera.raw16",
                 "capture.preview_rate",
                 "capture.preview_rate_fractional",
-                "video.ffmpeg"
+                "video.native",
+                "video.daily_timelapse"
             ]
         );
 

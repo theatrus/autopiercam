@@ -5,8 +5,9 @@
 AutoPierCam is a Windows-first capture suite for ZWO ASI planetary cameras,
 built around a portable Rust core and capture agent. On Windows it lives in the
 system tray, adapts between bright days and dark nights, saves debayered stills,
-and can upload completed artifacts. Optional H.264 security-video segments use
-a separately installed FFmpeg executable.
+and can upload completed artifacts. Development builds use the Windows-native
+H.264 encoder for security-video segments and daily timelapses from saved stills,
+with no separate encoder installation. See [video setup](docs/video.md).
 
 AutoPierCam 0.2.26 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
@@ -18,7 +19,8 @@ AutoPierCam 0.2.26 is authored by Yann Ramin and licensed under the
 The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.26)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
-driver is installed separately; optional video recording also needs FFmpeg.
+driver is installed separately. The 0.2.26 download predates native video and
+daily timelapses; those changes are not yet released.
 
 The camera-on-pier mark uses cyan for night operation and amber for daylight
 operation. Its canonical vector source and reproducible Windows icon outputs

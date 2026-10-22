@@ -139,11 +139,22 @@ pub(crate) struct RetentionPlan {
     pub(crate) quota_blocked: bool,
 }
 
-pub(crate) fn plan_retention(
+#[cfg(test)]
+fn plan_retention(
+    policy: RetentionPolicy,
+    now_unix_ms: u64,
+    free_bytes: Option<u64>,
+    candidates: Vec<RetentionCandidate>,
+) -> RetentionPlan {
+    plan_with_private_bytes(policy, now_unix_ms, free_bytes, candidates, 0)
+}
+
+fn plan_with_private_bytes(
     policy: RetentionPolicy,
     now_unix_ms: u64,
     free_bytes: Option<u64>,
     mut candidates: Vec<RetentionCandidate>,
+    private_bytes: u64,
 ) -> RetentionPlan {
     candidates.sort_by(|left, right| {
         left.captured_at_unix_ms
@@ -151,7 +162,7 @@ pub(crate) fn plan_retention(
             .then_with(|| left.path.cmp(&right.path))
     });
 
-    let managed_bytes = candidates.iter().fold(0_u64, |total, candidate| {
+    let managed_bytes = candidates.iter().fold(private_bytes, |total, candidate| {
         total.saturating_add(candidate.file_size_bytes)
     });
 
@@ -164,7 +175,7 @@ pub(crate) fn plan_retention(
     let protected_bytes = candidates
         .iter()
         .filter(|candidate| !candidate.is_reclaimable())
-        .fold(0_u64, |total, candidate| {
+        .fold(private_bytes, |total, candidate| {
             total.saturating_add(candidate.file_size_bytes)
         });
     let reclaimable_bytes = managed_bytes.saturating_sub(protected_bytes);
@@ -723,6 +734,62 @@ pub(crate) fn inventory_capture_directory(
     Ok(inventory)
 }
 
+/// Count recovery/working files without ever admitting them to deletion or the
+/// upload ledger. Includes abandoned staging files after a crash. Never follow
+/// links; a malformed/private tree fails accounting closed instead of hiding it.
+fn private_bytes(directory: &Path) -> io::Result<u64> {
+    fn count(path: &Path, depth: usize, remaining: &mut usize) -> io::Result<u64> {
+        if depth > 4 || *remaining == 0 {
+            return Err(io::Error::other("private video inventory exceeds bounds"));
+        }
+        *remaining -= 1;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let linked = metadata.file_type().is_symlink();
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            linked || metadata.file_attributes() & 0x400 != 0
+        };
+        if linked {
+            return Err(io::Error::other("linked private video storage"));
+        }
+        if metadata.is_file() {
+            return Ok(metadata.len());
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::other("invalid private video storage"));
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = 0_u64;
+        for entry in entries {
+            bytes = bytes.saturating_add(count(&entry?.path(), depth + 1, remaining)?);
+        }
+        Ok(bytes)
+    }
+    let mut remaining = 100_000;
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".autopiercam-timelapse"
+            || name.starts_with(".autopiercam-video-")
+            || (name.starts_with(".frame-") && name.ends_with(".partial"))
+        {
+            bytes = bytes.saturating_add(count(&entry.path(), 0, &mut remaining)?);
+        }
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RetentionSweepError {
     #[error("{operation} failed for {path}: {source}")]
@@ -845,7 +912,24 @@ fn sweep_retention(
             }
         })
         .collect::<Vec<_>>();
-    let plan = plan_retention(policy, swept_at_unix_ms, initial_free_bytes, candidates);
+    let private = match private_bytes(directory) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return RetentionTelemetry::failed(
+                swept_at_unix_ms,
+                policy,
+                initial_free_bytes,
+                format!("counting private video storage failed: {error}"),
+            );
+        }
+    };
+    let plan = plan_with_private_bytes(
+        policy,
+        swept_at_unix_ms,
+        initial_free_bytes,
+        candidates,
+        private,
+    );
 
     let mut managed_bytes = plan.managed_bytes;
     let mut protected_bytes = plan.protected_bytes;
@@ -928,9 +1012,56 @@ pub(crate) struct RetentionSink {
     wake_sender: SyncSender<()>,
     stop: Arc<AtomicBool>,
     capture_suspended: Arc<AtomicBool>,
+    storage: Arc<StorageCheck>,
 }
 
+struct StorageCheck {
+    policy: RetentionPolicy,
+    directory: PathBuf,
+    parser: GeneratedFrameNameParser,
+    platform: Arc<dyn RetentionPlatform>,
+}
+
+#[derive(Debug, Error)]
+#[error("video deferred: shared storage quota or minimum free space would be exceeded")]
+pub(crate) struct VideoStoragePressure;
+
 impl RetentionSink {
+    /// Fresh, read-only admission check on a writer/encoder thread, never on the
+    /// camera thread. This is not a reservation: concurrent writes and encoder
+    /// buffering can briefly overshoot, as with the existing retention sweeps.
+    pub(crate) fn check_video_space(&self, additional: u64) -> anyhow::Result<()> {
+        let result = (|| {
+            anyhow::ensure!(!self.is_stopped(), "retention worker stopped");
+            let check = &self.storage;
+            if !check.policy.has_byte_quota() {
+                return Ok(());
+            }
+            let bytes = inventory_capture_directory(&check.directory, check.parser.as_ref())?
+                .iter()
+                .fold(private_bytes(&check.directory)?, |total, file| {
+                    total.saturating_add(file.file_size_bytes)
+                });
+            let free = if check.policy.needs_free_space() {
+                Some(check.platform.available_bytes(&check.directory)?)
+            } else {
+                None
+            };
+            anyhow::ensure!(
+                quotas_satisfied(
+                    check.policy,
+                    bytes.saturating_add(additional),
+                    free.map(|bytes| bytes.saturating_sub(additional))
+                ),
+                VideoStoragePressure
+            );
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.try_wake();
+        }
+        result
+    }
     pub(crate) fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
@@ -1032,6 +1163,12 @@ impl RetentionWorker {
 
         let worker_capture_suspended = Arc::clone(&capture_suspended);
         let worker_stop = Arc::clone(&stop);
+        let storage = Arc::new(StorageCheck {
+            policy,
+            directory: directory.clone(),
+            parser: Arc::clone(&parse_generated_name),
+            platform: Arc::clone(&platform),
+        });
         let thread = thread::Builder::new()
             .name("autopiercam-retention".to_owned())
             .spawn(move || {
@@ -1066,6 +1203,7 @@ impl RetentionWorker {
                 wake_sender,
                 stop,
                 capture_suspended,
+                storage,
             },
         ))
     }
@@ -1443,6 +1581,113 @@ mod tests {
     }
 
     #[test]
+    fn video_working_files_share_quota_but_never_become_deletion_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let day = root.path().join(".autopiercam-timelapse/00000001");
+        let security = root.path().join(".autopiercam-video-example");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(&security).unwrap();
+        // Include samples, metadata, crash-orphaned temp files and encoder output.
+        for name in ["0000.jpg", "samples.json", "encoding.mp4", ".tmp-orphan"] {
+            fs::write(day.join(name), [0; 10]).unwrap();
+        }
+        fs::write(security.join("sample-000000.jpg"), [0; 10]).unwrap();
+        fs::write(root.path().join(".frame-x.mp4.1.2.partial"), [0; 10]).unwrap();
+        fs::write(root.path().join("personal.txt"), [0; 100]).unwrap();
+        fs::write(root.path().join("frame-100.jpg"), [0; 20]).unwrap();
+        assert_eq!(private_bytes(root.path()).unwrap(), 60);
+        let platform = RecordingPlatform {
+            free_bytes: 1000,
+            deleted: Mutex::new(Vec::new()),
+        };
+        let telemetry = sweep_retention(
+            RetentionPolicy {
+                max_managed_bytes: Some(50),
+                ..policy()
+            },
+            root.path(),
+            &parse_test_frame_name,
+            &LocalOnlyRetentionAuthority,
+            &platform,
+            &FixedClock(1000),
+        );
+        assert_eq!(telemetry.managed_bytes, 60);
+        assert_eq!(telemetry.protected_bytes, 60);
+        assert!(telemetry.blocked_pressure);
+        assert_eq!(
+            *platform.deleted.lock().unwrap(),
+            vec![root.path().join("frame-100.jpg")]
+        );
+        assert!(day.join("0000.jpg").exists());
+        // Working files must not displace the actual keep-latest capture.
+        let plan = plan_with_private_bytes(
+            RetentionPolicy {
+                max_managed_bytes: Some(50),
+                keep_latest: true,
+                ..policy()
+            },
+            1000,
+            Some(1000),
+            vec![candidate("newest.jpg", 100, 20)],
+            60,
+        );
+        assert!(plan.deletions.is_empty());
+        assert_eq!(plan.protected_bytes, 80);
+    }
+
+    #[test]
+    fn video_admission_rechecks_current_bytes_and_free_space_before_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let day = root.path().join(".autopiercam-timelapse/00000001");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("0000.jpg"), [0; 60]).unwrap();
+        fs::write(root.path().join("frame-100.jpg"), [0; 20]).unwrap();
+        let (wake_sender, _receiver) = mpsc::sync_channel(1);
+        let sink = RetentionSink {
+            wake_sender,
+            stop: Arc::new(AtomicBool::new(false)),
+            capture_suspended: Arc::new(AtomicBool::new(false)),
+            storage: Arc::new(StorageCheck {
+                policy: RetentionPolicy {
+                    max_managed_bytes: Some(100),
+                    min_free_bytes: Some(10),
+                    ..policy()
+                },
+                directory: root.path().into(),
+                parser: Arc::new(parse_test_frame_name),
+                platform: Arc::new(RecordingPlatform {
+                    free_bytes: 25,
+                    deleted: Mutex::new(Vec::new()),
+                }),
+            }),
+        };
+        sink.check_video_space(15).unwrap();
+        assert!(
+            sink.check_video_space(16)
+                .unwrap_err()
+                .is::<VideoStoragePressure>()
+        );
+        fs::write(day.join("encoding.mp4"), [0; 30]).unwrap();
+        assert!(
+            sink.check_video_space(0)
+                .unwrap_err()
+                .is::<VideoStoragePressure>()
+        );
+        fs::remove_file(day.join("encoding.mp4")).unwrap();
+        sink.check_video_space(0).unwrap();
+        assert!(!sink.capture_suspended()); // no stale-sweep dependence
+        sink.stop.store(true, Ordering::Release);
+        assert!(sink.check_video_space(0).is_err());
+    }
+
+    #[test]
+    fn private_inventory_rejects_unbounded_nesting() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".autopiercam-video-x/a/b/c/d/e")).unwrap();
+        assert!(private_bytes(root.path()).is_err());
+    }
+
+    #[test]
     fn modern_png_and_mp4_obey_the_same_retention_authority() {
         let directory = tempfile::tempdir().unwrap();
         for extension in ["png", "mp4"] {
@@ -1688,6 +1933,12 @@ mod tests {
             wake_sender,
             stop: Arc::clone(&stop),
             capture_suspended: Arc::new(AtomicBool::new(false)),
+            storage: Arc::new(StorageCheck {
+                policy: policy(),
+                directory: PathBuf::new(),
+                parser: Arc::new(parse_test_frame_name),
+                platform: Arc::new(SystemRetentionPlatform),
+            }),
         };
 
         assert_eq!(sink.try_wake(), RetentionWakeResult::Queued);

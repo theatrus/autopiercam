@@ -24,6 +24,7 @@ getrandom.workspace = true
 image.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -34,6 +35,8 @@ windows-sys.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tokio.workspace = true
+windows = { version = "=0.61.3", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
+libloading = "=0.9.0"
 
 [build-dependencies]
 embed-resource.workspace = true

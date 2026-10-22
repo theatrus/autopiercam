@@ -35,8 +35,10 @@ use tracing::{info, warn};
 
 mod exposure;
 mod ledger_maintenance;
+pub mod native_video;
 mod preview;
 mod retention;
+mod timelapse;
 mod upload;
 mod video;
 
@@ -447,7 +449,10 @@ impl AgentMonitor {
             "camera.raw16".to_owned(),
             "capture.preview_rate".to_owned(),
             "capture.preview_rate_fractional".to_owned(),
-            "video.ffmpeg".to_owned(),
+            #[cfg(windows)]
+            "video.native".to_owned(),
+            #[cfg(windows)]
+            "video.daily_timelapse".to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
@@ -1544,6 +1549,16 @@ fn run_recording_epoch(
     } else {
         None
     };
+    let timelapse_worker = if config.video.daily_timelapse {
+        Some(timelapse::DailyWorker::start(
+            &capture_directory,
+            upload_sink.clone(),
+            retention_sink.clone(),
+        )?)
+    } else {
+        None
+    };
+    let timelapse_sink = timelapse_worker.as_ref().map(timelapse::DailyWorker::sink);
     let (writer_tx, writer_rx) = sync_channel::<CaptureJob>(config.capture.writer_queue_capacity);
     let upload_health = upload_sink.as_ref().map(UploadSink::health);
     let writer_retention_sink = retention_sink.clone();
@@ -1557,6 +1572,7 @@ fn run_recording_epoch(
                 &writer_monitor,
                 upload_sink.as_ref(),
                 writer_retention_sink.as_ref(),
+                timelapse_sink.as_ref(),
             );
             // Also fence publication if an unwinding camera thread detaches
             // this writer before the normal join sequence can run.
@@ -1591,6 +1607,9 @@ fn run_recording_epoch(
     let video_result = video_worker
         .map(video::VideoWorker::stop_and_join)
         .unwrap_or(Ok(()));
+    if let Some(worker) = timelapse_worker {
+        worker.stop_and_join();
+    }
     let retention_result = retention_worker
         .map(RetentionWorker::stop_and_join)
         .unwrap_or(Ok(()));
@@ -2164,6 +2183,7 @@ fn writer_loop(
     monitor: &AgentMonitor,
     upload: Option<&UploadSink>,
     retention: Option<&RetentionSink>,
+    timelapse: Option<&timelapse::DailySink>,
 ) -> Result<()> {
     for job in receiver {
         let stats = if job.raw16 {
@@ -2179,11 +2199,42 @@ fn writer_loop(
                 job.jpeg_quality,
                 ColorType::Rgb16,
             )?;
+            if let Some(sink) = timelapse {
+                sink.record(&job.output, || {
+                    let source = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(
+                        job.width,
+                        job.height,
+                        rgb.as_slice(),
+                    )
+                    .context("invalid RGB16 frame")?;
+                    Ok(image::DynamicImage::ImageRgb16(image::imageops::thumbnail(
+                        &source,
+                        timelapse::WIDTH,
+                        timelapse::HEIGHT,
+                    ))
+                    .to_rgb8())
+                });
+            }
             autopiercam_core::image::raw16_stats(&job.data, 64)?
         } else {
             let rgb = demosaic_bilinear(&job.data, job.width, job.height, job.bayer)
                 .with_context(|| format!("debayering frame {}", job.sequence))?;
             save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
+            if let Some(sink) = timelapse {
+                sink.record(&job.output, || {
+                    let source = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
+                        job.width,
+                        job.height,
+                        rgb.as_slice(),
+                    )
+                    .context("invalid RGB8 frame")?;
+                    Ok(image::imageops::thumbnail(
+                        &source,
+                        timelapse::WIDTH,
+                        timelapse::HEIGHT,
+                    ))
+                });
+            }
             luma_stats(&rgb, 64)?
         };
         monitor.artifact_saved(&job.output);
@@ -3343,7 +3394,10 @@ mod tests {
                 "camera.raw16".to_owned(),
                 "capture.preview_rate".to_owned(),
                 "capture.preview_rate_fractional".to_owned(),
-                "video.ffmpeg".to_owned()
+                #[cfg(windows)]
+                "video.native".to_owned(),
+                #[cfg(windows)]
+                "video.daily_timelapse".to_owned(),
             ]
         );
         let upload = status.upload.expect("upload telemetry");

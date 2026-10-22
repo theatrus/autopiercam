@@ -977,9 +977,14 @@ internal sealed record AgentUploadConfiguration
 
 internal sealed record AgentVideoConfiguration
 {
-    [JsonPropertyName("ffmpeg_path")]
+    // Preserve uneditable legacy/forward fields when talking to an older agent.
+    // In particular, saving unrelated settings must not clear its encoder path.
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+
+    [JsonPropertyName("daily_timelapse")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? FfmpegPath { get; init; }
+    public bool? DailyTimelapse { get; init; }
 
     [JsonPropertyName("enabled")]
     [JsonRequired]

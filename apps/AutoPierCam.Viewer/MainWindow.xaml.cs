@@ -1140,7 +1140,7 @@ public sealed partial class MainWindow : Window
         UploadEnabledToggle.IsOn = configuration.Upload.Enabled;
         UploadEndpointTextBox.Text = configuration.Upload.Endpoint ?? string.Empty;
         VideoEnabledToggle.IsOn = configuration.Video.Enabled;
-        FfmpegPathTextBox.Text = configuration.Video.FfmpegPath ?? string.Empty;
+        DailyTimelapseToggle.IsOn = configuration.Video.DailyTimelapse == true;
         ResetNumberEditors(CaptureNumberBoxes);
 
         _configurationSnapshot = snapshot;
@@ -1276,13 +1276,6 @@ public sealed partial class MainWindow : Window
                 "Bearer-authenticated uploads require an HTTPS endpoint.");
         }
 
-        string? ffmpegPath = _latestAgentStatus?.HasCapability("video.ffmpeg") == true
-            ? NormalizeOptionalText(FfmpegPathTextBox.Text) : original.Video.FfmpegPath;
-        if (_latestAgentStatus?.HasCapability("video.ffmpeg") == true && VideoEnabledToggle.IsOn &&
-            (ffmpegPath is null || !System.IO.Path.IsPathFullyQualified(ffmpegPath) || !System.IO.File.Exists(ffmpegPath)))
-        {
-            throw new UserInputException("Select an existing, fully qualified FFmpeg executable path before enabling video.");
-        }
 
         return original with
         {
@@ -1324,7 +1317,8 @@ public sealed partial class MainWindow : Window
             Video = original.Video with
             {
                 Enabled = VideoEnabledToggle.IsOn,
-                FfmpegPath = ffmpegPath,
+                DailyTimelapse = _latestAgentStatus?.HasCapability("video.daily_timelapse") == true
+                    ? DailyTimelapseToggle.IsOn : original.Video.DailyTimelapse,
             },
         };
     }
@@ -1680,8 +1674,8 @@ public sealed partial class MainWindow : Window
         }
         UploadEnabledToggle.IsEnabled = configurationControlsEnabled;
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
-        VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.ffmpeg") == true;
-        FfmpegPathTextBox.IsEnabled = VideoEnabledToggle.IsEnabled;
+        VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.native") == true;
+        DailyTimelapseToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.daily_timelapse") == true;
         CaptureKeepEditsButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();

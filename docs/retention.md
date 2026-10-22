@@ -19,8 +19,9 @@ The `[capture]` table accepts these retention fields:
 
 - `retention_days` deletes eligible captures at or beyond that age. Zero
   disables the age rule.
-- `retention_max_bytes` is an optional maximum for all managed captures,
-  including protected captures. Omit it to disable that limit.
+- `retention_max_bytes` is an optional maximum for all managed captures and
+  private video working files, including protected data. Omit it to disable
+  that limit.
 - `retention_min_free_bytes` is an optional minimum available-byte target on
   the capture volume. Omit it to disable that limit.
 - `keep_latest` protects the newest managed capture even when another rule
@@ -39,11 +40,21 @@ older agent, already loaded values remain read-only and are preserved.
 
 ## Managed and protected artifacts
 
-The inventory includes only regular, non-reparse-point direct children of the
-capture directory whose names exactly match AutoPierCam's current or legacy
-generated JPEG grammar. Nested files, symbolic links/reparse points, unrelated
-filenames, temporary files, and other extensions are ignored rather than
-deleted.
+Deletion candidates are regular, non-reparse-point direct children of the
+capture directory whose names exactly match AutoPierCam's generated JPEG,
+PNG or MP4 grammar (legacy names are supported for JPEG only). Unrelated
+filenames and symbolic links/reparse points are never adopted for deletion.
+
+Private video trees (`.autopiercam-timelapse` and `.autopiercam-video-*`) and
+`.frame-*.partial` staging files are counted separately as protected bytes,
+including metadata and abandoned temporary files. They never become deletion
+candidates, upload jobs, or the newest capture for `keep_latest`. A linked or
+unbounded private tree fails accounting closed. Video sampling checks current
+usage before adding samples; encoding checks at start, every second and before
+publication. Pressure retains daily source samples for retry and discards an
+unfinished security segment. The quota is not a hard filesystem reservation:
+concurrent writes and encoder buffering can briefly exceed it. See
+[video storage and recovery](video.md) for the additional private sample caps.
 
 When no upload ledger exists, managed captures are locally reclaimable. Once a
 ledger exists, it is authoritative for deletion safety:
