@@ -237,6 +237,7 @@ where
     let sharing = sharing_service
         .as_ref()
         .map(autopiercam::SharingService::client);
+    monitor.set_timelapse_sharing(sharing.as_ref().map(|client| client.timelapse_sink()));
 
     let supervisor_monitor = monitor.clone();
     let supervisor_preview = preview.clone();

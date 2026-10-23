@@ -12,6 +12,8 @@ internal sealed record SharingPreferences
     [JsonPropertyName("scene_threshold_percent")] public byte SceneThresholdPercent { get; init; } = 20;
     [JsonPropertyName("interval_minutes")] public ushort IntervalMinutes { get; init; }
     [JsonPropertyName("telescope_events")] public bool TelescopeEvents { get; init; }
+    [JsonPropertyName("observation_context")] public bool ObservationContext { get; init; }
+    [JsonPropertyName("timelapses")] public bool Timelapses { get; init; }
     [JsonPropertyName("chat_configuration")] public bool ChatConfiguration { get; init; }
     [JsonPropertyName("burst_count")] public byte BurstCount { get; init; } = 1;
     [JsonPropertyName("spacing_seconds")] public ushort SpacingSeconds { get; init; } = 60;

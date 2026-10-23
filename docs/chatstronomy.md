@@ -110,7 +110,17 @@ sharing off; forgetting clears permissions. Both reset chat overrides.
 and posts to all of the camera's configured destinations, not just the command
 channel. Triggered images likewise use all configured camera destinations.
 
-Telescope triggers currently cover slew start/end and sequence start/finish.
+Legacy telescope triggers cover slew start/end and sequence start/finish.
+With **Include telescope targets and more actions** enabled locally, an updated
+v3 Hub can also report target changes, autofocus, guiding, parking, rotation,
+filter changes, cooling/warming, waits, centering, and plate solving. Captions
+include the telescope and target display names only when known. An ended action
+does not imply success. Old cameras/Hubs keep their existing v1/v2 behavior;
+enabling these new features against an old Hub shows an update-required error.
+New observations remain subject to the telescope's N.I.N.A. category permissions
+and the camera's local telescope-event switch. No coordinates or raw logs are
+sent in these labels. Queued image captions/bytes stay immutable across retries;
+another telescope or later target cannot relabel them.
 The Hub admits only fresh (up to 30 seconds), new, chat-enabled events from a
 telescope with the **same owner and at least one shared guild/channel route**.
 Startup history, disabled events and cross-owner telescopes do not trigger posts.
@@ -134,6 +144,26 @@ the wait can take several exposure cycles, not just the next delivered frame.
 The normal spacing and device cooldown still apply. Once the post-slew image is
 queued, remaining slew-start follow-ups are retired; already queued images keep
 their original caption and bytes.
+
+### Daily timelapses
+
+Enable **Share finalized daily timelapses** separately in Chatstronomy settings
+to post newly finished H.264 MP4 movies to the camera's selected Discord channels.
+Daily timelapse recording must also be enabled under Capture. The sharing switch
+does not enable recording or any image/snapshot permissions, and chat cannot turn
+it on. Both timelapses and rich observation labels require an updated v3 Hub.
+
+Uploads are capped at **20 MiB** and use HTTPS independently of the WebSocket,
+so heartbeats and image/control traffic remain responsive. Oversized movies stay
+local; they are not silently altered or split. One queued clip is held in memory,
+with at most three attempts using the same clip ID/bytes. The Hub keeps per-route
+receipts so retries do not repeat successful destinations. There is no historical
+directory scan or upload backlog after restart. Pause, capture-session changes,
+forgetting, disabling sharing, or changing settings cancels pending work.
+Already accepted Discord posts cannot be recalled. Uploads are best-effort; a
+failed upload never changes or deletes the local movie or interrupts acquisition.
+A daily clip can contain saved stills recorded earlier that day, before sharing
+was enabled. Review the recording/privacy settings before opting in.
 
 The completion request expires after four exposure durations plus 180 seconds,
 bounded to 5–60 minutes (an unknown exposure uses 60 seconds). Duplicate completion

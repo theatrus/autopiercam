@@ -538,7 +538,7 @@
                                 <TextBlock FontSize="16" FontWeight="SemiBold" Text="Choose what to share" />
                                 <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                            Text="Sends previews to your Hub channels. Snapshot now uses the latest frame, up to 2 min old." />
-                                <ToggleSwitch x:Name="SharingEnabledToggle" Header="Enable image sharing" />
+                                <ToggleSwitch x:Name="SharingEnabledToggle" Header="Enable Chatstronomy sharing" />
                                 <Button x:Name="SharingStopButton" Click="SharingStopButton_Click" Content="Stop sharing now"
                                         ToolTipService.ToolTip="Stop sharing now. Keep unsaved edits." />
                                 <ToggleSwitch x:Name="SharingSnapshotsToggle" Header="Allow Snapshot now requests" />
@@ -558,6 +558,11 @@
                                         </StackPanel>
                                         <ToggleSwitch x:Name="SharingDayNightToggle" Header="Send on day / night transitions" />
                                         <ToggleSwitch x:Name="SharingTelescopeToggle" Header="Send on slew / sequence events" />
+                                        <ToggleSwitch x:Name="SharingContextToggle" Header="Include telescope targets and more actions" />
+                                        <ToggleSwitch x:Name="SharingTimelapsesToggle" Header="Share finalized daily timelapses" />
+                                        <TextBlock Text="Uploads new H.264 MP4 clips up to 20 MiB to the camera's Discord channels. Requires an updated Hub. Local videos are kept unchanged." TextWrapping="Wrap" Style="{StaticResource CaptionTextBlockStyle}" />
+                                        <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                   Text="With telescope events enabled, add target and action labels to triggered images. Requires an updated Hub; never controls hardware." />
                                         <StackPanel Spacing="12">
                                             <StackPanel Spacing="6">
                                                 <TextBlock Text="Images per event" />

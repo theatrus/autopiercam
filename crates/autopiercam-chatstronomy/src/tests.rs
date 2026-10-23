@@ -197,6 +197,15 @@ impl Fixture {
         let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
         let auth = text(&mut socket).await;
         assert_eq!(auth["type"], "authenticate");
+        let p = &client.status().preferences;
+        let expected_version = if p.timelapses || (p.observation_context && p.telescope_events) {
+            3
+        } else if p.telescope_events || p.chat_configuration || p.interval_minutes > 0 {
+            2
+        } else {
+            1
+        };
+        assert_eq!(auth["protocol_version"], expected_version);
         assert_eq!(auth["snapshots"], snapshots);
         assert_eq!(auth["credential"], "csdc_test_only");
         socket
@@ -207,11 +216,164 @@ impl Fixture {
             ))
             .await
             .unwrap();
-        if auth["protocol_version"] == 2 {
+        if auth["protocol_version"].as_u64().unwrap() >= 2 {
             assert_eq!(text(&mut socket).await["type"], "trigger_capabilities");
+        }
+        if p.timelapses {
+            assert_eq!(
+                text(&mut socket).await,
+                json!({"type":"media_capabilities","timelapses":true})
+            );
+            socket.send(Message::Text(json!({"type":"media_ready","max_timelapse_bytes":crate::protocol::MAX_TIMELAPSE_BYTES}).to_string().into())).await.unwrap();
         }
         socket
     }
+}
+
+fn timelapse_fixture() -> Vec<u8> {
+    b"\0\0\0\x18ftypmp42\0\0\0\0isommp42\0\0\0\x09moovx\0\0\0\x09mdatx".to_vec()
+}
+
+#[tokio::test]
+async fn rich_target_action_context_labels_a_new_completed_frame() {
+    let fixture = Fixture::paired_with(Preferences {
+        telescope_events: true,
+        observation_context: true,
+        ..Default::default()
+    })
+    .await;
+    let mut socket = fixture.connect(false, false).await;
+    let occurred =
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now_ms()) * 1_000_000)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"telescope_event","event":"autofocus_started",
+        "expires_at":now_ms()/1000+30,"context":{"telescope_id":17,"telescope_name":"Scope A",
+        "target_name":"NGC 7023","occurred_at":occurred}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    *fixture.frames.write().unwrap() = Some(frame(2, false));
+    let image = text(&mut socket).await;
+    assert_eq!(image["event"]["kind"], "telescope_event");
+    let caption = image["event"]["summary"].as_str().unwrap();
+    assert!(caption.contains("autofocus started"));
+    assert!(caption.contains("Scope A"));
+    assert!(caption.contains("Target: NGC 7023"));
+    assert!(!image["event"]["jpeg_base64"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn timelapse_permissions_are_independent_and_queue_is_discarded_on_changes() {
+    let fixture = Fixture::paired().await;
+    let client = fixture.service.client();
+    assert!(!client.status().preferences.timelapses);
+    assert!(
+        !client
+            .offer_timelapse(std::path::Path::new("must-not-open.mp4"), now_ms())
+            .unwrap()
+    );
+    let status = client.status();
+    client
+        .update(
+            status.revision,
+            Preferences {
+                enabled: true,
+                timelapses: true,
+                ..status.preferences
+            },
+        )
+        .unwrap();
+    let path = fixture._directory.path().join("daily.mp4");
+    std::fs::write(&path, timelapse_fixture()).unwrap();
+    assert!(client.offer_timelapse(&path, now_ms()).unwrap());
+    assert!(client.offer_timelapse(&path, now_ms()).is_err());
+    let status = client.status();
+    client
+        .update(
+            status.revision,
+            Preferences {
+                timelapses: false,
+                ..status.preferences
+            },
+        )
+        .unwrap();
+    assert!(client.0.pending_timelapse.lock().unwrap().is_none());
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn finalized_timelapse_uses_binary_http_without_blocking_websocket_heartbeats() {
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    let mut socket = fixture.connect(false, false).await;
+    let client = fixture.service.client();
+    let path = fixture._directory.path().join("daily.mp4");
+    let movie = timelapse_fixture();
+    std::fs::write(&path, &movie).unwrap();
+    assert!(client.offer_timelapse(&path, now_ms()).unwrap());
+    let (mut http, _) = timeout(Duration::from_secs(5), fixture.listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut request = Vec::new();
+    let body_start = loop {
+        let mut part = [0; 1024];
+        let n = timeout(Duration::from_secs(5), http.read(&mut part))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        request.extend_from_slice(&part[..n]);
+        assert!(request.len() < 8192);
+        if let Some(index) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    while request.len() < body_start + movie.len() {
+        let mut part = [0; 1024];
+        let n = http.read(&mut part).await.unwrap();
+        assert!(n > 0);
+        request.extend_from_slice(&part[..n]);
+    }
+    let headers = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
+    assert!(headers.starts_with("post /v1/devices/timelapse "));
+    assert!(headers.contains("authorization: bearer csdc_test_only"));
+    assert!(headers.contains("content-type: video/mp4"));
+    assert!(headers.contains("x-installation-id:"));
+    assert!(headers.contains("x-event-id:"));
+    assert_eq!(&request[body_start..], movie.as_slice());
+    // Keep the HTTP response pending and independently exercise WS liveness.
+    socket
+        .send(Message::Ping(vec![9, 8, 7].into()))
+        .await
+        .unwrap();
+    let pong = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(pong, Message::Pong(_)));
+    let ack = r#"{"status":"delivered","retry_after_seconds":0}"#;
+    http.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ack}",ack.len()).as_bytes()).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while client.status().last_delivery_unix_ms.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(path.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), movie);
 }
 
 #[tokio::test]

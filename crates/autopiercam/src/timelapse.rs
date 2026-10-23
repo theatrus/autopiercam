@@ -489,6 +489,7 @@ impl DailyWorker {
         directory: &Path,
         upload: Option<UploadSink>,
         retention: Option<RetentionSink>,
+        sharing: Option<crate::TimelapseSink>,
     ) -> Result<Self> {
         let mut initial_cache = Cache::open(directory)?;
         initial_cache.retention = retention.clone();
@@ -521,6 +522,10 @@ impl DailyWorker {
                                     upload.as_ref(),
                                     retention.as_ref(),
                                 )?;
+                                if let Some(sharing) = &sharing
+                                    && let Err(error) = sharing.offer(&directory.join(output_name(day)), (day + 1).saturating_mul(DAY_MS)) {
+                                        tracing::warn!(%error, "Timelapse not queued for Chatstronomy; local movie is unchanged");
+                                    }
                             }
                             cache
                                 .0

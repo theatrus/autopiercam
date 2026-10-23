@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -45,6 +45,11 @@ pub struct Preferences {
     pub scene_threshold_percent: u8,
     pub interval_minutes: u16,
     pub telescope_events: bool,
+    /// Receive bounded target/action context from a transport-v3 Hub. This
+    /// does not enable telescope triggers or sharing by itself.
+    pub observation_context: bool,
+    /// Upload newly finalized daily MP4s. Independent of image and trigger consent.
+    pub timelapses: bool,
     pub chat_configuration: bool,
     pub burst_count: u8,
     pub spacing_seconds: u16,
@@ -60,6 +65,8 @@ impl Default for Preferences {
             scene_threshold_percent: 20,
             interval_minutes: 0,
             telescope_events: false,
+            observation_context: false,
+            timelapses: false,
             chat_configuration: false,
             burst_count: 1,
             spacing_seconds: 60,
@@ -128,9 +135,19 @@ pub(crate) struct Shared {
     pub vault: Arc<dyn CredentialStore>,
     pub source: FrameSource,
     pub policy: TransportPolicy,
+    pub pending_timelapse: Mutex<Option<QueuedTimelapse>>,
     path: PathBuf,
     mutation: Mutex<()>,
     pairing: AtomicBool,
+}
+
+pub(crate) struct QueuedTimelapse {
+    pub id: String,
+    pub bytes: Arc<[u8]>,
+    pub captured_at_unix_ms: u64,
+    pub session: u64,
+    pub epoch: u64,
+    pub queued_at: std::time::Instant,
 }
 
 impl Shared {
@@ -164,6 +181,29 @@ impl Shared {
 
 #[derive(Clone)]
 pub struct SharingClient(pub(crate) Arc<Shared>);
+
+#[derive(Clone)]
+pub struct TimelapseSink(std::sync::Weak<Shared>);
+
+impl std::fmt::Debug for TimelapseSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelapseSink").finish_non_exhaustive()
+    }
+}
+
+impl TimelapseSink {
+    pub fn offer(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+        self.0.upgrade().map_or(Ok(false), |shared| {
+            SharingClient(shared).offer_timelapse(path, captured_at_unix_ms)
+        })
+    }
+}
+
+impl std::fmt::Debug for SharingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharingClient").finish_non_exhaustive()
+    }
+}
 
 pub struct SharingService {
     client: SharingClient,
@@ -241,6 +281,7 @@ impl SharingService {
             vault,
             source,
             policy,
+            pending_timelapse: Mutex::new(None),
             path,
             mutation: Mutex::new(()),
             pairing: AtomicBool::new(false),
@@ -276,6 +317,9 @@ impl Drop for SharingService {
 }
 
 impl SharingClient {
+    pub fn timelapse_sink(&self) -> TimelapseSink {
+        TimelapseSink(Arc::downgrade(&self.0))
+    }
     pub fn status(&self) -> Status {
         let settings = self.0.settings.read().unwrap().clone();
         Status {
@@ -290,9 +334,68 @@ impl SharingClient {
     }
     /// Cancels the current connection and its immutable image outbox.
     pub fn invalidate(&self) {
+        *self.0.pending_timelapse.lock().unwrap() = None;
         self.0
             .changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Called by the background daily encoder, never the acquisition callback.
+    /// One immutable, bounded in-memory offer; no directory scan or old-file replay.
+    pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+        let epoch = *self.0.changes.borrow();
+        let settings = self.0.settings.read().unwrap().clone();
+        if !settings.preferences.enabled
+            || !settings.preferences.timelapses
+            || settings.device_id.is_none()
+            || self.0.stopped.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let Some(frame) = (self.0.source)() else {
+            return Ok(false);
+        };
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("Timelapse must be a regular file");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                bail!("Timelapse links are not permitted");
+            }
+        }
+        if metadata.len() == 0 || metadata.len() > crate::protocol::MAX_TIMELAPSE_BYTES as u64 {
+            bail!("Timelapse exceeds the 20 MiB sharing limit; the local file is unchanged");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(path)?
+            .take(crate::protocol::MAX_TIMELAPSE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() != metadata.len() as usize {
+            bail!("Timelapse changed while being read");
+        }
+        let _guard = self.0.mutation.lock().unwrap();
+        if *self.0.changes.borrow() != epoch
+            || self.0.stopped.load(Ordering::Acquire)
+            || (self.0.source)().is_none_or(|current| current.session != frame.session)
+        {
+            return Ok(false);
+        }
+        let mut pending = self.0.pending_timelapse.lock().unwrap();
+        if pending.is_some() {
+            bail!("A timelapse is already queued; the local file is unchanged");
+        }
+        *pending = Some(QueuedTimelapse {
+            id: random_uuid()?,
+            bytes: bytes.into(),
+            captured_at_unix_ms,
+            session: frame.session,
+            epoch,
+            queued_at: std::time::Instant::now(),
+        });
+        Ok(true)
     }
 
     pub fn update(&self, expected_revision: u64, mut preferences: Preferences) -> Result<Status> {
@@ -414,6 +517,8 @@ impl SharingClient {
         settings.preferences.day_night = false;
         settings.preferences.interval_minutes = 0;
         settings.preferences.telescope_events = false;
+        settings.preferences.observation_context = false;
+        settings.preferences.timelapses = false;
         settings.preferences.chat_configuration = false;
         settings.remote_rules = None;
         settings.device_id = None;

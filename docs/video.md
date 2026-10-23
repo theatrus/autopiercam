@@ -88,6 +88,11 @@ day-end timestamp and a fixed timelapse namespace nonce. HTTP PUT uses
 `video/mp4`; receivers must accept it before uploads are enabled. Still-image
 counters exclude movies; worker logs report completed clips and errors.
 
+Daily clips can also be posted to Discord through Chatstronomy with the separate
+**Share finalized daily timelapses** permission. This does not share security
+recording segments. Clips over 20 MiB remain local; no movie is resized or
+deleted to fit. See [Chatstronomy sharing](chatstronomy.md#daily-timelapses).
+
 The native pipeline disables the video processor's frame-rate conversion.
 It retains source timestamps and adds one terminal hold sample where necessary
 to preserve the final frame's duration through the Windows H.264 encoder.

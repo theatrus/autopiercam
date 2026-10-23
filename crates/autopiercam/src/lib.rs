@@ -42,7 +42,7 @@ mod timelapse;
 mod upload;
 mod video;
 
-pub use autopiercam_chatstronomy::service::{SharingClient, SharingService};
+pub use autopiercam_chatstronomy::service::{SharingClient, SharingService, TimelapseSink};
 use exposure::{
     ExposureMode, FrameWait, PreviewCadence, Settling, WaitDecision, acquisition_delay,
     poll_timeout_ms,
@@ -182,6 +182,7 @@ pub struct AgentMonitor {
     capturing_generation: Arc<AtomicU64>,
     upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
     upload_admin_generation: Arc<AtomicU64>,
+    timelapse_sharing: Arc<RwLock<Option<TimelapseSink>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -463,11 +464,19 @@ impl AgentMonitor {
             capturing_generation: Arc::new(AtomicU64::new(0)),
             upload_admin: Arc::new(RwLock::new(None)),
             upload_admin_generation: Arc::new(AtomicU64::new(0)),
+            timelapse_sharing: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn snapshot(&self) -> AgentStatus {
         self.snapshot_at(Instant::now())
+    }
+
+    pub fn set_timelapse_sharing(&self, sink: Option<TimelapseSink>) {
+        *self
+            .timelapse_sharing
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = sink;
     }
 
     fn snapshot_at(&self, now: Instant) -> AgentStatus {
@@ -1191,6 +1200,11 @@ pub fn run_agent_with_monitor(
     )
     .map_err(|error| warn!(%error, "Chatstronomy disabled; local capture remains available"))
     .ok();
+    monitor.set_timelapse_sharing(
+        sharing
+            .as_ref()
+            .map(|sharing| sharing.client().timelapse_sink()),
+    );
     let preview = sharing
         .as_ref()
         .is_some_and(|sharing| sharing.client().status().preferences.enabled)
@@ -1554,6 +1568,11 @@ fn run_recording_epoch(
             &capture_directory,
             upload_sink.clone(),
             retention_sink.clone(),
+            monitor
+                .timelapse_sharing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         )?)
     } else {
         None

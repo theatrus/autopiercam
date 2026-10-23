@@ -35,7 +35,7 @@ public sealed partial class MainWindow
         }
         SharingOriginTextBox.TextChanged += (_, _) => SharingChanged();
         foreach (ToggleSwitch toggle in new[] { SharingEnabledToggle, SharingSnapshotsToggle, SharingScenesToggle,
-            SharingDayNightToggle, SharingTelescopeToggle, SharingChatToggle })
+            SharingDayNightToggle, SharingTelescopeToggle, SharingContextToggle, SharingTimelapsesToggle, SharingChatToggle })
             toggle.Toggled += (_, _) => SharingChanged();
         SharingCodePasswordBox.PasswordChanged += (_, _) => RenderSharing();
         _sharingInitialized = true;
@@ -84,6 +84,8 @@ public sealed partial class MainWindow
         SceneThresholdPercent = checked((byte)SharingNumber(SharingThresholdNumberBox, 5, 80, "Changed area threshold")),
         IntervalMinutes = SharingNumber(SharingIntervalNumberBox, 0, 1440, "Send an image every"),
         TelescopeEvents = SharingTelescopeToggle.IsOn,
+        ObservationContext = SharingContextToggle.IsOn,
+        Timelapses = SharingTimelapsesToggle.IsOn,
         ChatConfiguration = SharingChatToggle.IsOn,
         BurstCount = checked((byte)SharingNumber(SharingBurstNumberBox, 1, 3, "Images per event")),
         SpacingSeconds = SharingNumber(SharingSpacingNumberBox, 60, 600, "Time between images"),
@@ -102,6 +104,8 @@ public sealed partial class MainWindow
         SharingThresholdNumberBox.Value = p.SceneThresholdPercent;
         SharingIntervalNumberBox.Value = p.IntervalMinutes;
         SharingTelescopeToggle.IsOn = p.TelescopeEvents;
+        SharingContextToggle.IsOn = p.ObservationContext;
+        SharingTimelapsesToggle.IsOn = p.Timelapses;
         SharingBurstNumberBox.Value = p.BurstCount;
         SharingSpacingNumberBox.Value = p.SpacingSeconds;
         SharingChatToggle.IsOn = p.ChatConfiguration;
@@ -132,7 +136,7 @@ public sealed partial class MainWindow
 
         SharingPairingGroup.Visibility = paired ? Visibility.Collapsed : Visibility.Visible;
         foreach (Control control in new Control[] { SharingOriginTextBox, SharingCodePasswordBox, SharingSnapshotsToggle,
-            SharingScenesToggle, SharingDayNightToggle, SharingTelescopeToggle, SharingChatToggle,
+            SharingScenesToggle, SharingDayNightToggle, SharingTelescopeToggle, SharingContextToggle, SharingTimelapsesToggle, SharingChatToggle,
             SharingIntervalNumberBox, SharingThresholdNumberBox, SharingBurstNumberBox, SharingSpacingNumberBox })
             control.IsEnabled = idle;
         SharingEnabledToggle.IsEnabled = idle && paired && !_sharingStatusUnknown;
