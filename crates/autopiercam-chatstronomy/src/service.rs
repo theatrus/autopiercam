@@ -7,11 +7,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
 };
@@ -136,6 +136,8 @@ pub(crate) struct Shared {
     pub source: FrameSource,
     pub policy: TransportPolicy,
     pub pending_timelapse: Mutex<Option<QueuedTimelapse>>,
+    snapshot_copy: Mutex<()>,
+    movie_generation: AtomicU64,
     path: PathBuf,
     mutation: Mutex<()>,
     pairing: AtomicBool,
@@ -143,7 +145,7 @@ pub(crate) struct Shared {
 
 pub(crate) struct QueuedTimelapse {
     pub id: String,
-    pub bytes: Arc<[u8]>,
+    pub movie: crate::movie::Movie,
     pub captured_at_unix_ms: u64,
     pub session: u64,
     pub epoch: u64,
@@ -151,6 +153,11 @@ pub(crate) struct QueuedTimelapse {
 }
 
 impl Shared {
+    pub fn cancel_timelapses(&self) {
+        let mut pending = self.pending_timelapse.lock().unwrap();
+        self.movie_generation.fetch_add(1, Ordering::AcqRel);
+        *pending = None;
+    }
     /// Called only by the transport task. Local mutations still cancel that
     /// task via `changes`; remote updates cannot alter consent or identity.
     pub fn configure_triggers(
@@ -282,6 +289,8 @@ impl SharingService {
             source,
             policy,
             pending_timelapse: Mutex::new(None),
+            snapshot_copy: Mutex::new(()),
+            movie_generation: AtomicU64::new(0),
             path,
             mutation: Mutex::new(()),
             pairing: AtomicBool::new(false),
@@ -334,16 +343,17 @@ impl SharingClient {
     }
     /// Cancels the current connection and its immutable image outbox.
     pub fn invalidate(&self) {
-        *self.0.pending_timelapse.lock().unwrap() = None;
+        self.0.cancel_timelapses();
         self.0
             .changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Called by the background daily encoder, never the acquisition callback.
-    /// One immutable, bounded in-memory offer; no directory scan or old-file replay.
+    /// One immutable, bounded disk offer; no directory scan or old-file replay.
     pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
         let epoch = *self.0.changes.borrow();
+        let movie_generation = self.0.movie_generation.load(Ordering::Acquire);
         let settings = self.0.settings.read().unwrap().clone();
         if !settings.preferences.enabled
             || !settings.preferences.timelapses
@@ -355,27 +365,20 @@ impl SharingClient {
         let Some(frame) = (self.0.source)() else {
             return Ok(false);
         };
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            bail!("Timelapse must be a regular file");
+        let _copy = self
+            .0
+            .snapshot_copy
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("A timelapse snapshot is already being copied"))?;
+        if self.0.pending_timelapse.lock().unwrap().is_some() {
+            bail!("A timelapse is already queued; the local file is unchanged");
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes() & 0x400 != 0 {
-                bail!("Timelapse links are not permitted");
-            }
-        }
-        if metadata.len() == 0 || metadata.len() > crate::protocol::MAX_TIMELAPSE_BYTES as u64 {
-            bail!("Timelapse exceeds the 20 MiB sharing limit; the local file is unchanged");
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)?
-            .take(crate::protocol::MAX_TIMELAPSE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() != metadata.len() as usize {
-            bail!("Timelapse changed while being read");
-        }
+        let movie = crate::movie::Movie::snapshot(path, || {
+            *self.0.changes.borrow() == epoch
+                && self.0.movie_generation.load(Ordering::Acquire) == movie_generation
+                && !self.0.stopped.load(Ordering::Acquire)
+                && (self.0.source)().is_some_and(|current| current.session == frame.session)
+        })?;
         let _guard = self.0.mutation.lock().unwrap();
         if *self.0.changes.borrow() != epoch
             || self.0.stopped.load(Ordering::Acquire)
@@ -384,12 +387,15 @@ impl SharingClient {
             return Ok(false);
         }
         let mut pending = self.0.pending_timelapse.lock().unwrap();
+        if self.0.movie_generation.load(Ordering::Acquire) != movie_generation {
+            return Ok(false);
+        }
         if pending.is_some() {
             bail!("A timelapse is already queued; the local file is unchanged");
         }
         *pending = Some(QueuedTimelapse {
             id: random_uuid()?,
-            bytes: bytes.into(),
+            movie,
             captured_at_unix_ms,
             session: frame.session,
             epoch,

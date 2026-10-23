@@ -153,15 +153,31 @@ Daily timelapse recording must also be enabled under Capture. The sharing switch
 does not enable recording or any image/snapshot permissions, and chat cannot turn
 it on. Both timelapses and rich observation labels require an updated v3 Hub.
 
-Uploads are capped at **20 MiB** and use HTTPS independently of the WebSocket,
-so heartbeats and image/control traffic remain responsive. Oversized movies stay
-local; they are not silently altered or split. One queued clip is held in memory,
-with at most three attempts using the same clip ID/bytes. The Hub keeps per-route
+Uploads honor the Hub's advertised byte limit, clamped to a separate **512 MiB
+client safety ceiling**, and use HTTPS independently of the WebSocket. Higher
+advertisements do not invalidate the connection. The existing v3 capability
+messages and binary `video/mp4` endpoint/headers are unchanged; older v3 Hubs
+advertising 20 MiB still impose that smaller limit. No new fields are sent.
+Oversized movies stay local; they are not silently altered or split.
+One pending clip is a private, immutable temporary-file snapshot, not a whole
+movie in RAM. HTTP uses `Content-Length` and backpressured 64 KiB file reads,
+with at most three attempts using the same clip ID, timestamp and snapshot bytes.
+The Hub keeps per-route
 receipts so retries do not repeat successful destinations. There is no historical
 directory scan or upload backlog after restart. Pause, capture-session changes,
 forgetting, disabling sharing, or changing settings cancels pending work.
+Temporary snapshots are removed after success, rejection, cancellation or retry
+exhaustion. They live in private `.autopiercam-video-sharing-*` directories beside
+the original, counted by the existing video working-storage quota. Snapshot
+creation uses bounded chunks and checks cancellation between chunks. Abrupt
+process termination can leave a private orphan, still counted by storage limits;
+it is never replayed as a new upload. At most one copy operation, one pending
+snapshot and one active upload can exist at a time.
 Already accepted Discord posts cannot be recalled. Uploads are best-effort; a
 failed upload never changes or deletes the local movie or interrupts acquisition.
+The advertised limit does not guarantee Discord acceptance. Size/media rejection
+is terminal and shown in sharing status; the movie is never split into arbitrary
+attachments. This change does not resize or re-encode movies.
 Automatic image posts coalesce while a movie is pending so a one-minute image
 schedule cannot starve it behind the shared cooldown; snapshot requests report
 unavailable during that upload. Heartbeats and permission changes remain live.

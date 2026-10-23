@@ -6,7 +6,12 @@ pub const TRIGGER_PROTOCOL_VERSION: u32 = 2;
 pub const CONTEXT_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_WIRE_BYTES: usize = 720 * 1024;
 pub const MAX_JPEG_BYTES: usize = 512 * 1024;
-pub const MAX_TIMELAPSE_BYTES: usize = 20 * 1024 * 1024;
+/// Independent client disk/network safety ceiling, not a Hub protocol limit.
+pub const TIMELAPSE_SAFETY_CEILING: u64 = 512 * 1024 * 1024;
+
+pub fn timelapse_limit(advertised: u64) -> u64 {
+    advertised.min(TIMELAPSE_SAFETY_CEILING)
+}
 
 /// An immutable observation label, never telescope/camera control or a durable
 /// "current target" state. Names are the only free-form information admitted.
@@ -181,7 +186,7 @@ pub enum ClientMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerMessage {
     MediaReady {
-        max_timelapse_bytes: usize,
+        max_timelapse_bytes: u64,
     },
     Ready {
         protocol_version: u32,
@@ -228,7 +233,7 @@ impl ServerMessage {
         match &message {
             Self::MediaReady {
                 max_timelapse_bytes,
-            } if *max_timelapse_bytes == 0 || *max_timelapse_bytes > MAX_TIMELAPSE_BYTES => {
+            } if *max_timelapse_bytes == 0 => {
                 return Err(InvalidMessage);
             }
             Self::Ready {

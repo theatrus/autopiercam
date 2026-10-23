@@ -90,8 +90,10 @@ counters exclude movies; worker logs report completed clips and errors.
 
 Daily clips can also be posted to Discord through Chatstronomy with the separate
 **Share finalized daily timelapses** permission. This does not share security
-recording segments. Clips over 20 MiB remain local; no movie is resized or
-deleted to fit. See [Chatstronomy sharing](chatstronomy.md#daily-timelapses).
+recording segments. Clips above the Hub's advertised limit (or the independent
+512 MiB client safety ceiling) remain local. Uploads stream a private immutable
+file snapshot; no movie is resized, split, or deleted to fit. Discord can still
+reject a clip. See [Chatstronomy sharing](chatstronomy.md#daily-timelapses).
 
 The native pipeline disables the video processor's frame-rate conversion.
 It retains source timestamps and adds one terminal hold sample where necessary

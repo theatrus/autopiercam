@@ -252,6 +252,13 @@ async fn session(
     epoch: u64,
     observations: &mut Observations,
 ) -> Result<bool> {
+    struct MovieSession<'a>(&'a Shared);
+    impl Drop for MovieSession<'_> {
+        fn drop(&mut self) {
+            self.0.cancel_timelapses();
+        }
+    }
+    let _movies = MovieSession(shared);
     let Observations {
         detector,
         last_new_event,
@@ -336,6 +343,8 @@ async fn session(
                     Ok("delivered") => {*shared.last_delivery.lock().unwrap() = Some(now_ms()); status(shared, "Connected; timelapse delivered");}
                     Ok("elided") => status(shared, "Connected; timelapse skipped by the camera cooldown"),
                     Ok("no_destinations") => status(shared, "Connected; select camera destination channels in the Hub"),
+                    Ok("media_rejected") => status(shared, "Connected; Hub or Discord rejected the video size/media; local movie unchanged"),
+                    Ok("retry_exhausted") => status(shared, "Connected; timelapse failed after three attempts; local movie unchanged"),
                     _ => status(shared, "Connected; timelapse not delivered (local movie is unchanged)"),
                 }
             }
@@ -348,7 +357,7 @@ async fn session(
                     _ => bail!("Hub disconnected"),
                 };
                 match incoming {
-                    ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {media_limit = Some(max_timelapse_bytes);}
+                    ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {media_limit = Some(crate::protocol::timelapse_limit(max_timelapse_bytes));}
                     ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
                         let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
                         if accepted {
@@ -416,13 +425,25 @@ async fn session(
                 }
             }
             _ = ticks.tick() => {
+                {
+                    let mut pending = shared.pending_timelapse.lock().unwrap();
+                    if pending.as_ref().is_some_and(|item| item.epoch != epoch
+                        || item.queued_at.elapsed() > Duration::from_secs(900)
+                        || (shared.source)().is_none_or(|frame| frame.session != item.session)) {
+                        *pending = None;
+                    }
+                }
                 if video_upload.is_none() && let Some(limit) = media_limit {
                     let item = shared.pending_timelapse.lock().unwrap().take();
                     if let Some(item) = item.filter(|item| item.epoch == epoch
-                        && item.queued_at.elapsed() <= Duration::from_secs(900) && item.bytes.len() <= limit
+                        && item.queued_at.elapsed() <= Duration::from_secs(900)
                         && (shared.source)().is_some_and(|frame| frame.session == item.session)) {
-                        video_upload = Some(Box::pin(upload_timelapse(shared, settings, origin, credential, item)));
-                        status(shared, "Connected; uploading timelapse (automatic images coalesced)");
+                        if item.movie.len > limit {
+                            status(shared, "Connected; timelapse exceeds negotiated upload limit; local movie unchanged");
+                        } else {
+                            video_upload = Some(Box::pin(upload_timelapse(shared, settings, origin, credential, item)));
+                            status(shared, "Connected; uploading timelapse (automatic images coalesced)");
+                        }
                     }
                 }
                 if last_rx.elapsed() > Duration::from_secs(100) { bail!("Hub idle"); }
@@ -509,7 +530,7 @@ async fn source_invalidated(shared: &Shared, session: u64) {
     }
 }
 
-async fn upload_timelapse(
+pub(crate) async fn upload_timelapse(
     shared: &Shared,
     settings: &Settings,
     origin: &HubOrigin,
@@ -544,12 +565,14 @@ async fn upload_timelapse(
                 let response = client.post(origin.timelapse_url()).bearer_auth(credential.expose_for_transport())
                     .header("content-type", "video/mp4").header("x-installation-id", &settings.installation_id)
                     .header("x-event-id", &item.id).header("x-captured-at", &captured_at)
-                    .body(item.bytes.to_vec()).send().await;
+                    .header("content-length", item.movie.len)
+                    .body(reqwest::Body::wrap_stream(item.movie.stream())).send().await;
                 let Ok(mut response) = response else {return "retry";};
                 retry_delay = response.headers().get("retry-after").and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value >= 0.0)
                     .map(|seconds| Duration::from_secs_f64(seconds.clamp(60.0,3600.0))).unwrap_or(Duration::from_secs(60));
                 if matches!(response.status().as_u16(), 429 | 502 | 503 | 504) {return "retry";}
+                if matches!(response.status().as_u16(), 400 | 413 | 415 | 422) {return "media_rejected";}
                 if !response.status().is_success() {return "rejected";}
                 let mut bytes = Vec::new();
                 loop {
@@ -566,7 +589,8 @@ async fn upload_timelapse(
                 if let Some(seconds) = value["retry_after_seconds"].as_u64() {retry_delay = retry_delay.max(Duration::from_secs(seconds.clamp(60,3600)));}
                 match value["status"].as_str() {
                     Some("delivered") => "delivered", Some("retry" | "rate_limited") => "retry",
-                    Some("elided") => "elided", Some("no_destinations") => "no_destinations", _ => "rejected",
+                    Some("elided") => "elided", Some("no_destinations") => "no_destinations",
+                    Some("media_rejected") => "media_rejected", _ => "rejected",
                 }
             } => result,
         };

@@ -177,6 +177,15 @@ impl Fixture {
         }
     }
     async fn connect(&self, snapshots: bool, scene_changes: bool) -> WebSocketStream<TcpStream> {
+        self.connect_with_limit(snapshots, scene_changes, 20 * 1024 * 1024)
+            .await
+    }
+    async fn connect_with_limit(
+        &self,
+        snapshots: bool,
+        scene_changes: bool,
+        limit: u64,
+    ) -> WebSocketStream<TcpStream> {
         let client = self.service.client();
         let status = client.status();
         client
@@ -224,7 +233,14 @@ impl Fixture {
                 text(&mut socket).await,
                 json!({"type":"media_capabilities","timelapses":true})
             );
-            socket.send(Message::Text(json!({"type":"media_ready","max_timelapse_bytes":crate::protocol::MAX_TIMELAPSE_BYTES}).to_string().into())).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"media_ready","max_timelapse_bytes":limit})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
         }
         socket
     }
@@ -232,6 +248,383 @@ impl Fixture {
 
 fn timelapse_fixture() -> Vec<u8> {
     b"\0\0\0\x18ftypmp42\0\0\0\0isommp42\0\0\0\x09moovx\0\0\0\x09mdatx".to_vec()
+}
+
+fn private_movies(directory: &std::path::Path) -> usize {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".autopiercam-video-sharing-")
+        })
+        .count()
+}
+
+async fn movie_headers(http: &mut TcpStream) -> String {
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(
+            timeout(Duration::from_secs(5), http.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(headers.len() < 8192);
+    }
+    String::from_utf8(headers).unwrap().to_ascii_lowercase()
+}
+
+async fn movie_response(http: &mut TcpStream, code: u16, body: &str) {
+    http.write_all(
+        format!(
+            "HTTP/1.1 {code} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn larger_advertisement_accepts_a_21_mib_clip_with_content_length_and_unchanged_bytes() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    // Above even the client ceiling must not invalidate the v3 connection.
+    let mut socket = fixture.connect_with_limit(false, false, u64::MAX).await;
+    let client = fixture.service.client();
+    let path = fixture._directory.path().join("daily.mp4");
+    let size = 21 * 1024 * 1024_u64;
+    let mut header = timelapse_fixture();
+    header[33..37].copy_from_slice(&((size - 33) as u32).to_be_bytes());
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&header).unwrap();
+    file.set_len(size).unwrap();
+    drop(file);
+    let mut expected = Sha256::new();
+    let mut source = std::fs::File::open(&path).unwrap();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = source.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        expected.update(&buffer[..n]);
+    }
+    drop(source);
+    assert!(client.offer_timelapse(&path, now_ms()).unwrap());
+    // The HTTP body must come from the snapshot, not this now-replaced original.
+    std::fs::write(&path, b"replacement movie").unwrap();
+    let (mut http, _) = timeout(Duration::from_secs(5), fixture.listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let headers = movie_headers(&mut http).await;
+    assert!(headers.contains(&format!("content-length: {size}\r\n")));
+    assert!(!headers.contains("transfer-encoding:"));
+    let mut received = 0;
+    let mut hash = Sha256::new();
+    while received < size {
+        let n = timeout(Duration::from_secs(5), http.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        hash.update(&buffer[..n]);
+        received += n as u64;
+    }
+    assert_eq!(received, size);
+    assert_eq!(hash.finalize(), expected.finalize());
+    socket.send(Message::Ping(vec![7].into())).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Pong(_)
+    ));
+    movie_response(&mut http, 200, r#"{"status":"delivered"}"#).await;
+    timeout(Duration::from_secs(3), async {
+        while client.status().last_delivery_unix_ms.is_none()
+            || private_movies(fixture._directory.path()) != 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"replacement movie");
+}
+
+#[tokio::test]
+async fn permanent_size_and_media_rejections_are_terminal_visible_and_clean_up() {
+    for (code, body) in [(413, ""), (200, r#"{"status":"media_rejected"}"#)] {
+        let fixture = Fixture::paired_with(Preferences {
+            timelapses: true,
+            ..Default::default()
+        })
+        .await;
+        let _socket = fixture.connect(false, false).await;
+        let client = fixture.service.client();
+        let path = fixture._directory.path().join("daily.mp4");
+        let movie = timelapse_fixture();
+        std::fs::write(&path, &movie).unwrap();
+        assert!(client.offer_timelapse(&path, now_ms()).unwrap());
+        let (mut http, _) = timeout(Duration::from_secs(5), fixture.listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = movie_headers(&mut http).await;
+        let mut body_bytes = vec![0; movie.len()];
+        http.read_exact(&mut body_bytes).await.unwrap();
+        movie_response(&mut http, code, body).await;
+        timeout(Duration::from_secs(3), async {
+            while !client
+                .status()
+                .connection
+                .contains("rejected the video size/media")
+                || private_movies(fixture._directory.path()) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.status().last_delivery_unix_ms.is_none());
+        assert!(client.0.pending_timelapse.lock().unwrap().is_none());
+        assert_eq!(std::fs::read(path).unwrap(), movie);
+    }
+}
+
+#[tokio::test]
+async fn early_413_during_large_body_stream_is_terminal_and_releases_file() {
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    let _socket = fixture
+        .connect_with_limit(false, false, 64 * 1024 * 1024)
+        .await;
+    let client = fixture.service.client();
+    let path = fixture._directory.path().join("daily.mp4");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(21 * 1024 * 1024)
+        .unwrap();
+    client.offer_timelapse(&path, now_ms()).unwrap();
+    let (mut http, _) = timeout(Duration::from_secs(5), fixture.listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = movie_headers(&mut http).await;
+    movie_response(&mut http, 413, "").await;
+    timeout(Duration::from_secs(3), async {
+        while !client
+            .status()
+            .connection
+            .contains("rejected the video size/media")
+            || private_movies(fixture._directory.path()) != 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 21 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn negotiated_smaller_limit_skips_upload_without_disconnect_and_cleans_snapshot() {
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    let mut socket = fixture.connect_with_limit(false, false, 1).await;
+    let client = fixture.service.client();
+    let path = fixture._directory.path().join("daily.mp4");
+    std::fs::write(&path, timelapse_fixture()).unwrap();
+    client.offer_timelapse(&path, now_ms()).unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !client.status().connection.contains("exceeds negotiated")
+            || private_movies(fixture._directory.path()) != 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    socket.send(Message::Ping(vec![7].into())).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Pong(_)
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), fixture.listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn stalled_large_upload_cancellation_releases_snapshot_and_preserves_original() {
+    for cancel in ["consent", "pause", "session", "disconnect"] {
+        let fixture = Fixture::paired_with(Preferences {
+            timelapses: true,
+            ..Default::default()
+        })
+        .await;
+        let mut socket = fixture
+            .connect_with_limit(false, false, 64 * 1024 * 1024)
+            .await;
+        let client = fixture.service.client();
+        let path = fixture._directory.path().join("daily.mp4");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(21 * 1024 * 1024)
+            .unwrap();
+        client.offer_timelapse(&path, now_ms()).unwrap();
+        let (mut http, _) = timeout(Duration::from_secs(5), fixture.listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = movie_headers(&mut http).await; // do not consume body: backpressure
+        match cancel {
+            "consent" => {
+                let s = client.status();
+                client
+                    .update(
+                        s.revision,
+                        Preferences {
+                            timelapses: false,
+                            ..s.preferences
+                        },
+                    )
+                    .unwrap();
+            }
+            "pause" => {
+                *fixture.frames.write().unwrap() = None;
+            }
+            "session" => {
+                fixture.frames.write().unwrap().as_mut().unwrap().session += 1;
+            }
+            _ => {
+                socket.close(None).await.unwrap();
+            }
+        }
+        timeout(Duration::from_secs(5), async {
+            while private_movies(fixture._directory.path()) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 21 * 1024 * 1024);
+        assert!(client.status().last_delivery_unix_ms.is_none());
+    }
+}
+
+#[test]
+fn timelapse_limit_is_negotiated_without_new_fields_or_protocol_versions() {
+    use crate::protocol::{ServerMessage, TIMELAPSE_SAFETY_CEILING, timelapse_limit};
+    for advertised in [20 * 1024 * 1024, 64 * 1024 * 1024, u64::MAX] {
+        let wire = json!({"type":"media_ready","max_timelapse_bytes":advertised}).to_string();
+        assert!(
+            matches!(ServerMessage::parse_for_version(wire.as_bytes(),3).unwrap(),ServerMessage::MediaReady {max_timelapse_bytes} if max_timelapse_bytes==advertised)
+        );
+        assert!(ServerMessage::parse_for_version(wire.as_bytes(), 2).is_err());
+        assert_eq!(
+            timelapse_limit(advertised),
+            advertised.min(TIMELAPSE_SAFETY_CEILING)
+        );
+    }
+    assert!(ServerMessage::parse(br#"{"type":"media_ready","max_timelapse_bytes":0}"#).is_err());
+}
+
+#[tokio::test]
+async fn timelapse_retries_keep_bytes_uuid_and_timestamp_and_stop_at_three_attempts() {
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    let _socket = fixture.connect(false, false).await;
+    let client = fixture.service.client();
+    let path = fixture._directory.path().join("daily.mp4");
+    let bytes = timelapse_fixture();
+    std::fs::write(&path, &bytes).unwrap();
+    let movie = crate::movie::Movie::snapshot(&path, || true).unwrap();
+    let session = fixture.frames.read().unwrap().as_ref().unwrap().session;
+    let item = QueuedTimelapse {
+        id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+        movie,
+        captured_at_unix_ms: now_ms(),
+        session,
+        epoch: *client.0.changes.borrow(),
+        queued_at: std::time::Instant::now(),
+    };
+    let settings = client.0.settings.read().unwrap().clone();
+    let origin =
+        crate::origin::HubOrigin::parse(&settings.preferences.hub_origin, client.0.policy).unwrap();
+    let credential = Secret::new("csdc_test_only".into());
+    let sender =
+        crate::transport::upload_timelapse(&client.0, &settings, &origin, &credential, item);
+    let receiver = async {
+        let mut identity = None;
+        for attempt in 0..3 {
+            let (mut http, _) = fixture.listener.accept().await.unwrap();
+            let headers = movie_headers(&mut http).await;
+            let current: Vec<_> = headers
+                .lines()
+                .filter(|line| {
+                    line.starts_with("x-event-id:") || line.starts_with("x-captured-at:")
+                })
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(current.len(), 2);
+            if let Some(expected) = &identity {
+                assert_eq!(&current, expected);
+            } else {
+                identity = Some(current);
+            }
+            let mut body = vec![0; bytes.len()];
+            http.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, bytes);
+            std::fs::write(&path, format!("changed original {attempt}")).unwrap();
+            movie_response(&mut http, 503, "").await;
+            // Advance only the upload's runtime clock; the WS service has its
+            // own runtime. Do not wait real minutes or shorten production backoff.
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                tokio::time::resume();
+            }
+        }
+    };
+    let (result, ()) = timeout(Duration::from_secs(150), async {
+        tokio::join!(sender, receiver)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), "retry_exhausted");
+    assert_eq!(private_movies(fixture._directory.path()), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), b"changed original 2");
 }
 
 #[tokio::test]

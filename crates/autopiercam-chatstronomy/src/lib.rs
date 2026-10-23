@@ -4,6 +4,7 @@
 //! Credentials are stored only in the OS credential store. Sharing is opt-in.
 
 mod media;
+mod movie;
 pub mod origin;
 pub mod protocol;
 pub mod service;
