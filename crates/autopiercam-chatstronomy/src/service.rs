@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
 };
@@ -45,6 +45,12 @@ pub struct Preferences {
     pub scene_threshold_percent: u8,
     pub interval_minutes: u16,
     pub telescope_events: bool,
+    /// Receive bounded target/action context from a transport-v3 Hub. This
+    /// does not enable telescope triggers or sharing by itself.
+    pub observation_context: bool,
+    /// Upload newly finalized daily MP4s. Independent of image and trigger consent.
+    pub timelapses: bool,
+    pub overlays: crate::observation::OverlayOptions,
     pub chat_configuration: bool,
     pub burst_count: u8,
     pub spacing_seconds: u16,
@@ -60,6 +66,9 @@ impl Default for Preferences {
             scene_threshold_percent: 20,
             interval_minutes: 0,
             telescope_events: false,
+            observation_context: false,
+            timelapses: false,
+            overlays: Default::default(),
             chat_configuration: false,
             burst_count: 1,
             spacing_seconds: 60,
@@ -68,6 +77,9 @@ impl Default for Preferences {
 }
 impl Preferences {
     pub(crate) fn validate(&mut self, policy: TransportPolicy) -> Result<()> {
+        if !self.overlays.valid() {
+            bail!("Choose a positive Hub telescope ID for timelapse overlays");
+        }
         if self.interval_minutes > 1440
             || !(1..=3).contains(&self.burst_count)
             || !(60..=600).contains(&self.spacing_seconds)
@@ -128,12 +140,30 @@ pub(crate) struct Shared {
     pub vault: Arc<dyn CredentialStore>,
     pub source: FrameSource,
     pub policy: TransportPolicy,
+    pub pending_timelapse: Mutex<Option<QueuedTimelapse>>,
+    pub observations: Mutex<crate::observation::History>,
+    snapshot_copy: Mutex<()>,
+    movie_generation: AtomicU64,
     path: PathBuf,
     mutation: Mutex<()>,
     pairing: AtomicBool,
 }
 
+pub(crate) struct QueuedTimelapse {
+    pub id: String,
+    pub movie: crate::movie::Movie,
+    pub captured_at_unix_ms: u64,
+    pub session: u64,
+    pub epoch: u64,
+    pub queued_at: std::time::Instant,
+}
+
 impl Shared {
+    pub fn cancel_timelapses(&self) {
+        let mut pending = self.pending_timelapse.lock().unwrap();
+        self.movie_generation.fetch_add(1, Ordering::AcqRel);
+        *pending = None;
+    }
     /// Called only by the transport task. Local mutations still cancel that
     /// task via `changes`; remote updates cannot alter consent or identity.
     pub fn configure_triggers(
@@ -164,6 +194,52 @@ impl Shared {
 
 #[derive(Clone)]
 pub struct SharingClient(pub(crate) Arc<Shared>);
+
+#[derive(Clone)]
+pub struct TimelapseSink(std::sync::Weak<Shared>);
+
+impl std::fmt::Debug for TimelapseSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelapseSink").finish_non_exhaustive()
+    }
+}
+
+impl TimelapseSink {
+    /// Called at capture enqueue time, not at daily encoding time. Never opens a camera.
+    pub fn overlay_for(&self, captured_at_unix_ms: u64) -> Option<crate::observation::Overlay> {
+        let shared = self.0.upgrade()?;
+        let settings = shared.settings.read().unwrap();
+        if shared.stopped.load(Ordering::Acquire)
+            || !settings.preferences.enabled
+            || !settings.preferences.overlays.requested()
+        {
+            return None;
+        }
+        let frame = (shared.source)()?;
+        shared.observations.lock().unwrap().overlay(
+            &settings.preferences.overlays,
+            frame.session,
+            i64::try_from(captured_at_unix_ms).ok()?,
+            std::time::Instant::now(),
+        )
+    }
+    pub fn offer_checked(
+        &self,
+        path: &Path,
+        captured_at_unix_ms: u64,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<bool> {
+        self.0.upgrade().map_or(Ok(false), |shared| {
+            SharingClient(shared).offer_timelapse_checked(path, captured_at_unix_ms, check_space)
+        })
+    }
+}
+
+impl std::fmt::Debug for SharingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharingClient").finish_non_exhaustive()
+    }
+}
 
 pub struct SharingService {
     client: SharingClient,
@@ -241,6 +317,10 @@ impl SharingService {
             vault,
             source,
             policy,
+            pending_timelapse: Mutex::new(None),
+            observations: Mutex::new(Default::default()),
+            snapshot_copy: Mutex::new(()),
+            movie_generation: AtomicU64::new(0),
             path,
             mutation: Mutex::new(()),
             pairing: AtomicBool::new(false),
@@ -276,6 +356,9 @@ impl Drop for SharingService {
 }
 
 impl SharingClient {
+    pub fn timelapse_sink(&self) -> TimelapseSink {
+        TimelapseSink(Arc::downgrade(&self.0))
+    }
     pub fn status(&self) -> Status {
         let settings = self.0.settings.read().unwrap().clone();
         Status {
@@ -290,9 +373,79 @@ impl SharingClient {
     }
     /// Cancels the current connection and its immutable image outbox.
     pub fn invalidate(&self) {
+        self.0.observations.lock().unwrap().clear();
+        self.0.cancel_timelapses();
         self.0
             .changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+        self.offer_timelapse_checked(path, captured_at_unix_ms, |_| Ok(()))
+    }
+    /// Called by the background daily encoder, never the acquisition callback.
+    /// One immutable, bounded disk offer; no directory scan or old-file replay.
+    fn offer_timelapse_checked(
+        &self,
+        path: &Path,
+        captured_at_unix_ms: u64,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<bool> {
+        let epoch = *self.0.changes.borrow();
+        let movie_generation = self.0.movie_generation.load(Ordering::Acquire);
+        let settings = self.0.settings.read().unwrap().clone();
+        if !settings.preferences.enabled
+            || !settings.preferences.timelapses
+            || settings.device_id.is_none()
+            || self.0.stopped.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let Some(frame) = (self.0.source)() else {
+            return Ok(false);
+        };
+        let _copy = self
+            .0
+            .snapshot_copy
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("A timelapse snapshot is already being copied"))?;
+        if self.0.pending_timelapse.lock().unwrap().is_some() {
+            bail!("A timelapse is already queued; the local file is unchanged");
+        }
+        let movie = crate::movie::Movie::snapshot_checked(
+            path,
+            || {
+                *self.0.changes.borrow() == epoch
+                    && self.0.movie_generation.load(Ordering::Acquire) == movie_generation
+                    && !self.0.stopped.load(Ordering::Acquire)
+                    && (self.0.source)().is_some_and(|current| current.session == frame.session)
+            },
+            check_space,
+        )?;
+        let _guard = self.0.mutation.lock().unwrap();
+        if *self.0.changes.borrow() != epoch
+            || self.0.stopped.load(Ordering::Acquire)
+            || (self.0.source)().is_none_or(|current| current.session != frame.session)
+        {
+            return Ok(false);
+        }
+        let mut pending = self.0.pending_timelapse.lock().unwrap();
+        if self.0.movie_generation.load(Ordering::Acquire) != movie_generation {
+            return Ok(false);
+        }
+        if pending.is_some() {
+            bail!("A timelapse is already queued; the local file is unchanged");
+        }
+        *pending = Some(QueuedTimelapse {
+            id: random_uuid()?,
+            movie,
+            captured_at_unix_ms,
+            session: frame.session,
+            epoch,
+            queued_at: std::time::Instant::now(),
+        });
+        Ok(true)
     }
 
     pub fn update(&self, expected_revision: u64, mut preferences: Preferences) -> Result<Status> {
@@ -414,6 +567,9 @@ impl SharingClient {
         settings.preferences.day_night = false;
         settings.preferences.interval_minutes = 0;
         settings.preferences.telescope_events = false;
+        settings.preferences.observation_context = false;
+        settings.preferences.timelapses = false;
+        settings.preferences.overlays = Default::default();
         settings.preferences.chat_configuration = false;
         settings.remote_rules = None;
         settings.device_id = None;

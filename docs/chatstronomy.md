@@ -110,7 +110,17 @@ sharing off; forgetting clears permissions. Both reset chat overrides.
 and posts to all of the camera's configured destinations, not just the command
 channel. Triggered images likewise use all configured camera destinations.
 
-Telescope triggers currently cover slew start/end and sequence start/finish.
+Legacy telescope triggers cover slew start/end and sequence start/finish.
+With **Include telescope targets and more actions** enabled locally, an updated
+v3 Hub can also report target changes, autofocus, guiding, parking, rotation,
+filter changes, cooling/warming, waits, centering, and plate solving. Captions
+include the telescope and target display names only when known. An ended action
+does not imply success. Old cameras/Hubs keep their existing v1/v2 behavior;
+enabling these new features against an old Hub shows an update-required error.
+New observations remain subject to the telescope's N.I.N.A. category permissions
+and the camera's local telescope-event switch. No coordinates or raw logs are
+sent in these labels. Queued image captions/bytes stay immutable across retries;
+another telescope or later target cannot relabel them.
 The Hub admits only fresh (up to 30 seconds), new, chat-enabled events from a
 telescope with the **same owner and at least one shared guild/channel route**.
 Startup history, disabled events and cross-owner telescopes do not trigger posts.
@@ -135,6 +145,48 @@ The normal spacing and device cooldown still apply. Once the post-slew image is
 queued, remaining slew-start follow-ups are retired; already queued images keep
 their original caption and bytes.
 
+### Daily timelapses
+
+Enable **Share finalized daily timelapses** separately in Chatstronomy settings
+to post newly finished H.264 MP4 movies to the camera's selected Discord channels.
+Daily timelapse recording must also be enabled under Capture. The sharing switch
+does not enable recording or any image/snapshot permissions, and chat cannot turn
+it on. Both timelapses and rich observation labels require an updated v3 Hub.
+
+Uploads honor the Hub's advertised byte limit, clamped to a separate **512 MiB
+client safety ceiling**, and use HTTPS independently of the WebSocket. Higher
+advertisements do not invalidate the connection. The existing v3 capability
+messages and binary `video/mp4` endpoint/headers are unchanged; older v3 Hubs
+advertising 20 MiB still impose that smaller limit. No new fields are sent.
+Oversized movies stay local; they are not silently altered or split.
+One pending clip is a private, immutable temporary-file snapshot, not a whole
+movie in RAM. HTTP uses `Content-Length` and backpressured 64 KiB file reads,
+with at most three attempts using the same clip ID, timestamp and snapshot bytes.
+The Hub keeps per-route
+receipts so retries do not repeat successful destinations. There is no historical
+directory scan or upload backlog after restart. Pause, capture-session changes,
+forgetting, disabling sharing, or changing settings cancels pending work.
+Temporary snapshots are removed after success, rejection, cancellation or retry
+exhaustion. They live in private `.autopiercam-video-sharing-*` directories beside
+the original, counted by the existing video working-storage quota. Snapshot
+creation checks room for the full additional copy before starting, rechecks
+remaining space once a second and before queueing, and checks cancellation
+between bounded chunks. These checks share the video retention limits, not a
+hard filesystem reservation against concurrent writes. Abrupt
+process termination can leave a private orphan, still counted by storage limits;
+it is never replayed as a new upload. At most one copy operation, one pending
+snapshot and one active upload can exist at a time.
+Already accepted Discord posts cannot be recalled. Uploads are best-effort; a
+failed upload never changes or deletes the local movie or interrupts acquisition.
+The advertised limit does not guarantee Discord acceptance. Size/media rejection
+is terminal and shown in sharing status; the movie is never split into arbitrary
+attachments. This change does not resize or re-encode movies.
+Automatic image posts coalesce while a movie is pending so a one-minute image
+schedule cannot starve it behind the shared cooldown; snapshot requests report
+unavailable during that upload. Heartbeats and permission changes remain live.
+A daily clip can contain saved stills recorded earlier that day, before sharing
+was enabled. Review the recording/privacy settings before opting in.
+
 The completion request expires after four exposure durations plus 180 seconds,
 bounded to 5–60 minutes (an unknown exposure uses 60 seconds). Duplicate completion
 events do not extend it; a new slew supersedes it. Pause/session/consent changes
@@ -148,6 +200,47 @@ uses a v2 WebSocket only when these features are enabled and stops with an
 operator-visible protocol error against an older Hub, rather than silently
 ignoring the configuration. Neither these sources nor their installers are
 deployed automatically.
+
+## Daily timelapse overlays
+
+In **Settings → Chatstronomy → Daily timelapse overlays**, enter the exact Hub
+telescope record ID (not the pier-camera device ID), then choose target name,
+completed exposure count, and/or **Focuser** or **External / observatory**
+temperature. All labels default off. Enable daily timelapse recording in Imaging
+and pairing/master sharing in Chatstronomy; movie uploads, image posts and
+telescope-event triggers remain separate opt-ins.
+
+Overlays require the Hub's [v4 observation-state feed](https://github.com/theatrus/chatstronomy/blob/main/docs/OBSERVATION_STATE_PROTOCOL.md)
+and the N.I.N.A. plugin's **Share observation state for pier-camera overlays**
+permission. Target labels also require Target Scheduler consent; counts require
+Target Scheduler, Images and Sequence; temperatures require the corresponding
+focuser or weather category. The telescope must share the camera's owner and a
+guild/channel route. An older Hub reports an update requirement; turning all
+overlay choices off restores the existing v1/v2/v3 negotiation. Pairing and v3
+media messages are unchanged. Older agents do not receive the new settings field.
+
+Counts are confirmed, successfully saved LIGHT imaging exposures within one
+target visit, not pier-camera samples, planned exposures or reconstructed history.
+A missing target, unobserved visit start or privacy gap leaves the count unknown.
+Temperature labels name the chosen sensor; neither the other sensor nor camera
+cooler temperature is used as a fallback. Unknown or expired fields are omitted.
+
+Each saved frame receives a copy of the latest selected-telescope state already
+received at or before its host capture timestamp. Later target/count updates
+cannot relabel it. Snapshot validity is at most 30 seconds; sensor measurements
+have their own expiry, at most two minutes. These are host/source timestamps,
+not a guarantee that a long exposure depicts one instantaneous telescope state.
+Only 128 snapshots of the explicitly selected telescope are retained in memory.
+Epoch changes, disconnect, pause, capture-session changes and consent changes
+clear retained associations. Baselines and count changes never trigger images.
+
+Windows renders up to two lines of white Unicode text over a darkened bottom
+strip of the private 720p timelapse JPEG. Long text is ellipsized. Original
+full-resolution stills, preview/security videos and existing MP4s are unchanged.
+Labels already burned into saved samples remain through restart and cannot be
+removed by disabling a toggle later. Future samples use the new choices; the
+daily clip may therefore contain both labeled and unlabeled frames. Existing
+sample, retention and upload limits still apply after rendering.
 
 ## Runtime and persistence
 

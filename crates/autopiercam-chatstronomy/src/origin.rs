@@ -63,6 +63,12 @@ impl HubOrigin {
         url
     }
 
+    pub fn timelapse_url(&self) -> Url {
+        let mut url = self.0.clone();
+        url.set_path("/v1/devices/timelapse");
+        url
+    }
+
     pub fn websocket_url(&self) -> Url {
         let mut url = self.0.clone();
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };

@@ -39,10 +39,11 @@ pub mod native_video;
 mod preview;
 mod retention;
 mod timelapse;
+mod timelapse_overlay;
 mod upload;
 mod video;
 
-pub use autopiercam_chatstronomy::service::{SharingClient, SharingService};
+pub use autopiercam_chatstronomy::service::{SharingClient, SharingService, TimelapseSink};
 use exposure::{
     ExposureMode, FrameWait, PreviewCadence, Settling, WaitDecision, acquisition_delay,
     poll_timeout_ms,
@@ -182,6 +183,7 @@ pub struct AgentMonitor {
     capturing_generation: Arc<AtomicU64>,
     upload_admin: Arc<RwLock<Option<RegisteredUploadAdmin>>>,
     upload_admin_generation: Arc<AtomicU64>,
+    timelapse_sharing: Arc<RwLock<Option<TimelapseSink>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -439,6 +441,7 @@ impl AgentMonitor {
             CAPABILITY_STORAGE_RETENTION.to_owned(),
             CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
             "sharing.get".to_owned(),
+            "sharing.observation_overlays".to_owned(),
             "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.gain_range".to_owned(),
@@ -463,11 +466,19 @@ impl AgentMonitor {
             capturing_generation: Arc::new(AtomicU64::new(0)),
             upload_admin: Arc::new(RwLock::new(None)),
             upload_admin_generation: Arc::new(AtomicU64::new(0)),
+            timelapse_sharing: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn snapshot(&self) -> AgentStatus {
         self.snapshot_at(Instant::now())
+    }
+
+    pub fn set_timelapse_sharing(&self, sink: Option<TimelapseSink>) {
+        *self
+            .timelapse_sharing
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = sink;
     }
 
     fn snapshot_at(&self, now: Instant) -> AgentStatus {
@@ -865,6 +876,7 @@ pub fn snapshot(
 
 #[derive(Debug)]
 struct CaptureJob {
+    overlay: Option<autopiercam_chatstronomy::observation::Overlay>,
     sequence: u64,
     width: u32,
     height: u32,
@@ -1191,6 +1203,11 @@ pub fn run_agent_with_monitor(
     )
     .map_err(|error| warn!(%error, "Chatstronomy disabled; local capture remains available"))
     .ok();
+    monitor.set_timelapse_sharing(
+        sharing
+            .as_ref()
+            .map(|sharing| sharing.client().timelapse_sink()),
+    );
     let preview = sharing
         .as_ref()
         .is_some_and(|sharing| sharing.client().status().preferences.enabled)
@@ -1554,6 +1571,11 @@ fn run_recording_epoch(
             &capture_directory,
             upload_sink.clone(),
             retention_sink.clone(),
+            monitor
+                .timelapse_sharing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         )?)
     } else {
         None
@@ -1902,6 +1924,16 @@ fn capture_loop(
                 output.set_extension("png");
             }
             let job = CaptureJob {
+                overlay: if config.video.daily_timelapse {
+                    monitor
+                        .timelapse_sharing
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|sink| sink.overlay_for(frame.captured_at_unix_ms))
+                } else {
+                    None
+                },
                 sequence: state.queued,
                 width: meta.width,
                 height: meta.height,
@@ -2200,7 +2232,7 @@ fn writer_loop(
                 ColorType::Rgb16,
             )?;
             if let Some(sink) = timelapse {
-                sink.record(&job.output, || {
+                sink.record(&job.output, job.overlay.as_ref(), || {
                     let source = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(
                         job.width,
                         job.height,
@@ -2221,7 +2253,7 @@ fn writer_loop(
                 .with_context(|| format!("debayering frame {}", job.sequence))?;
             save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
             if let Some(sink) = timelapse {
-                sink.record(&job.output, || {
+                sink.record(&job.output, job.overlay.as_ref(), || {
                     let source = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
                         job.width,
                         job.height,
@@ -3384,6 +3416,7 @@ mod tests {
                 CAPABILITY_STORAGE_RETENTION.to_owned(),
                 CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
                 "sharing.get".to_owned(),
+                "sharing.observation_overlays".to_owned(),
                 "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.gain_range".to_owned(),

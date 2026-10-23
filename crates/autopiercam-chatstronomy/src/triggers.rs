@@ -1,4 +1,5 @@
 //! Bounded, completed-frame scheduling. No camera commands or image backlog.
+use crate::protocol::TelescopeContext;
 use crate::service::{Frame, Preferences};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -46,6 +47,8 @@ enum TelescopeEvent {
     SlewCompleted,
     SequenceStarted,
     SequenceFinished,
+    Action(&'static str),
+    Operation(&'static str, &'static str),
 }
 
 impl TelescopeEvent {
@@ -59,12 +62,63 @@ impl TelescopeEvent {
         }
     }
 
-    fn description(self) -> &'static str {
+    fn parse_context(event: &str) -> Option<Self> {
+        if let Some(event) = Self::parse(event) {
+            return Some(event);
+        }
+        let description = match event {
+            "target_changed" => "target changed",
+            "autofocus_started" => "autofocus started",
+            "autofocus_completed" => "autofocus completed",
+            "autofocus_failed" => "autofocus failed",
+            "mount_parked" => "mount parked",
+            "mount_unparked" => "mount unparked",
+            "meridian_flip_started" => "meridian flip started",
+            "meridian_flip_completed" => "meridian flip completed",
+            "guiding_started" => "guiding started",
+            "guiding_stopped" => "guiding stopped",
+            "guiding_dithered" => "guiding dithered",
+            "rotator_move_started" => "rotator move started",
+            "rotator_moved" => "rotator moved",
+            "filter_changed" => "filter changed",
+            "focuser_moved" => "focuser moved",
+            _ => {
+                // Fixed vocabularies, never an arbitrary remote caption/name.
+                let (base, phase) = [
+                    ("_started", "started"),
+                    ("_completed", "completed"),
+                    ("_ended", "ended"),
+                    ("_failed", "failed"),
+                ]
+                .into_iter()
+                .find_map(|(suffix, phase)| event.strip_suffix(suffix).map(|base| (base, phase)))?;
+                let description = match base {
+                    "camera_cooling" => "camera cooling",
+                    "camera_warming" => "camera warming",
+                    "time_wait" => "time wait",
+                    "astronomical_wait" => "astronomical wait",
+                    "safety_wait" => "safety wait",
+                    "condition_wait" => "condition wait",
+                    "manual_wait" => "manual wait",
+                    "sequence_slew" => "sequence slew",
+                    "mount_center" => "mount centering",
+                    "plate_solve" => "plate solving",
+                    _ => return None,
+                };
+                return Some(Self::Operation(description, phase));
+            }
+        };
+        Some(Self::Action(description))
+    }
+
+    fn description(self) -> String {
         match self {
-            Self::SlewStarted => "mount slew started",
-            Self::SlewCompleted => "mount slew completed",
-            Self::SequenceStarted => "sequence started",
-            Self::SequenceFinished => "sequence finished",
+            Self::SlewStarted => "mount slew started".into(),
+            Self::SlewCompleted => "mount slew completed".into(),
+            Self::SequenceStarted => "sequence started".into(),
+            Self::SequenceFinished => "sequence finished".into(),
+            Self::Action(description) => description.into(),
+            Self::Operation(description, phase) => format!("{description} {phase}"),
         }
     }
 }
@@ -73,6 +127,7 @@ struct Burst {
     kind: &'static str,
     summary: &'static str,
     telescope: Option<TelescopeEvent>,
+    context: Option<TelescopeContext>,
     total: u8,
     session: u64,
     after_sequence: u64,
@@ -122,6 +177,15 @@ struct SlewFinish {
     after_sequence: u64,
     after_unix_ms: u64,
     deadline: Instant,
+    context: Option<TelescopeContext>,
+}
+
+fn same_source(left: Option<&TelescopeContext>, right: Option<&TelescopeContext>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.telescope_id == right.telescope_id,
+        _ => false,
+    }
 }
 
 pub(crate) struct Scheduler {
@@ -160,6 +224,7 @@ impl Scheduler {
             kind,
             summary,
             telescope: None,
+            context: None,
             total: self.rules.burst_count,
             session: frame.session,
             after_sequence: if wait_new {
@@ -180,10 +245,32 @@ impl Scheduler {
     /// Motion images stay available. Completion reserves one separate post-slew
     /// image; it never stops/restarts capture or relabels an in-flight exposure.
     pub fn telescope_trigger(&mut self, event: &str, frame: &Frame, now: Instant, wall_ms: u64) {
-        let Some(event) = TelescopeEvent::parse(event) else {
+        self.telescope_trigger_with_context(event, None, frame, now, wall_ms);
+    }
+
+    pub fn telescope_trigger_with_context(
+        &mut self,
+        event: &str,
+        context: Option<TelescopeContext>,
+        frame: &Frame,
+        now: Instant,
+        wall_ms: u64,
+    ) {
+        let Some(event) = (if context.is_some() {
+            TelescopeEvent::parse_context(event)
+        } else {
+            TelescopeEvent::parse(event)
+        }) else {
             return;
         };
         if event == TelescopeEvent::SlewCompleted {
+            if self.slew_finish.as_ref().is_some_and(|pending| {
+                now < pending.deadline && !same_source(pending.context.as_ref(), context.as_ref())
+            }) {
+                // One bounded completion slot. Another telescope must not
+                // replace or relabel a pending observation.
+                return;
+            }
             // Duplicate notifications cannot postpone the pending image forever.
             if self
                 .slew_finish
@@ -208,6 +295,7 @@ impl Scheduler {
                                 .saturating_add(180)
                                 .clamp(300, 3600),
                         ),
+                    context,
                 });
             }
             return;
@@ -215,7 +303,13 @@ impl Scheduler {
         if event == TelescopeEvent::SlewStarted {
             // A genuinely new slew supersedes the previous unfinished request.
             // This only changes sharing state, never camera acquisition.
-            self.slew_finish = None;
+            if self
+                .slew_finish
+                .as_ref()
+                .is_none_or(|pending| same_source(pending.context.as_ref(), context.as_ref()))
+            {
+                self.slew_finish = None;
+            }
         }
         if self
             .burst
@@ -227,7 +321,10 @@ impl Scheduler {
         if self.burst.is_none() {
             self.trigger("telescope_event", "", frame, now, true);
             self.burst.as_mut().unwrap().telescope = Some(event);
+            self.burst.as_mut().unwrap().context = context;
         } else if let Some(b) = &mut self.burst
+            && b.context.is_none()
+            && context.is_none()
             && b.telescope.is_some_and(|previous| previous != event)
         {
             b.telescope = Some(event);
@@ -272,7 +369,13 @@ impl Scheduler {
                 && frame.captured_at_unix_ms <= wall_ms
         }) {
             self.finish_ready = true;
-            return Some(("telescope_event", "Pier camera: Post-slew image after mount slew completed (exposure timing estimated)".into()));
+            let summary = "Pier camera: Post-slew image after mount slew completed (exposure timing estimated)";
+            let summary = self
+                .slew_finish
+                .as_ref()
+                .and_then(|p| p.context.as_ref())
+                .map_or_else(|| summary.to_owned(), |context| context.caption(summary));
+            return Some(("telescope_event", summary));
         }
         if self
             .burst
@@ -307,6 +410,11 @@ impl Scheduler {
                 }
                 None => b.summary.to_owned(),
             };
+            let summary = if let Some(context) = &b.context {
+                context.caption(&summary)
+            } else {
+                summary
+            };
             (b.kind, summary)
         })
     }
@@ -316,13 +424,17 @@ impl Scheduler {
         self.last_queued_at = Some(now);
         if self.finish_ready {
             self.finish_ready = false;
-            self.slew_finish = None;
+            let finished = self.slew_finish.take();
             // No more start-followups after the post-slew image. Already queued
             // bytes retain their caption for retries; no exposure is cancelled.
             if self
                 .burst
                 .as_ref()
                 .is_some_and(|b| b.telescope == Some(TelescopeEvent::SlewStarted))
+                && same_source(
+                    self.burst.as_ref().and_then(|b| b.context.as_ref()),
+                    finished.as_ref().and_then(|p| p.context.as_ref()),
+                )
             {
                 self.burst = None;
             }
@@ -342,6 +454,196 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(id: i64, name: &str, target: &str) -> TelescopeContext {
+        TelescopeContext {
+            telescope_id: id,
+            telescope_name: name.into(),
+            target_name: Some(target.into()),
+            occurred_at: "2026-10-22T20:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn rich_context_captions_are_immutable_across_targets_and_telescopes() {
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let mut f = crate::tests::frame(1, false);
+        f.captured_at_unix_ms = wall;
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences {
+            burst_count: 2,
+            ..Default::default()
+        }));
+        s.telescope_trigger_with_context(
+            "autofocus_started",
+            Some(context(1, "RC61", "M31")),
+            &f,
+            now,
+            wall,
+        );
+        s.telescope_trigger_with_context(
+            "autofocus_completed",
+            Some(context(1, "Renamed", "M42")),
+            &f,
+            now,
+            wall,
+        );
+        s.telescope_trigger_with_context(
+            "target_changed",
+            Some(context(2, "UC131", "M33")),
+            &f,
+            now,
+            wall,
+        );
+        assert!(
+            s.due(Some(&f), now, wall, &mut PeriodicSchedule::default())
+                .is_none()
+        );
+        f.sequence += 1;
+        let caption = s
+            .due(Some(&f), now, wall, &mut PeriodicSchedule::default())
+            .unwrap()
+            .1;
+        assert!(caption.contains("autofocus started"));
+        assert!(caption.contains("RC61 · Target: M31"));
+        assert!(
+            !caption.contains("completed") && !caption.contains("M42") && !caption.contains("M33")
+        );
+        s.queued(&f, now);
+        f.sequence += 1;
+        let follow_up = s
+            .due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                wall,
+                &mut PeriodicSchedule::default(),
+            )
+            .unwrap()
+            .1;
+        assert!(
+            follow_up.contains("Follow-up after autofocus started")
+                && follow_up.contains("Target: M31")
+        );
+        f.session += 1;
+        assert!(
+            s.due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                wall,
+                &mut PeriodicSchedule::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rich_actions_use_only_fixed_names_and_keep_ended_distinct_from_success() {
+        assert!(TelescopeEvent::parse("autofocus_started").is_none());
+        for base in [
+            "camera_cooling",
+            "camera_warming",
+            "time_wait",
+            "astronomical_wait",
+            "safety_wait",
+            "condition_wait",
+            "manual_wait",
+            "sequence_slew",
+            "mount_center",
+            "plate_solve",
+        ] {
+            for phase in ["started", "completed", "ended", "failed"] {
+                let event = format!("{base}_{phase}");
+                let parsed = TelescopeEvent::parse_context(&event).unwrap();
+                assert!(parsed.description().ends_with(phase));
+                if phase == "ended" {
+                    assert!(!parsed.description().contains("completed"));
+                }
+            }
+        }
+        for unknown in [
+            "custom_script_started",
+            "autofocus_progress",
+            "camera_cooling_success",
+            "target_changed_ended",
+        ] {
+            assert!(TelescopeEvent::parse_context(unknown).is_none());
+        }
+        let now = Instant::now();
+        let mut f = crate::tests::frame(1, false);
+        let wall = f.captured_at_unix_ms;
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()));
+        s.telescope_trigger_with_context(
+            "target_changed",
+            Some(context(17, "UC131", "NGC 7023")),
+            &f,
+            now,
+            wall,
+        );
+        f.sequence += 1;
+        assert!(
+            s.due(Some(&f), now, wall, &mut PeriodicSchedule::default())
+                .unwrap()
+                .1
+                .contains("target changed")
+        );
+    }
+
+    #[test]
+    fn post_slew_context_is_not_replaced_by_another_telescope_or_target() {
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let mut f = crate::tests::frame(1, false);
+        f.captured_at_unix_ms = wall;
+        let mut s = Scheduler::new(TriggerRules::local(&Preferences::default()));
+        s.telescope_trigger_with_context(
+            "mount_slewed",
+            Some(context(1, "RC61", "M31")),
+            &f,
+            now,
+            wall,
+        );
+        s.telescope_trigger_with_context(
+            "mount_slewed",
+            Some(context(1, "Renamed", "M42")),
+            &f,
+            now,
+            wall,
+        );
+        s.telescope_trigger_with_context(
+            "mount_slew_started",
+            Some(context(2, "UC131", "M33")),
+            &f,
+            now,
+            wall,
+        );
+        s.telescope_trigger_with_context(
+            "mount_slewed",
+            Some(context(2, "UC131", "M33")),
+            &f,
+            now,
+            wall,
+        );
+        f.sequence += 1;
+        f.conservative_start_unix_ms = Some(wall + 1);
+        f.captured_at_unix_ms = wall + 60_000;
+        let caption = s
+            .due(
+                Some(&f),
+                now + Duration::from_secs(60),
+                wall + 60_000,
+                &mut PeriodicSchedule::default(),
+            )
+            .unwrap()
+            .1;
+        assert!(caption.contains("Post-slew") && caption.contains("RC61 · Target: M31"));
+        s.queued(&f, now + Duration::from_secs(60));
+        // Completion of RC61 must not retire a UC131 start observation.
+        assert!(
+            s.burst
+                .as_ref()
+                .is_some_and(|b| b.context.as_ref().unwrap().telescope_id == 2)
+        );
+    }
     #[test]
     fn long_exposure_finish_waits_without_suppressing_motion_images() {
         for seconds in [30, 60] {

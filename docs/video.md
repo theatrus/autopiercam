@@ -1,7 +1,6 @@
 # Windows-native video and daily timelapses
 
-These are development changes after 0.2.26; the published 0.2.26 installer
-predates the native encoder.
+Windows-native security video and daily timelapses are available in 0.2.27.
 
 Both video modes use Windows Media Foundation to produce H.264 MP4, without an
 external executable or codec download. Hardware transforms are allowed; Windows
@@ -46,6 +45,11 @@ It makes a private JPEG copy, scaled to fit a 1280 × 720 black canvas without
 stretching. RAW8 JPEG and RAW16 PNG captures are supported. Sampling does not
 depend on preview FPS and never requests, aborts, or restarts an exposure.
 
+Optional [observation overlays](chatstronomy.md#daily-timelapse-overlays)
+add the target, saved LIGHT exposure count and a selected focuser/external
+temperature to future private samples. Values are captured with each frame and
+omitted when unknown or stale; original stills remain unchanged.
+
 Samples play at 24 source frames per second. A fully sampled UTC day produces
 about 60 seconds of video. Missing minutes are omitted rather than filled in;
 a partial day produces a shorter clip. Clips close at midnight UTC, not local
@@ -87,6 +91,13 @@ grammar, upload ledger, and protected retention rules. Daily movies use the UTC
 day-end timestamp and a fixed timelapse namespace nonce. HTTP PUT uses
 `video/mp4`; receivers must accept it before uploads are enabled. Still-image
 counters exclude movies; worker logs report completed clips and errors.
+
+Daily clips can also be posted to Discord through Chatstronomy with the separate
+**Share finalized daily timelapses** permission. This does not share security
+recording segments. Clips above the Hub's advertised limit (or the independent
+512 MiB client safety ceiling) remain local. Uploads stream a private immutable
+file snapshot; no movie is resized, split, or deleted to fit. Discord can still
+reject a clip. See [Chatstronomy sharing](chatstronomy.md#daily-timelapses).
 
 The native pipeline disables the video processor's frame-rate conversion.
 It retains source timestamps and adds one terminal hold sample where necessary

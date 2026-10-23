@@ -1182,6 +1182,7 @@ mod tests {
                 CAPABILITY_STORAGE_RETENTION,
                 CAPABILITY_EXPOSURE_PROGRESS,
                 "sharing.get",
+                "sharing.observation_overlays",
                 "cameras.list",
                 "camera.adaptive_exposure",
                 "camera.gain_range",

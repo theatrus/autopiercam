@@ -5,22 +5,27 @@
 AutoPierCam is a Windows-first capture suite for ZWO ASI planetary cameras,
 built around a portable Rust core and capture agent. On Windows it lives in the
 system tray, adapts between bright days and dark nights, saves debayered stills,
-and can upload completed artifacts. Development builds use the Windows-native
+and can upload completed artifacts. Video uses the Windows-native
 H.264 encoder for security-video segments and daily timelapses from saved stills,
 with no separate encoder installation. See [video setup](docs/video.md).
 
-AutoPierCam 0.2.26 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.27 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.26)](https://github.com/theatrus/autopiercam/releases/download/v0.2.26/AutoPierCam-0.2.26-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.26)
+[Download the signed Windows x64 installer (0.2.27)](https://github.com/theatrus/autopiercam/releases/download/v0.2.27/AutoPierCam-0.2.27-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.27)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
-driver is installed separately. The 0.2.26 download predates native video and
-daily timelapses; those changes are not yet released.
+driver is installed separately.
+
+Version 0.2.27 adds native security video and daily timelapses, optional target,
+saved-exposure count and focuser/external-temperature overlays, and opt-in
+Chatstronomy movie sharing. Larger uploads honor the Hub limit up to a separate
+512 MiB client ceiling; Discord delivery is best-effort. See the
+[0.2.27 release notes](docs/releases/0.2.27.md) and [video setup](docs/video.md).
 
 The camera-on-pier mark uses cyan for night operation and amber for daylight
 operation. Its canonical vector source and reproducible Windows icon outputs

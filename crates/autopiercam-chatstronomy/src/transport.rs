@@ -26,6 +26,8 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type VideoUpload<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<&'static str>> + Send + 'a>>;
 
 pub(crate) async fn pair(
     origin: &HubOrigin,
@@ -192,7 +194,11 @@ pub(crate) async fn run(shared: Arc<Shared>) {
         {
             status(
                 &shared,
-                "Hub rejected authentication/protocol; pair again or update",
+                if settings.preferences.overlays.requested() {
+                    "Hub v4 observation protocol required; update Hub or turn overlays off"
+                } else {
+                    "Hub rejected authentication/protocol; pair again or update"
+                },
             );
             outbox = None;
             let _ = changes.changed().await;
@@ -250,12 +256,26 @@ async fn session(
     epoch: u64,
     observations: &mut Observations,
 ) -> Result<bool> {
+    struct MovieSession<'a>(&'a Shared);
+    impl Drop for MovieSession<'_> {
+        fn drop(&mut self) {
+            self.0.observations.lock().unwrap().clear();
+            self.0.cancel_timelapses();
+        }
+    }
+    let _movies = MovieSession(shared);
     let Observations {
         detector,
         last_new_event,
         periodic,
     } = observations;
-    let version = if settings.preferences.interval_minutes > 0
+    let version = if settings.preferences.overlays.requested() {
+        crate::protocol::OBSERVATION_PROTOCOL_VERSION
+    } else if settings.preferences.timelapses
+        || (settings.preferences.observation_context && settings.preferences.telescope_events)
+    {
+        crate::protocol::CONTEXT_PROTOCOL_VERSION
+    } else if settings.preferences.interval_minutes > 0
         || settings.preferences.telescope_events
         || settings.preferences.chat_configuration
     {
@@ -291,13 +311,42 @@ async fn session(
             device_id,
             protocol_version,
         } if Some(device_id) == settings.device_id && protocol_version == version => {}
-        ServerMessage::Error { code } => return Ok(!requires_operator_action(&code)),
+        ServerMessage::Error { code } => {
+            if settings.preferences.overlays.requested() {
+                status(
+                    shared,
+                    "Hub v4 required for overlays; update Hub or turn overlays off",
+                );
+            }
+            return Ok(!requires_operator_action(&code));
+        }
         _ => return Ok(false),
     }
     status(shared, "Connected");
-    if version == crate::protocol::TRIGGER_PROTOCOL_VERSION {
-        send(&mut socket, serde_json::json!({"type":"trigger_capabilities", "chat_configuration":settings.preferences.chat_configuration, "telescope_events":settings.preferences.telescope_events}).to_string()).await?;
+    if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION {
+        let mut capabilities = serde_json::json!({"type":"trigger_capabilities", "chat_configuration":settings.preferences.chat_configuration, "telescope_events":settings.preferences.telescope_events});
+        if version >= crate::protocol::CONTEXT_PROTOCOL_VERSION {
+            capabilities["observation_context"] = settings.preferences.observation_context.into();
+        }
+        send(&mut socket, capabilities.to_string()).await?;
     }
+    if settings.preferences.timelapses {
+        send(
+            &mut socket,
+            serde_json::json!({"type":"media_capabilities","timelapses":true}).to_string(),
+        )
+        .await?;
+    }
+    let mut media_limit = None;
+    let mut telemetry_ready = false;
+    if settings.preferences.overlays.requested() {
+        send(
+            &mut socket,
+            serde_json::json!({"type":"observation_capabilities","telemetry":true}).to_string(),
+        )
+        .await?;
+    }
+    let mut video_upload: Option<VideoUpload<'_>> = None;
     let mut rules = settings.rules();
     periodic.configure(rules.interval_minutes, now_ms());
     let mut scheduler = Scheduler::new(rules.clone());
@@ -311,16 +360,37 @@ async fn session(
             bail!("Local sharing permission changed");
         }
         tokio::select! {
+            result = async {video_upload.as_mut().expect("guarded upload").await}, if video_upload.is_some() => {
+                video_upload = None;
+                match result {
+                    Ok("delivered") => {*shared.last_delivery.lock().unwrap() = Some(now_ms()); status(shared, "Connected; timelapse delivered");}
+                    Ok("elided") => status(shared, "Connected; timelapse skipped by the camera cooldown"),
+                    Ok("no_destinations") => status(shared, "Connected; select camera destination channels in the Hub"),
+                    Ok("media_rejected") => status(shared, "Connected; Hub or Discord rejected the video size/media; local movie unchanged"),
+                    Ok("retry_exhausted") => status(shared, "Connected; timelapse failed after three attempts; local movie unchanged"),
+                    _ => status(shared, "Connected; timelapse not delivered (local movie is unchanged)"),
+                }
+            }
             incoming = socket.next() => {
                 last_rx = Instant::now();
                 let incoming = match incoming {
-                    Some(Ok(Message::Text(text))) => match ServerMessage::parse(text.as_bytes()) { Ok(value) => value, Err(_) => return Ok(false) },
+                    Some(Ok(Message::Text(text))) => match ServerMessage::parse_for_version(text.as_bytes(), version) { Ok(value) => value, Err(_) => return Ok(false) },
                     Some(Ok(Message::Ping(_))) => { socket.flush().await?; continue; }
                     Some(Ok(Message::Pong(_))) => continue,
                     _ => bail!("Hub disconnected"),
                 };
                 match incoming {
-                    ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version == crate::protocol::TRIGGER_PROTOCOL_VERSION => {
+                    ServerMessage::ObservationReady { telemetry, .. } if settings.preferences.overlays.requested() => {
+                        telemetry_ready = telemetry;
+                        shared.observations.lock().unwrap().clear();
+                        if !telemetry { status(shared, "Connected; Hub observation telemetry unavailable"); }
+                    }
+                    ServerMessage::ObservationState(state) if telemetry_ready && settings.preferences.overlays.requested() => {
+                        shared.observations.lock().unwrap().accept(*state, &settings.preferences.overlays,
+                            (shared.source)().map(|f|f.session), now_ms() as i64, std::time::Instant::now());
+                    }
+                    ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {media_limit = Some(crate::protocol::timelapse_limit(max_timelapse_bytes));}
+                    ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
                         let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
                         if accepted {
                             rules = proposed;
@@ -335,16 +405,23 @@ async fn session(
                         }
                         send(&mut socket, serde_json::json!({"type":"trigger_configuration_result","request_id":request_id,"accepted":accepted}).to_string()).await?;
                     }
-                    ServerMessage::TelescopeEvent { event, expires_at } if version == crate::protocol::TRIGGER_PROTOCOL_VERSION => {
+                    ServerMessage::TelescopeEvent { event, expires_at, context } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
+                        if version >= crate::protocol::CONTEXT_PROTOCOL_VERSION
+                            && context.is_some() != settings.preferences.observation_context {return Ok(false);}
                         let now_seconds = (now_ms() / 1000) as i64;
                         if rules.telescope_events && expires_at > now_seconds && expires_at <= now_seconds + 90
+                            && context.as_ref().is_none_or(|context| context.fresh_at(now_ms() as i64, expires_at))
                             && let Some(frame) = (shared.source)() {
-                            scheduler.telescope_trigger(&event, &frame, Instant::now(), now_ms());
+                            if context.is_some() && settings.preferences.observation_context {
+                                scheduler.telescope_trigger_with_context(&event, context, &frame, Instant::now(), now_ms());
+                            } else {
+                                scheduler.telescope_trigger(&event, &frame, Instant::now(), now_ms());
+                            }
                         }
                     }
                     ServerMessage::SnapshotRequest { ref request_id, .. } => {
                         let frame = (shared.source)();
-                        if request.is_some() || outbox.is_some() {
+                        if request.is_some() || outbox.is_some() || video_upload.is_some() {
                             send(&mut socket, serde_json::to_string(&ClientMessage::SnapshotUnavailable { request_id })?).await?;
                         } else {
                             match SnapshotFence::new(&incoming, state(shared, settings, frame.as_ref()), now_ms(), Instant::now()) {
@@ -380,6 +457,28 @@ async fn session(
                 }
             }
             _ = ticks.tick() => {
+                shared.observations.lock().unwrap().session((shared.source)().map(|f| f.session));
+                {
+                    let mut pending = shared.pending_timelapse.lock().unwrap();
+                    if pending.as_ref().is_some_and(|item| item.epoch != epoch
+                        || item.queued_at.elapsed() > Duration::from_secs(900)
+                        || (shared.source)().is_none_or(|frame| frame.session != item.session)) {
+                        *pending = None;
+                    }
+                }
+                if video_upload.is_none() && let Some(limit) = media_limit {
+                    let item = shared.pending_timelapse.lock().unwrap().take();
+                    if let Some(item) = item.filter(|item| item.epoch == epoch
+                        && item.queued_at.elapsed() <= Duration::from_secs(900)
+                        && (shared.source)().is_some_and(|frame| frame.session == item.session)) {
+                        if item.movie.len > limit {
+                            status(shared, "Connected; timelapse exceeds negotiated upload limit; local movie unchanged");
+                        } else {
+                            video_upload = Some(Box::pin(upload_timelapse(shared, settings, origin, credential, item)));
+                            status(shared, "Connected; uploading timelapse (automatic images coalesced)");
+                        }
+                    }
+                }
                 if last_rx.elapsed() > Duration::from_secs(100) { bail!("Hub idle"); }
                 let frame = (shared.source)();
                 if outbox.as_ref().is_some_and(|item| !item.fresh(frame.as_ref())) { *outbox = None; }
@@ -415,7 +514,7 @@ async fn session(
                 } else if frame.is_none() { *detector = Detector::default(); last_sequence = 0; }
                 let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms(), periodic);
                 if let Some((kind, summary)) = due && let Some(f) = frame.as_ref()
-                    && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
+                    && video_upload.is_none() && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
                     let encoded_frame = f.clone();
                     if let Ok(jpeg) = tokio::task::spawn_blocking(move || media::jpeg(&encoded_frame, MAX_JPEG_BYTES)).await? {
                         *outbox = Some(event(f, kind, &summary, None, jpeg)?);
@@ -427,6 +526,10 @@ async fn session(
                 if shared.stopped.load(Ordering::Acquire) || *shared.changes.borrow() != epoch {
                     bail!("Local sharing permission changed");
                 }
+                // Let a daily movie acquire the shared Hub cooldown instead of
+                // starving behind a one-minute periodic image schedule. Socket
+                // receive/heartbeat/consent work continues normally.
+                if video_upload.is_some() {continue;}
                 let pending = if snapshot_outbox.is_some() { &mut snapshot_outbox } else { &mut *outbox };
                 if let Some(item) = pending.as_mut() {
                     if !item.fresh(current.as_ref()) { *pending = None; continue; }
@@ -458,6 +561,81 @@ async fn source_invalidated(shared: &Shared, session: u64) {
         }
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+pub(crate) async fn upload_timelapse(
+    shared: &Shared,
+    settings: &Settings,
+    origin: &HubOrigin,
+    credential: &Secret,
+    item: crate::service::QueuedTimelapse,
+) -> Result<&'static str> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(Duration::from_secs(185))
+        .build()
+        .map_err(|_| anyhow::anyhow!("Could not initialize timelapse sharing"))?;
+    let captured_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(item.captured_at_unix_ms) * 1_000_000,
+    )?
+    .format(&time::format_description::well_known::Rfc3339)?;
+    let mut retry_delay = Duration::from_secs(60);
+    for attempt in 0..3 {
+        if shared.stopped.load(Ordering::Acquire)
+            || *shared.changes.borrow() != item.epoch
+            || !settings.preferences.enabled
+            || !settings.preferences.timelapses
+            || (shared.source)().is_none_or(|frame| frame.session != item.session)
+            || item.queued_at.elapsed() > Duration::from_secs(900)
+        {
+            return Ok("expired");
+        }
+        let status = tokio::select! {
+            biased;
+            _ = source_invalidated(shared, item.session) => return Ok("expired"),
+            result = async {
+                let response = client.post(origin.timelapse_url()).bearer_auth(credential.expose_for_transport())
+                    .header("content-type", "video/mp4").header("x-installation-id", &settings.installation_id)
+                    .header("x-event-id", &item.id).header("x-captured-at", &captured_at)
+                    .header("content-length", item.movie.len)
+                    .body(reqwest::Body::wrap_stream(item.movie.stream())).send().await;
+                let Ok(mut response) = response else {return "retry";};
+                retry_delay = response.headers().get("retry-after").and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|seconds| Duration::from_secs_f64(seconds.clamp(60.0,3600.0))).unwrap_or(Duration::from_secs(60));
+                if matches!(response.status().as_u16(), 429 | 502 | 503 | 504) {return "retry";}
+                if matches!(response.status().as_u16(), 400 | 413 | 415 | 422) {return "media_rejected";}
+                if !response.status().is_success() {return "rejected";}
+                let mut bytes = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if bytes.len()+chunk.len()>4096 {return "rejected";}
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(_) => return "retry",
+                    }
+                }
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {return "rejected";};
+                if let Some(seconds) = value["retry_after_seconds"].as_u64() {retry_delay = retry_delay.max(Duration::from_secs(seconds.clamp(60,3600)));}
+                match value["status"].as_str() {
+                    Some("delivered") => "delivered", Some("retry" | "rate_limited") => "retry",
+                    Some("elided") => "elided", Some("no_destinations") => "no_destinations",
+                    Some("media_rejected") => "media_rejected", _ => "rejected",
+                }
+            } => result,
+        };
+        if status != "retry" {
+            return Ok(status);
+        }
+        if attempt < 2 {
+            let remaining = Duration::from_secs(900).saturating_sub(item.queued_at.elapsed());
+            tokio::select! {biased; _ = source_invalidated(shared, item.session) => return Ok("expired"), _ = sleep(retry_delay.min(remaining)) => {}}
+        }
+    }
+    Ok("retry_exhausted")
 }
 
 fn event(

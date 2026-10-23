@@ -4,6 +4,67 @@ using Xunit;
 public sealed class SharingSetupTests
 {
     [Fact]
+    public void OverlaysAreIndependentAndOldAgentsReceiveNoNewFields()
+    {
+        Assert.DoesNotContain("overlays", System.Text.Json.JsonSerializer.Serialize(new SharingPreferences()));
+        var baseline = Status with { Preferences = new() { HubOrigin = "https://hub.example.test" } };
+        var setup = new SharingSetupState(baseline);
+        var options = SharingOverlayOptions.Parse("17", true, true, "external");
+        setup.Draft = setup.Draft with { Overlays = options };
+        setup.Refresh(baseline with { Connection = "Connected" });
+        Assert.True(setup.IsDirty);
+        var saved = setup.ForSave();
+        Assert.Equal(options, saved.Overlays);
+        Assert.False(saved.Timelapses);
+        Assert.False(saved.Snapshots);
+        Assert.False(saved.TelescopeEvents);
+        Assert.False(saved.ObservationContext);
+        var wire = System.Text.Json.JsonSerializer.Serialize(saved);
+        Assert.Contains("\"temperature\":\"external\"",wire);
+        Assert.Equal(saved, System.Text.Json.JsonSerializer.Deserialize<SharingPreferences>(wire));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("-1")]
+    [InlineData("17.5")]
+    [InlineData("9007199254740992")]
+    public void OverlaySelectionRejectsAmbiguousOrInvalidTelescopeIds(string text)
+    {
+        Assert.Throws<InvalidOperationException>(() => SharingOverlayOptions.Parse(text,true,true,"focuser"));
+        Assert.Null(SharingOverlayOptions.Parse("",false,false,"off").TelescopeId);
+    }
+
+    [Fact]
+    public void TimelapsesAreAnIndependentLocalOptIn()
+    {
+        var legacy = System.Text.Json.JsonSerializer.Deserialize<SharingPreferences>("{}")!;
+        Assert.False(legacy.Timelapses);
+        var setup = new SharingSetupState(Status with { Preferences = new() { HubOrigin = "https://hub.example.test" } });
+        setup.Draft = setup.Draft with { Timelapses = true };
+        var saved = setup.ForSave();
+        Assert.True(saved.Timelapses);
+        Assert.False(saved.Snapshots);
+        Assert.False(saved.TelescopeEvents);
+        Assert.False(saved.ObservationContext);
+    }
+    [Fact]
+    public void ObservationContextIsLocalOptInAndSurvivesDraftRefresh()
+    {
+        var legacy = System.Text.Json.JsonSerializer.Deserialize<SharingPreferences>("{\"telescope_events\":true}")!;
+        Assert.False(legacy.ObservationContext);
+        var setup = new SharingSetupState(Status);
+        setup.Draft = setup.Draft with { ObservationContext = true };
+        setup.Refresh(Status with { Connection = "Connected" });
+        Assert.True(setup.IsDirty);
+        Assert.True(setup.ForSave().ObservationContext);
+        Assert.False(setup.ForSave().TelescopeEvents);
+        Assert.False(setup.HasChatOverrides);
+        var wire = System.Text.Json.JsonSerializer.Serialize(setup.ForSave());
+        Assert.Contains("\"observation_context\":true", wire);
+    }
+
+    [Fact]
     public void IntervalEditPreservesThresholdAndOtherCollapsedNumericFields()
     {
         var setup = new SharingSetupState(Status);

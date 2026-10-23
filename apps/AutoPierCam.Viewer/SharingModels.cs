@@ -12,9 +12,38 @@ internal sealed record SharingPreferences
     [JsonPropertyName("scene_threshold_percent")] public byte SceneThresholdPercent { get; init; } = 20;
     [JsonPropertyName("interval_minutes")] public ushort IntervalMinutes { get; init; }
     [JsonPropertyName("telescope_events")] public bool TelescopeEvents { get; init; }
+    [JsonPropertyName("observation_context")] public bool ObservationContext { get; init; }
+    [JsonPropertyName("timelapses")] public bool Timelapses { get; init; }
+    [JsonPropertyName("overlays"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SharingOverlayOptions? Overlays { get; init; }
     [JsonPropertyName("chat_configuration")] public bool ChatConfiguration { get; init; }
     [JsonPropertyName("burst_count")] public byte BurstCount { get; init; } = 1;
     [JsonPropertyName("spacing_seconds")] public ushort SpacingSeconds { get; init; } = 60;
+}
+
+internal sealed record SharingOverlayOptions
+{
+    [JsonPropertyName("telescope_id")] public long? TelescopeId { get; init; }
+    [JsonPropertyName("target")] public bool Target { get; init; }
+    [JsonPropertyName("exposure_count")] public bool ExposureCount { get; init; }
+    [JsonPropertyName("temperature")] public string Temperature { get; init; } = "off";
+
+    public static SharingOverlayOptions Parse(string telescopeId, bool target, bool count, string temperature)
+    {
+        long? id = null;
+        if (!string.IsNullOrWhiteSpace(telescopeId))
+        {
+            if (!long.TryParse(telescopeId.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out long value) || value <= 0 || value > 9007199254740991)
+                throw new InvalidOperationException("Enter the positive telescope record ID shown in the Hub.");
+            id = value;
+        }
+        if (temperature is not ("off" or "focuser" or "external"))
+            throw new InvalidOperationException("Choose a temperature source.");
+        if ((target || count || temperature != "off") && id is null)
+            throw new InvalidOperationException("Choose a Hub telescope ID before enabling overlays.");
+        return new() { TelescopeId = id, Target = target, ExposureCount = count, Temperature = temperature };
+    }
 }
 
 internal sealed record SharingTriggerRules
