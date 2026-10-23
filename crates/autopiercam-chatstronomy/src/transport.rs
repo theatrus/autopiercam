@@ -380,7 +380,7 @@ async fn session(
                     }
                     ServerMessage::SnapshotRequest { ref request_id, .. } => {
                         let frame = (shared.source)();
-                        if request.is_some() || outbox.is_some() {
+                        if request.is_some() || outbox.is_some() || video_upload.is_some() {
                             send(&mut socket, serde_json::to_string(&ClientMessage::SnapshotUnavailable { request_id })?).await?;
                         } else {
                             match SnapshotFence::new(&incoming, state(shared, settings, frame.as_ref()), now_ms(), Instant::now()) {
@@ -422,6 +422,7 @@ async fn session(
                         && item.queued_at.elapsed() <= Duration::from_secs(900) && item.bytes.len() <= limit
                         && (shared.source)().is_some_and(|frame| frame.session == item.session)) {
                         video_upload = Some(Box::pin(upload_timelapse(shared, settings, origin, credential, item)));
+                        status(shared, "Connected; uploading timelapse (automatic images coalesced)");
                     }
                 }
                 if last_rx.elapsed() > Duration::from_secs(100) { bail!("Hub idle"); }
@@ -459,7 +460,7 @@ async fn session(
                 } else if frame.is_none() { *detector = Detector::default(); last_sequence = 0; }
                 let due = scheduler.due(frame.as_ref(), Instant::now(), now_ms(), periodic);
                 if let Some((kind, summary)) = due && let Some(f) = frame.as_ref()
-                    && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
+                    && video_upload.is_none() && outbox.is_none() && request.is_none() && last_new_event.elapsed() >= Duration::from_secs(60) {
                     let encoded_frame = f.clone();
                     if let Ok(jpeg) = tokio::task::spawn_blocking(move || media::jpeg(&encoded_frame, MAX_JPEG_BYTES)).await? {
                         *outbox = Some(event(f, kind, &summary, None, jpeg)?);
@@ -471,6 +472,10 @@ async fn session(
                 if shared.stopped.load(Ordering::Acquire) || *shared.changes.borrow() != epoch {
                     bail!("Local sharing permission changed");
                 }
+                // Let a daily movie acquire the shared Hub cooldown instead of
+                // starving behind a one-minute periodic image schedule. Socket
+                // receive/heartbeat/consent work continues normally.
+                if video_upload.is_some() {continue;}
                 let pending = if snapshot_outbox.is_some() { &mut snapshot_outbox } else { &mut *outbox };
                 if let Some(item) = pending.as_mut() {
                     if !item.fresh(current.as_ref()) { *pending = None; continue; }

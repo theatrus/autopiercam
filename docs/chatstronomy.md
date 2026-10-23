@@ -162,6 +162,9 @@ directory scan or upload backlog after restart. Pause, capture-session changes,
 forgetting, disabling sharing, or changing settings cancels pending work.
 Already accepted Discord posts cannot be recalled. Uploads are best-effort; a
 failed upload never changes or deletes the local movie or interrupts acquisition.
+Automatic image posts coalesce while a movie is pending so a one-minute image
+schedule cannot starve it behind the shared cooldown; snapshot requests report
+unavailable during that upload. Heartbeats and permission changes remain live.
 A daily clip can contain saved stills recorded earlier that day, before sharing
 was enabled. Review the recording/privacy settings before opting in.
 
