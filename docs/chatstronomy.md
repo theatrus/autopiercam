@@ -198,6 +198,47 @@ operator-visible protocol error against an older Hub, rather than silently
 ignoring the configuration. Neither these sources nor their installers are
 deployed automatically.
 
+## Daily timelapse overlays
+
+In **Settings → Chatstronomy → Daily timelapse overlays**, enter the exact Hub
+telescope record ID (not the pier-camera device ID), then choose target name,
+completed exposure count, and/or **Focuser** or **External / observatory**
+temperature. All labels default off. Enable daily timelapse recording in Imaging
+and pairing/master sharing in Chatstronomy; movie uploads, image posts and
+telescope-event triggers remain separate opt-ins.
+
+Overlays require the Hub's [v4 observation-state feed](https://github.com/theatrus/chatstronomy/blob/theatrus/pier-camera-observation-context/docs/OBSERVATION_STATE_PROTOCOL.md)
+and the N.I.N.A. plugin's **Share observation state for pier-camera overlays**
+permission. Target labels also require Target Scheduler consent; counts require
+Target Scheduler, Images and Sequence; temperatures require the corresponding
+focuser or weather category. The telescope must share the camera's owner and a
+guild/channel route. An older Hub reports an update requirement; turning all
+overlay choices off restores the existing v1/v2/v3 negotiation. Pairing and v3
+media messages are unchanged. Older agents do not receive the new settings field.
+
+Counts are confirmed, successfully saved LIGHT imaging exposures within one
+target visit, not pier-camera samples, planned exposures or reconstructed history.
+A missing target, unobserved visit start or privacy gap leaves the count unknown.
+Temperature labels name the chosen sensor; neither the other sensor nor camera
+cooler temperature is used as a fallback. Unknown or expired fields are omitted.
+
+Each saved frame receives a copy of the latest selected-telescope state already
+received at or before its host capture timestamp. Later target/count updates
+cannot relabel it. Snapshot validity is at most 30 seconds; sensor measurements
+have their own expiry, at most two minutes. These are host/source timestamps,
+not a guarantee that a long exposure depicts one instantaneous telescope state.
+Only 128 snapshots of the explicitly selected telescope are retained in memory.
+Epoch changes, disconnect, pause, capture-session changes and consent changes
+clear retained associations. Baselines and count changes never trigger images.
+
+Windows renders up to two lines of white Unicode text over a darkened bottom
+strip of the private 720p timelapse JPEG. Long text is ellipsized. Original
+full-resolution stills, preview/security videos and existing MP4s are unchanged.
+Labels already burned into saved samples remain through restart and cannot be
+removed by disabling a toggle later. Future samples use the new choices; the
+daily clip may therefore contain both labeled and unlabeled frames. Existing
+sample, retention and upload limits still apply after rendering.
+
 ## Runtime and persistence
 
 The tray owns one dedicated network worker, independent of capture and the

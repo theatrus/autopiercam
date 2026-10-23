@@ -4,6 +4,7 @@ use std::fmt;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const TRIGGER_PROTOCOL_VERSION: u32 = 2;
 pub const CONTEXT_PROTOCOL_VERSION: u32 = 3;
+pub const OBSERVATION_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_WIRE_BYTES: usize = 720 * 1024;
 pub const MAX_JPEG_BYTES: usize = 512 * 1024;
 /// Independent client disk/network safety ceiling, not a Hub protocol limit.
@@ -41,67 +42,72 @@ impl TelescopeContext {
     /// Only UTC RFC3339 is admitted. Build validated time components without
     /// enabling a new parser/dependency in the capture agent.
     fn occurred_at_milliseconds(&self) -> Option<i64> {
-        let value = self
-            .occurred_at
-            .strip_suffix('Z')
-            .or_else(|| self.occurred_at.strip_suffix("+00:00"))?;
-        if !value.is_ascii() || !(19..=29).contains(&value.len()) {
-            return None;
-        }
-        let (date, clock) = value.split_once('T')?;
-        if date.len() != 10
-            || &date[4..5] != "-"
-            || &date[7..8] != "-"
-            || clock.len() < 8
-            || &clock[2..3] != ":"
-            || &clock[5..6] != ":"
-        {
-            return None;
-        }
-        let digits = |v: &str| v.bytes().all(|b| b.is_ascii_digit());
-        if ![
-            &date[..4],
-            &date[5..7],
-            &date[8..],
-            &clock[..2],
-            &clock[3..5],
-            &clock[6..8],
-        ]
-        .into_iter()
-        .all(digits)
-        {
-            return None;
-        }
-        let nanos = if clock.len() > 8 {
-            let fraction = clock.strip_prefix(&clock[..8])?.strip_prefix('.')?;
-            if fraction.is_empty() || fraction.len() > 9 || !digits(fraction) {
-                return None;
-            }
-            fraction.parse::<u32>().ok()? * 10_u32.pow(9 - fraction.len() as u32)
-        } else {
-            0
-        };
-        let date = time::Date::from_calendar_date(
-            date[..4].parse().ok()?,
-            time::Month::try_from(date[5..7].parse::<u8>().ok()?).ok()?,
-            date[8..].parse().ok()?,
-        )
-        .ok()?;
-        let clock = time::Time::from_hms_nano(
-            clock[..2].parse().ok()?,
-            clock[3..5].parse().ok()?,
-            clock[6..8].parse().ok()?,
-            nanos,
-        )
-        .ok()?;
-        (time::PrimitiveDateTime::new(date, clock)
-            .assume_utc()
-            .unix_timestamp_nanos()
-            / 1_000_000)
-            .try_into()
-            .ok()
+        utc_milliseconds(&self.occurred_at)
     }
+}
 
+pub(crate) fn utc_milliseconds(value: &str) -> Option<i64> {
+    let value = value
+        .strip_suffix('Z')
+        .or_else(|| value.strip_suffix("+00:00"))?;
+    if !value.is_ascii() || !(19..=29).contains(&value.len()) {
+        return None;
+    }
+    let (date, clock) = value.split_once('T')?;
+    if date.len() != 10
+        || &date[4..5] != "-"
+        || &date[7..8] != "-"
+        || clock.len() < 8
+        || &clock[2..3] != ":"
+        || &clock[5..6] != ":"
+    {
+        return None;
+    }
+    let digits = |v: &str| v.bytes().all(|b| b.is_ascii_digit());
+    if ![
+        &date[..4],
+        &date[5..7],
+        &date[8..],
+        &clock[..2],
+        &clock[3..5],
+        &clock[6..8],
+    ]
+    .into_iter()
+    .all(digits)
+    {
+        return None;
+    }
+    let nanos = if clock.len() > 8 {
+        let fraction = clock.strip_prefix(&clock[..8])?.strip_prefix('.')?;
+        if fraction.is_empty() || fraction.len() > 9 || !digits(fraction) {
+            return None;
+        }
+        fraction.parse::<u32>().ok()? * 10_u32.pow(9 - fraction.len() as u32)
+    } else {
+        0
+    };
+    let date = time::Date::from_calendar_date(
+        date[..4].parse().ok()?,
+        time::Month::try_from(date[5..7].parse::<u8>().ok()?).ok()?,
+        date[8..].parse().ok()?,
+    )
+    .ok()?;
+    let clock = time::Time::from_hms_nano(
+        clock[..2].parse().ok()?,
+        clock[3..5].parse().ok()?,
+        clock[6..8].parse().ok()?,
+        nanos,
+    )
+    .ok()?;
+    (time::PrimitiveDateTime::new(date, clock)
+        .assume_utc()
+        .unix_timestamp_nanos()
+        / 1_000_000)
+        .try_into()
+        .ok()
+}
+
+impl TelescopeContext {
     pub(crate) fn fresh_at(&self, now_ms: i64, expires_at: i64) -> bool {
         self.occurred_at_milliseconds().is_some_and(|occurred| {
             (0..=30_000).contains(&now_ms.saturating_sub(occurred))
@@ -182,9 +188,15 @@ pub enum ClientMessage<'a> {
     },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerMessage {
+    ObservationReady {
+        telemetry: bool,
+        interval_seconds: u64,
+        max_age_seconds: u64,
+    },
+    ObservationState(Box<crate::observation::ObservationState>),
     MediaReady {
         max_timelapse_bytes: u64,
     },
@@ -231,6 +243,12 @@ impl ServerMessage {
         }
         let message: Self = serde_json::from_slice(bytes).map_err(|_| InvalidMessage)?;
         match &message {
+            Self::ObservationReady {
+                interval_seconds,
+                max_age_seconds,
+                ..
+            } if *interval_seconds != 5 || *max_age_seconds != 30 => return Err(InvalidMessage),
+            Self::ObservationState(state) if !state.valid() => return Err(InvalidMessage),
             Self::MediaReady {
                 max_timelapse_bytes,
             } if *max_timelapse_bytes == 0 => {
@@ -243,6 +261,7 @@ impl ServerMessage {
                 PROTOCOL_VERSION,
                 TRIGGER_PROTOCOL_VERSION,
                 CONTEXT_PROTOCOL_VERSION,
+                OBSERVATION_PROTOCOL_VERSION,
             ]
             .contains(protocol_version)
                 || *device_id <= 0 =>
@@ -275,11 +294,18 @@ impl ServerMessage {
     /// Context is negotiated, not an additive field sent to strict v2 peers.
     pub(crate) fn parse_for_version(bytes: &[u8], version: u32) -> Result<Self, InvalidMessage> {
         let message = Self::parse(bytes)?;
-        if matches!(&message, Self::MediaReady { .. }) && version != CONTEXT_PROTOCOL_VERSION {
+        if matches!(
+            &message,
+            Self::ObservationReady { .. } | Self::ObservationState(_)
+        ) && version != OBSERVATION_PROTOCOL_VERSION
+        {
+            return Err(InvalidMessage);
+        }
+        if matches!(&message, Self::MediaReady { .. }) && version < CONTEXT_PROTOCOL_VERSION {
             return Err(InvalidMessage);
         }
         if let Self::TelescopeEvent { event, context, .. } = &message
-            && ((version != CONTEXT_PROTOCOL_VERSION && context.is_some())
+            && ((version < CONTEXT_PROTOCOL_VERSION && context.is_some())
                 || (context.is_none()
                     && !matches!(
                         event.as_str(),
@@ -291,7 +317,7 @@ impl ServerMessage {
         {
             return Err(InvalidMessage);
         }
-        if matches!(&message, Self::TelescopeEvent { .. }) && version != CONTEXT_PROTOCOL_VERSION {
+        if matches!(&message, Self::TelescopeEvent { .. }) && version < CONTEXT_PROTOCOL_VERSION {
             let value: serde_json::Value =
                 serde_json::from_slice(bytes).map_err(|_| InvalidMessage)?;
             if value.get("context").is_some() {
@@ -421,7 +447,7 @@ mod tests {
     fn rejects_unknown_commands_fields_versions_and_oversized_input() {
         for message in [
             r#"{"type":"capture_resume"}"#,
-            r#"{"type":"ready","protocol_version":4,"device_id":42}"#,
+            r#"{"type":"ready","protocol_version":5,"device_id":42}"#,
             r#"{"type":"ready","protocol_version":1,"device_id":42,"channel_id":"1"}"#,
             r#"{"type":"snapshot_request","request_id":"not-uuid","expires_at":1,"max_jpeg_bytes":1,"max_frame_age_seconds":120}"#,
             r#"{"type":"ready","protocol_version":1,"device_id":0}"#,

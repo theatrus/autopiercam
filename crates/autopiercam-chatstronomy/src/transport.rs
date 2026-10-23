@@ -194,7 +194,11 @@ pub(crate) async fn run(shared: Arc<Shared>) {
         {
             status(
                 &shared,
-                "Hub rejected authentication/protocol; pair again or update",
+                if settings.preferences.overlays.requested() {
+                    "Hub v4 observation protocol required; update Hub or turn overlays off"
+                } else {
+                    "Hub rejected authentication/protocol; pair again or update"
+                },
             );
             outbox = None;
             let _ = changes.changed().await;
@@ -255,6 +259,7 @@ async fn session(
     struct MovieSession<'a>(&'a Shared);
     impl Drop for MovieSession<'_> {
         fn drop(&mut self) {
+            self.0.observations.lock().unwrap().clear();
             self.0.cancel_timelapses();
         }
     }
@@ -264,7 +269,9 @@ async fn session(
         last_new_event,
         periodic,
     } = observations;
-    let version = if settings.preferences.timelapses
+    let version = if settings.preferences.overlays.requested() {
+        crate::protocol::OBSERVATION_PROTOCOL_VERSION
+    } else if settings.preferences.timelapses
         || (settings.preferences.observation_context && settings.preferences.telescope_events)
     {
         crate::protocol::CONTEXT_PROTOCOL_VERSION
@@ -304,13 +311,21 @@ async fn session(
             device_id,
             protocol_version,
         } if Some(device_id) == settings.device_id && protocol_version == version => {}
-        ServerMessage::Error { code } => return Ok(!requires_operator_action(&code)),
+        ServerMessage::Error { code } => {
+            if settings.preferences.overlays.requested() {
+                status(
+                    shared,
+                    "Hub v4 required for overlays; update Hub or turn overlays off",
+                );
+            }
+            return Ok(!requires_operator_action(&code));
+        }
         _ => return Ok(false),
     }
     status(shared, "Connected");
     if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION {
         let mut capabilities = serde_json::json!({"type":"trigger_capabilities", "chat_configuration":settings.preferences.chat_configuration, "telescope_events":settings.preferences.telescope_events});
-        if version == crate::protocol::CONTEXT_PROTOCOL_VERSION {
+        if version >= crate::protocol::CONTEXT_PROTOCOL_VERSION {
             capabilities["observation_context"] = settings.preferences.observation_context.into();
         }
         send(&mut socket, capabilities.to_string()).await?;
@@ -323,6 +338,14 @@ async fn session(
         .await?;
     }
     let mut media_limit = None;
+    let mut telemetry_ready = false;
+    if settings.preferences.overlays.requested() {
+        send(
+            &mut socket,
+            serde_json::json!({"type":"observation_capabilities","telemetry":true}).to_string(),
+        )
+        .await?;
+    }
     let mut video_upload: Option<VideoUpload<'_>> = None;
     let mut rules = settings.rules();
     periodic.configure(rules.interval_minutes, now_ms());
@@ -357,6 +380,15 @@ async fn session(
                     _ => bail!("Hub disconnected"),
                 };
                 match incoming {
+                    ServerMessage::ObservationReady { telemetry, .. } if settings.preferences.overlays.requested() => {
+                        telemetry_ready = telemetry;
+                        shared.observations.lock().unwrap().clear();
+                        if !telemetry { status(shared, "Connected; Hub observation telemetry unavailable"); }
+                    }
+                    ServerMessage::ObservationState(state) if telemetry_ready && settings.preferences.overlays.requested() => {
+                        shared.observations.lock().unwrap().accept(*state, &settings.preferences.overlays,
+                            (shared.source)().map(|f|f.session), now_ms() as i64, std::time::Instant::now());
+                    }
                     ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {media_limit = Some(crate::protocol::timelapse_limit(max_timelapse_bytes));}
                     ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
                         let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
@@ -374,7 +406,7 @@ async fn session(
                         send(&mut socket, serde_json::json!({"type":"trigger_configuration_result","request_id":request_id,"accepted":accepted}).to_string()).await?;
                     }
                     ServerMessage::TelescopeEvent { event, expires_at, context } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
-                        if version == crate::protocol::CONTEXT_PROTOCOL_VERSION
+                        if version >= crate::protocol::CONTEXT_PROTOCOL_VERSION
                             && context.is_some() != settings.preferences.observation_context {return Ok(false);}
                         let now_seconds = (now_ms() / 1000) as i64;
                         if rules.telescope_events && expires_at > now_seconds && expires_at <= now_seconds + 90
@@ -425,6 +457,7 @@ async fn session(
                 }
             }
             _ = ticks.tick() => {
+                shared.observations.lock().unwrap().session((shared.source)().map(|f| f.session));
                 {
                     let mut pending = shared.pending_timelapse.lock().unwrap();
                     if pending.as_ref().is_some_and(|item| item.epoch != epoch

@@ -34,8 +34,11 @@ public sealed partial class MainWindow
             box.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => SharingChanged());
         }
         SharingOriginTextBox.TextChanged += (_, _) => SharingChanged();
+        SharingOverlayTelescopeTextBox.TextChanged += (_, _) => SharingChanged();
+        SharingOverlayTemperatureComboBox.SelectionChanged += (_, _) => SharingChanged();
         foreach (ToggleSwitch toggle in new[] { SharingEnabledToggle, SharingSnapshotsToggle, SharingScenesToggle,
-            SharingDayNightToggle, SharingTelescopeToggle, SharingContextToggle, SharingTimelapsesToggle, SharingChatToggle })
+            SharingDayNightToggle, SharingTelescopeToggle, SharingContextToggle, SharingTimelapsesToggle, SharingChatToggle,
+            SharingOverlayTargetToggle, SharingOverlayCountToggle })
             toggle.Toggled += (_, _) => SharingChanged();
         SharingCodePasswordBox.PasswordChanged += (_, _) => RenderSharing();
         _sharingInitialized = true;
@@ -86,6 +89,9 @@ public sealed partial class MainWindow
         TelescopeEvents = SharingTelescopeToggle.IsOn,
         ObservationContext = SharingContextToggle.IsOn,
         Timelapses = SharingTimelapsesToggle.IsOn,
+        Overlays = _latestAgentStatus?.HasCapability("sharing.observation_overlays") == true
+            ? SharingOverlayOptions.Parse(SharingOverlayTelescopeTextBox.Text, SharingOverlayTargetToggle.IsOn,
+                SharingOverlayCountToggle.IsOn, SharingOverlayTemperatureComboBox.SelectedIndex switch { 1 => "focuser", 2 => "external", _ => "off" }) : null,
         ChatConfiguration = SharingChatToggle.IsOn,
         BurstCount = checked((byte)SharingNumber(SharingBurstNumberBox, 1, 3, "Images per event")),
         SpacingSeconds = SharingNumber(SharingSpacingNumberBox, 60, 600, "Time between images"),
@@ -106,6 +112,10 @@ public sealed partial class MainWindow
         SharingTelescopeToggle.IsOn = p.TelescopeEvents;
         SharingContextToggle.IsOn = p.ObservationContext;
         SharingTimelapsesToggle.IsOn = p.Timelapses;
+        SharingOverlayTelescopeTextBox.Text = p.Overlays?.TelescopeId?.ToString(CultureInfo.InvariantCulture) ?? "";
+        SharingOverlayTargetToggle.IsOn = p.Overlays?.Target == true;
+        SharingOverlayCountToggle.IsOn = p.Overlays?.ExposureCount == true;
+        SharingOverlayTemperatureComboBox.SelectedIndex = p.Overlays?.Temperature switch { "focuser" => 1, "external" => 2, _ => 0 };
         SharingBurstNumberBox.Value = p.BurstCount;
         SharingSpacingNumberBox.Value = p.SpacingSeconds;
         SharingChatToggle.IsOn = p.ChatConfiguration;
@@ -133,6 +143,9 @@ public sealed partial class MainWindow
         bool paired = _sharing?.Status.DeviceId is not null;
         bool idle = !_sharingBusy && !_operationInProgress && !_savingAll && supported && loaded;
         bool review = _sharing?.NeedsReview == true;
+        foreach (Control control in new Control[] { SharingOverlayTelescopeTextBox, SharingOverlayTargetToggle,
+            SharingOverlayCountToggle, SharingOverlayTemperatureComboBox })
+            control.IsEnabled = idle && _latestAgentStatus?.HasCapability("sharing.observation_overlays") == true;
 
         SharingPairingGroup.Visibility = paired ? Visibility.Collapsed : Visibility.Visible;
         foreach (Control control in new Control[] { SharingOriginTextBox, SharingCodePasswordBox, SharingSnapshotsToggle,

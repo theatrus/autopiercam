@@ -39,6 +39,7 @@ pub mod native_video;
 mod preview;
 mod retention;
 mod timelapse;
+mod timelapse_overlay;
 mod upload;
 mod video;
 
@@ -440,6 +441,7 @@ impl AgentMonitor {
             CAPABILITY_STORAGE_RETENTION.to_owned(),
             CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
             "sharing.get".to_owned(),
+            "sharing.observation_overlays".to_owned(),
             "cameras.list".to_owned(),
             "camera.adaptive_exposure".to_owned(),
             "camera.gain_range".to_owned(),
@@ -874,6 +876,7 @@ pub fn snapshot(
 
 #[derive(Debug)]
 struct CaptureJob {
+    overlay: Option<autopiercam_chatstronomy::observation::Overlay>,
     sequence: u64,
     width: u32,
     height: u32,
@@ -1921,6 +1924,16 @@ fn capture_loop(
                 output.set_extension("png");
             }
             let job = CaptureJob {
+                overlay: if config.video.daily_timelapse {
+                    monitor
+                        .timelapse_sharing
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|sink| sink.overlay_for(frame.captured_at_unix_ms))
+                } else {
+                    None
+                },
                 sequence: state.queued,
                 width: meta.width,
                 height: meta.height,
@@ -2219,7 +2232,7 @@ fn writer_loop(
                 ColorType::Rgb16,
             )?;
             if let Some(sink) = timelapse {
-                sink.record(&job.output, || {
+                sink.record(&job.output, job.overlay.as_ref(), || {
                     let source = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(
                         job.width,
                         job.height,
@@ -2240,7 +2253,7 @@ fn writer_loop(
                 .with_context(|| format!("debayering frame {}", job.sequence))?;
             save_rgb(&job.output, job.width, job.height, &rgb, job.jpeg_quality)?;
             if let Some(sink) = timelapse {
-                sink.record(&job.output, || {
+                sink.record(&job.output, job.overlay.as_ref(), || {
                     let source = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
                         job.width,
                         job.height,
@@ -3403,6 +3416,7 @@ mod tests {
                 CAPABILITY_STORAGE_RETENTION.to_owned(),
                 CAPABILITY_EXPOSURE_PROGRESS.to_owned(),
                 "sharing.get".to_owned(),
+                "sharing.observation_overlays".to_owned(),
                 "cameras.list".to_owned(),
                 "camera.adaptive_exposure".to_owned(),
                 "camera.gain_range".to_owned(),

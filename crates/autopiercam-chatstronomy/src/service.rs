@@ -50,6 +50,7 @@ pub struct Preferences {
     pub observation_context: bool,
     /// Upload newly finalized daily MP4s. Independent of image and trigger consent.
     pub timelapses: bool,
+    pub overlays: crate::observation::OverlayOptions,
     pub chat_configuration: bool,
     pub burst_count: u8,
     pub spacing_seconds: u16,
@@ -67,6 +68,7 @@ impl Default for Preferences {
             telescope_events: false,
             observation_context: false,
             timelapses: false,
+            overlays: Default::default(),
             chat_configuration: false,
             burst_count: 1,
             spacing_seconds: 60,
@@ -75,6 +77,9 @@ impl Default for Preferences {
 }
 impl Preferences {
     pub(crate) fn validate(&mut self, policy: TransportPolicy) -> Result<()> {
+        if !self.overlays.valid() {
+            bail!("Choose a positive Hub telescope ID for timelapse overlays");
+        }
         if self.interval_minutes > 1440
             || !(1..=3).contains(&self.burst_count)
             || !(60..=600).contains(&self.spacing_seconds)
@@ -136,6 +141,7 @@ pub(crate) struct Shared {
     pub source: FrameSource,
     pub policy: TransportPolicy,
     pub pending_timelapse: Mutex<Option<QueuedTimelapse>>,
+    pub observations: Mutex<crate::observation::History>,
     snapshot_copy: Mutex<()>,
     movie_generation: AtomicU64,
     path: PathBuf,
@@ -199,6 +205,24 @@ impl std::fmt::Debug for TimelapseSink {
 }
 
 impl TimelapseSink {
+    /// Called at capture enqueue time, not at daily encoding time. Never opens a camera.
+    pub fn overlay_for(&self, captured_at_unix_ms: u64) -> Option<crate::observation::Overlay> {
+        let shared = self.0.upgrade()?;
+        let settings = shared.settings.read().unwrap();
+        if shared.stopped.load(Ordering::Acquire)
+            || !settings.preferences.enabled
+            || !settings.preferences.overlays.requested()
+        {
+            return None;
+        }
+        let frame = (shared.source)()?;
+        shared.observations.lock().unwrap().overlay(
+            &settings.preferences.overlays,
+            frame.session,
+            i64::try_from(captured_at_unix_ms).ok()?,
+            std::time::Instant::now(),
+        )
+    }
     pub fn offer(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
         self.0.upgrade().map_or(Ok(false), |shared| {
             SharingClient(shared).offer_timelapse(path, captured_at_unix_ms)
@@ -289,6 +313,7 @@ impl SharingService {
             source,
             policy,
             pending_timelapse: Mutex::new(None),
+            observations: Mutex::new(Default::default()),
             snapshot_copy: Mutex::new(()),
             movie_generation: AtomicU64::new(0),
             path,
@@ -343,6 +368,7 @@ impl SharingClient {
     }
     /// Cancels the current connection and its immutable image outbox.
     pub fn invalidate(&self) {
+        self.0.observations.lock().unwrap().clear();
         self.0.cancel_timelapses();
         self.0
             .changes
@@ -525,6 +551,7 @@ impl SharingClient {
         settings.preferences.telescope_events = false;
         settings.preferences.observation_context = false;
         settings.preferences.timelapses = false;
+        settings.preferences.overlays = Default::default();
         settings.preferences.chat_configuration = false;
         settings.remote_rules = None;
         settings.device_id = None;

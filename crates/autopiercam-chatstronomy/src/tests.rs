@@ -207,7 +207,9 @@ impl Fixture {
         let auth = text(&mut socket).await;
         assert_eq!(auth["type"], "authenticate");
         let p = &client.status().preferences;
-        let expected_version = if p.timelapses || (p.observation_context && p.telescope_events) {
+        let expected_version = if p.overlays.requested() {
+            4
+        } else if p.timelapses || (p.observation_context && p.telescope_events) {
             3
         } else if p.telescope_events || p.chat_configuration || p.interval_minutes > 0 {
             2
@@ -242,8 +244,107 @@ impl Fixture {
                 .await
                 .unwrap();
         }
+        if p.overlays.requested() {
+            assert_eq!(
+                text(&mut socket).await,
+                json!({"type":"observation_capabilities","telemetry":true})
+            );
+            socket.send(Message::Text(json!({"type":"observation_ready","telemetry":true,"interval_seconds":5,"max_age_seconds":30}).to_string().into())).await.unwrap();
+        }
         socket
     }
+}
+
+#[tokio::test]
+async fn observation_state_is_not_an_image_trigger_and_pause_disable_disconnect_clear_labels() {
+    use crate::observation::{OverlayOptions, TemperatureSource};
+    let fixture = Fixture::paired_with(Preferences {
+        overlays: OverlayOptions {
+            telescope_id: Some(17),
+            target: true,
+            exposure_count: true,
+            temperature: TemperatureSource::External,
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut socket = fixture.connect(false, false).await;
+    let client = fixture.service.client();
+    let sink = client.timelapse_sink();
+    let mut state = crate::observation::tests::fixture();
+    let now = time::OffsetDateTime::now_utc();
+    let format = time::format_description::well_known::Rfc3339;
+    state["observed_at"] = json!(now.format(&format).unwrap());
+    state["valid_until"] = json!((now + time::Duration::seconds(30)).format(&format).unwrap());
+    state["target"]["started_at"] =
+        json!((now - time::Duration::hours(1)).format(&format).unwrap());
+    state["completed_exposures"]["as_of"] = state["observed_at"].clone();
+    state["temperatures"] = Value::Null;
+    for count in [505, 506, 506] {
+        state["completed_exposures"]["count"] = json!(count);
+        state["revision"] = json!(count);
+        socket
+            .send(Message::Text(state.to_string().into()))
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if sink
+                .overlay_for(now_ms())
+                .is_some_and(|o| o.lines[1].contains("506"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        timeout(Duration::from_millis(350), text(&mut socket))
+            .await
+            .is_err(),
+        "initial/state/count updates must not post images"
+    );
+    *fixture.frames.write().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(sink.overlay_for(now_ms()).is_none());
+    *fixture.frames.write().unwrap() = Some(frame(2, false));
+    assert!(
+        sink.overlay_for(now_ms()).is_none(),
+        "resume does not revive pre-pause labels"
+    );
+    socket
+        .send(Message::Text(state.to_string().into()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while sink.overlay_for(now_ms()).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    socket.close(None).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while sink.overlay_for(now_ms()).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = client.status();
+    client
+        .update(
+            status.revision,
+            Preferences {
+                overlays: Default::default(),
+                ..status.preferences
+            },
+        )
+        .unwrap();
+    assert!(sink.overlay_for(now_ms()).is_none());
 }
 
 fn timelapse_fixture() -> Vec<u8> {

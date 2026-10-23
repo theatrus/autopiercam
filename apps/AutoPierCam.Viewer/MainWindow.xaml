@@ -560,6 +560,19 @@
                                         <ToggleSwitch x:Name="SharingTelescopeToggle" Header="Send on slew / sequence events" />
                                         <ToggleSwitch x:Name="SharingContextToggle" Header="Include telescope targets and more actions" />
                                         <ToggleSwitch x:Name="SharingTimelapsesToggle" Header="Share finalized daily timelapses" />
+                                        <StackPanel x:Name="SharingOverlayGroup" Spacing="8">
+                                            <TextBlock Text="Daily timelapse overlays" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                                            <TextBlock Text="Optional labels on future timelapse samples only. Enable daily timelapses in Imaging, pairing/sharing here, and observation sharing in the N.I.N.A. plugin. Requires Hub v4; does not enable image or movie uploads." TextWrapping="Wrap" />
+                                            <TextBox x:Name="SharingOverlayTelescopeTextBox" Header="Hub telescope record ID (not the camera device ID)" MaxLength="16" />
+                                            <ToggleSwitch x:Name="SharingOverlayTargetToggle" Header="Target name" />
+                                            <ToggleSwitch x:Name="SharingOverlayCountToggle" Header="Completed, saved LIGHT exposure count" />
+                                            <ComboBox x:Name="SharingOverlayTemperatureComboBox" Header="Temperature source" SelectedIndex="0" HorizontalAlignment="Stretch">
+                                                <ComboBoxItem Content="Off" />
+                                                <ComboBoxItem Content="Focuser" />
+                                                <ComboBoxItem Content="External / observatory" />
+                                            </ComboBox>
+                                            <TextBlock Text="Unknown or expired values are omitted. Existing samples keep their labels; original stills stay unchanged. The selected source is never replaced with camera temperature." TextWrapping="Wrap" />
+                                        </StackPanel>
                                         <TextBlock Text="Uploads new H.264 MP4 clips up to 20 MiB to the camera's Discord channels. Requires an updated Hub. Local videos are kept unchanged." TextWrapping="Wrap" Style="{StaticResource CaptionTextBlockStyle}" />
                                         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                                    Text="With telescope events enabled, add target and action labels to triggered images. Requires an updated Hub; never controls hardware." />

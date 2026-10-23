@@ -46,6 +46,11 @@ It makes a private JPEG copy, scaled to fit a 1280 × 720 black canvas without
 stretching. RAW8 JPEG and RAW16 PNG captures are supported. Sampling does not
 depend on preview FPS and never requests, aborts, or restarts an exposure.
 
+Optional [observation overlays](chatstronomy.md#daily-timelapse-overlays)
+add the target, saved LIGHT exposure count and a selected focuser/external
+temperature to future private samples. Values are captured with each frame and
+omitted when unknown or stale; original stills remain unchanged.
+
 Samples play at 24 source frames per second. A fully sampled UTC day produces
 about 60 seconds of video. Missing minutes are omitted rather than filled in;
 a partial day produces a shorter clip. Clips close at midnight UTC, not local

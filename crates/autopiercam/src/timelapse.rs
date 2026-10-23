@@ -133,9 +133,19 @@ impl Cache {
         })
     }
 
+    #[cfg(test)]
     fn record(
         &mut self,
         timestamp: u64,
+        thumbnail: impl FnOnce() -> Result<RgbImage>,
+    ) -> Result<()> {
+        self.record_annotated(timestamp, None, thumbnail)
+    }
+
+    fn record_annotated(
+        &mut self,
+        timestamp: u64,
+        overlay: Option<&autopiercam_chatstronomy::observation::Overlay>,
         thumbnail: impl FnOnce() -> Result<RgbImage>,
     ) -> Result<()> {
         ensure!(
@@ -170,6 +180,9 @@ impl Cache {
             i64::from((WIDTH - thumbnail.width()) / 2),
             i64::from((HEIGHT - thumbnail.height()) / 2),
         );
+        if let Some(overlay) = overlay {
+            crate::timelapse_overlay::draw(&mut canvas, overlay)?;
+        }
         let mut jpeg = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80).encode_image(&canvas)?;
         ensure!(
@@ -222,6 +235,43 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn annotated_samples_stay_bounded_immutable_and_keep_unannotated_frames_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = Cache::open(root.path()).unwrap();
+        let label = autopiercam_chatstronomy::observation::Overlay {
+            lines: vec![
+                "Target: NGC 7023".into(),
+                "Saved LIGHT exposures: 505".into(),
+            ],
+        };
+        cache
+            .record_annotated(DAY_MS, Some(&label), thumbnail)
+            .unwrap();
+        cache.record(DAY_MS + 60_000, thumbnail).unwrap();
+        let path = cache.root.join("00000001/0000.jpg");
+        let saved = fs::read(&path).unwrap();
+        let plain = fs::read(cache.root.join("00000001/0001.jpg")).unwrap();
+        assert!(saved.len() as u64 <= MAX_JPEG);
+        let labeled = image::load_from_memory(&saved).unwrap().to_rgb8();
+        let unlabeled = image::load_from_memory(&plain).unwrap().to_rgb8();
+        assert_eq!(labeled.dimensions(), (WIDTH, HEIGHT));
+        assert_eq!(labeled.get_pixel(30, 30), unlabeled.get_pixel(30, 30));
+        assert_ne!(labeled, unlabeled);
+        cache
+            .record_annotated(DAY_MS, None, || {
+                panic!("never re-render an occupied minute")
+            })
+            .unwrap();
+        drop(cache);
+        let mut reopened = Cache::open(root.path()).unwrap();
+        reopened
+            .record(DAY_MS, || panic!("never relabel after restart"))
+            .unwrap();
+        assert_eq!(fs::read(path).unwrap(), saved);
+    }
+
     #[test]
     fn shared_quota_skips_new_samples_and_defers_closed_day_without_losing_sources() {
         use crate::retention::{
@@ -449,7 +499,12 @@ fn marker(path: &Path, contents: &[u8]) -> Result<()> {
 #[derive(Clone)]
 pub(crate) struct DailySink(Arc<Mutex<Cache>>);
 impl DailySink {
-    pub(crate) fn record(&self, saved: &Path, thumbnail: impl FnOnce() -> Result<RgbImage>) {
+    pub(crate) fn record(
+        &self,
+        saved: &Path,
+        overlay: Option<&autopiercam_chatstronomy::observation::Overlay>,
+        thumbnail: impl FnOnce() -> Result<RgbImage>,
+    ) {
         let result = (|| {
             let timestamp = saved
                 .file_name()
@@ -460,7 +515,7 @@ impl DailySink {
                 .0
                 .lock()
                 .map_err(|_| anyhow!("timelapse cache lock poisoned"))?;
-            let result = cache.record(timestamp, thumbnail);
+            let result = cache.record_annotated(timestamp, overlay, thumbnail);
             if result.is_err() {
                 let minute = timestamp / 60_000;
                 if cache.last_warning_minute == Some(minute) {
