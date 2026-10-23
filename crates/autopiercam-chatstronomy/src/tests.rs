@@ -111,6 +111,85 @@ struct Fixture {
     vault: Arc<MemoryStore>,
     listener: TcpListener,
 }
+
+#[tokio::test]
+async fn scheduled_consent_is_persistent_and_rechecked_during_snapshot_copy() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fixture = Fixture::paired_with(Preferences {
+        timelapses: true,
+        ..Default::default()
+    })
+    .await;
+    let client = fixture.service.client();
+    let sink = client.timelapse_sink();
+    assert!(sink.consent_key().is_none()); // pairing alone grants no upload consent
+    let status = client.status();
+    client
+        .update(
+            status.revision,
+            Preferences {
+                enabled: true,
+                ..status.preferences
+            },
+        )
+        .unwrap();
+    let key = sink.consent_key().unwrap();
+    let stored: Settings = serde_json::from_slice(
+        &std::fs::read(fixture._directory.path().join("agent.chatstronomy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        key,
+        format!(
+            "{}:{}:{}:{}",
+            stored.installation_id,
+            stored.device_id.unwrap(),
+            stored.revision,
+            stored.preferences.hub_origin
+        )
+    );
+    assert!(!key.contains("csdc_"));
+    assert!(!sink.ready_for_movie()); // cannot claim a durable schedule before negotiation
+    client.0.media_ready.store(true, Ordering::Release);
+    assert!(sink.ready_for_movie());
+    *fixture.frames.write().unwrap() = None;
+    assert!(!sink.ready_for_movie());
+    *fixture.frames.write().unwrap() = Some(frame(1, false));
+    let path = fixture._directory.path().join("scheduled.mp4");
+    // A small structural MP4 fixture; no encoder, camera, credentials or remote host.
+    let bytes = b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom\0\0\0\x08moov\0\0\0\x08mdat";
+    std::fs::write(&path, bytes).unwrap();
+    assert!(
+        !sink
+            .offer_scheduled_checked(&path, now_ms(), "wrong consent", |_| panic!(
+                "must reject before copying"
+            ))
+            .unwrap()
+    );
+    let changed = AtomicBool::new(false);
+    let result = sink.offer_scheduled_checked(&path, now_ms(), &key, |_| {
+        if !changed.swap(true, Ordering::AcqRel) {
+            let status = client.status();
+            client.update(status.revision, status.preferences)?;
+        }
+        Ok(())
+    });
+    assert!(changed.load(Ordering::Acquire));
+    assert!(result.is_err() || !result.unwrap());
+    assert!(client.0.pending_timelapse.lock().unwrap().is_none());
+    assert_ne!(sink.consent_key().unwrap(), key);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(
+        std::fs::read_dir(fixture._directory.path())
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".autopiercam-video-sharing-"))
+    );
+    drop(fixture);
+}
 impl Fixture {
     async fn paired() -> Self {
         Self::paired_with(Preferences::default()).await

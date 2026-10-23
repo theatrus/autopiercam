@@ -19,7 +19,12 @@ impl Config {
         capture.interval_ms = next.capture.interval_ms;
         capture.preview_max_fps = next.capture.preview_max_fps;
         capture.jpeg_quality = next.capture.jpeg_quality;
-        capture != next.capture || self.upload != next.upload || self.video != next.video
+        capture != next.capture
+            || self.upload != next.upload
+            || self.video != next.video
+            || ((self.video.daily_timelapse || next.video.daily_timelapse)
+                && (self.camera.latitude_deg != next.camera.latitude_deg
+                    || self.camera.longitude_deg != next.camera.longitude_deg))
     }
 
     /// Acquisition layout/device or white-balance changes need a new camera session.
@@ -164,6 +169,10 @@ impl Config {
                 "video recording requires Windows Media Foundation",
             ));
         }
+        self.video
+            .timelapse_schedule
+            .validate(&self.camera)
+            .map_err(ConfigError::Validation)?;
         if self.upload.enabled && self.upload.endpoint.is_none() {
             return Err(ConfigError::Validation(
                 "upload.endpoint is required when upload.enabled is true",
@@ -447,8 +456,10 @@ impl Default for UploadConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
-    /// Sample saved stills into one native H.264 clip per UTC day.
+    /// Sample saved stills into one native H.264 clip per configured window.
     pub daily_timelapse: bool,
+    #[serde(skip_serializing_if = "crate::timelapse_schedule::TimelapseSchedule::is_default")]
+    pub timelapse_schedule: crate::timelapse_schedule::TimelapseSchedule,
     // Read legacy configurations without breaking startup; never execute or
     // re-serialize this obsolete external-encoder setting.
     #[serde(skip_serializing)]
@@ -462,6 +473,7 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             daily_timelapse: false,
+            timelapse_schedule: Default::default(),
             ffmpeg_path: None,
             enabled: false,
             segment_seconds: 300,
@@ -765,6 +777,16 @@ mod tests {
             toml::from_str::<Config>(&toml::to_string(&next).unwrap()).unwrap(),
             next
         );
+        let running = next.clone();
+        next.video.timelapse_schedule.window = crate::timelapse_schedule::WindowMode::LocalNoon;
+        next.video.timelapse_schedule.timezone = "America/Los_Angeles".into();
+        assert!(running.requires_recording_reload(&next));
+        assert!(!running.requires_camera_restart(&next));
+        let running = next.clone();
+        next.camera.latitude_deg = Some(38.7);
+        next.camera.longitude_deg = Some(-121.1);
+        assert!(running.requires_recording_reload(&next));
+        assert!(!running.requires_camera_restart(&next));
     }
 
     #[test]

@@ -7,7 +7,12 @@ use crate::{
     upload::{UploadEnqueueResult, UploadSink},
 };
 use anyhow::{Context, Result, anyhow, ensure};
+use autopiercam_core::{
+    config::CameraConfig,
+    timelapse_schedule::{TimelapseSchedule, Window},
+};
 use image::RgbImage;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
@@ -67,7 +72,7 @@ fn sample_slot(path: &Path) -> Option<u32> {
     if number.len() != 4 || !number.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    number.parse::<u32>().ok().filter(|n| *n < 1440)
+    number.parse::<u32>().ok().filter(|n| *n < 1560)
 }
 
 fn samples(path: &Path) -> Result<Vec<PathBuf>> {
@@ -87,7 +92,7 @@ fn samples(path: &Path) -> Result<Vec<PathBuf>> {
 
 fn day_number(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    if name.len() != 8 || !name.bytes().all(|c| c.is_ascii_digit()) {
+    if ![8, 20].contains(&name.len()) || !name.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
     name.parse::<u64>().ok()
@@ -109,6 +114,76 @@ struct Cache {
     bytes: u64,
     last_warning_minute: Option<u64>,
     retention: Option<RetentionSink>,
+    schedule: TimelapseSchedule,
+    camera: CameraConfig,
+    plan_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowRecord {
+    window: Window,
+    plan_id: String,
+}
+
+fn read_window(path: &Path) -> Result<Option<WindowRecord>> {
+    ensure!(
+        day_number(path).is_some() && regular(path)?.is_dir(),
+        "invalid timelapse window directory"
+    );
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.len() == 8)
+    {
+        return Ok(None);
+    }
+    let file = path.join("window.json");
+    ensure!(
+        regular(&file)?.is_file() && regular(&file)?.len() <= 4096,
+        "invalid timelapse window metadata"
+    );
+    let record: WindowRecord = serde_json::from_reader(File::open(file)?)?;
+    ensure!(
+        record.window.valid()
+            && record.plan_id.len() == 64
+            && record.plan_id.bytes().all(|c| c.is_ascii_hexdigit()),
+        "invalid timelapse boundaries"
+    );
+    Ok(Some(record))
+}
+
+// A crash between mkdir and the atomic metadata write leaves no samples. It
+// must not block other windows; the next sample can initialize this directory.
+fn uninitialized_window(path: &Path) -> Result<bool> {
+    Ok(path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.len() == 20)
+        && !path.join("window.json").exists()
+        && entries(path)?.is_empty())
+}
+
+fn movie_path(directory: &Path, path: &Path) -> Result<PathBuf> {
+    let key = day_number(path).context("invalid window key")?;
+    Ok(if let Some(record) = read_window(path)? {
+        directory.join(format!(
+            "frame-{}-{:03}-{:032x}-000000.mp4",
+            record.window.end_ms / 1000,
+            record.window.end_ms % 1000,
+            (u128::from(key) << 64) | 0x7363686564756c65
+        ))
+    } else {
+        directory.join(output_name(key))
+    })
+}
+
+fn fingerprint(schedule: &TimelapseSchedule, camera: &CameraConfig) -> String {
+    let data = serde_json::to_vec(&(schedule, camera.latitude_deg, camera.longitude_deg)).unwrap();
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl Cache {
@@ -130,6 +205,9 @@ impl Cache {
             bytes,
             last_warning_minute: None,
             retention: None,
+            schedule: Default::default(),
+            camera: Default::default(),
+            plan_id: fingerprint(&TimelapseSchedule::default(), &CameraConfig::default()),
         })
     }
 
@@ -152,14 +230,24 @@ impl Cache {
             regular(&self.root)?.is_dir(),
             "invalid timelapse cache root"
         );
-        let day = timestamp / DAY_MS;
-        ensure!(day < 100_000_000, "invalid timelapse day");
-        let dir = self.root.join(format!("{day:08}"));
+        let Some(window) = self.schedule.at(timestamp, &self.camera) else {
+            return Ok(());
+        };
+        let legacy = self.schedule == TimelapseSchedule::default();
+        let dir = if legacy {
+            let day = timestamp / DAY_MS;
+            ensure!(day < 100_000_000, "invalid timelapse day");
+            self.root.join(format!("{day:08}"))
+        } else {
+            let digest = Sha256::digest(serde_json::to_vec(&(&window, &self.plan_id))?);
+            let key = u64::from_le_bytes(digest[..8].try_into().unwrap());
+            self.root.join(format!("{key:020}"))
+        };
         // No back-fill into a sealed/completed day, including clock rollback.
         if dir.join("sealed").exists() || dir.join("done").exists() {
             return Ok(());
         }
-        let slot = timestamp % DAY_MS / 60_000;
+        let slot = (timestamp - window.start_ms) / 60_000;
         let output = dir.join(format!("{slot:04}.jpg"));
         if output.exists() {
             return Ok(());
@@ -194,6 +282,21 @@ impl Cache {
         }
         fs::create_dir_all(&dir)?;
         ensure!(regular(&dir)?.is_dir(), "invalid timelapse day directory");
+        if !legacy {
+            let record = WindowRecord {
+                window,
+                plan_id: self.plan_id.clone(),
+            };
+            let data = serde_json::to_vec(&record)?;
+            if dir.join("window.json").exists() {
+                ensure!(
+                    fs::read(dir.join("window.json"))? == data,
+                    "timelapse window conflict"
+                );
+            } else {
+                marker(&dir.join("window.json"), &data)?;
+            }
+        }
         let mut staging = tempfile::NamedTempFile::new_in(&dir)?;
         staging.write_all(&jpeg)?;
         staging.as_file().sync_all()?;
@@ -210,7 +313,14 @@ impl Cache {
         for path in entries(&self.root)? {
             let day = day_number(&path).context("invalid timelapse cache directory")?;
             ensure!(regular(&path)?.is_dir(), "invalid timelapse day directory");
-            if day < now / DAY_MS {
+            if uninitialized_window(&path)? {
+                continue;
+            }
+            let end = read_window(&path)?.map_or_else(
+                || day.saturating_add(1).saturating_mul(DAY_MS),
+                |r| r.window.end_ms,
+            );
+            if end <= now {
                 marker(&path.join("sealed"), b"1")?;
                 result.push((day, path));
             }
@@ -235,6 +345,177 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn scheduled_cache(root: &Path) -> Cache {
+        use autopiercam_core::timelapse_schedule::{DeliveryMode, WindowMode};
+        let mut cache = Cache::open(root).unwrap();
+        cache.schedule = TimelapseSchedule {
+            window: WindowMode::DuskToDawn,
+            timezone: "America/Los_Angeles".into(),
+            delivery: DeliveryMode::LocalTime,
+            ..Default::default()
+        };
+        cache.camera.latitude_deg = Some(38.7);
+        cache.camera.longitude_deg = Some(-121.1);
+        cache.plan_id = fingerprint(&cache.schedule, &cache.camera);
+        cache
+    }
+    fn timestamp(date: &str) -> u64 {
+        chrono::DateTime::parse_from_rfc3339(date)
+            .unwrap()
+            .timestamp_millis() as u64
+    }
+
+    #[test]
+    fn sunset_window_survives_restart_seals_at_sunrise_and_keeps_waiting_movie() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = scheduled_cache(root.path());
+        let evening = timestamp("2026-10-23T05:00:00Z");
+        let morning = timestamp("2026-10-23T12:00:00Z");
+        let window = cache.schedule.at(evening, &cache.camera).unwrap();
+        cache.record(evening, thumbnail).unwrap();
+        drop(cache);
+        let mut cache = scheduled_cache(root.path());
+        cache.record(morning, thumbnail).unwrap();
+        cache
+            .record(evening, || panic!("restart must not duplicate sample"))
+            .unwrap();
+        cache
+            .record(window.start_ms - 1, || panic!("daylight must not render"))
+            .unwrap();
+        assert!(cache.pending(window.end_ms - 1).unwrap().is_empty());
+        let jobs = cache.pending(window.end_ms).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let path = &jobs[0].1;
+        assert_eq!(samples(path).unwrap().len(), 2);
+        let record = read_window(path).unwrap().unwrap();
+        assert_eq!(record.window, window);
+        cache
+            .record(morning + 60_000, || {
+                panic!("rollback cannot append to sealed night")
+            })
+            .unwrap();
+        let output = movie_path(root.path(), path).unwrap();
+        assert_eq!(
+            parse_generated_capture_filename(output.file_name().unwrap().to_str().unwrap()),
+            Some(window.end_ms)
+        );
+        fs::write(&output, b"finalized local movie").unwrap();
+        marker(&path.join("sha256"), hash(&output).unwrap().as_bytes()).unwrap();
+        marker(&path.join("send.pending"), b"consent").unwrap();
+        finish_day(
+            Path::new("must-not-execute"),
+            path,
+            &output,
+            &AtomicBool::new(false),
+            None,
+            None,
+        )
+        .unwrap();
+        cache.clean_done(path).unwrap();
+        assert!(samples(path).unwrap().is_empty());
+        assert_eq!(Cache::open(root.path()).unwrap().bytes, 0);
+        assert_eq!(
+            protected_outputs(root.path(), window.send_after_ms - 1).unwrap(),
+            vec![output.clone()]
+        );
+        assert_eq!(
+            protected_outputs(root.path(), window.end_ms + DAY_MS - 1).unwrap(),
+            vec![output.clone()]
+        );
+        assert!(
+            protected_outputs(root.path(), window.end_ms + DAY_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"finalized local movie");
+        // An interrupted offer is terminal on restart, not a second upload.
+        marker(&path.join("send.claim"), b"1").unwrap();
+        deliver_scheduled(
+            path,
+            &output,
+            &record,
+            &record.plan_id,
+            window.send_after_ms,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(path.join("send.done").exists());
+        assert!(
+            protected_outputs(root.path(), window.send_after_ms)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(output).unwrap(), b"finalized local movie");
+    }
+
+    #[test]
+    fn scheduled_delivery_exact_fence_expiry_and_consent_are_bounded() {
+        let record = WindowRecord {
+            window: Window {
+                start_ms: 0,
+                end_ms: 100,
+                send_after_ms: 1000,
+            },
+            plan_id: "plan".into(),
+        };
+        let decide = |now, consent, ready| {
+            delivery_decision(&record, "plan", now, "consent", consent, ready)
+        };
+        for now in [0, 99, 100, 999] {
+            assert_eq!(decide(now, Some("consent"), true), DeliveryDecision::Wait);
+        }
+        assert_eq!(decide(1000, Some("consent"), true), DeliveryDecision::Offer);
+        assert_eq!(decide(1000, Some("consent"), false), DeliveryDecision::Wait);
+        assert_eq!(
+            decide(100 + DAY_MS - 1, Some("consent"), true),
+            DeliveryDecision::Offer
+        );
+        assert_eq!(
+            decide(100 + DAY_MS, Some("consent"), true),
+            DeliveryDecision::Cancel
+        );
+        for consent in [None, Some("new revision"), Some("new pairing")] {
+            assert_eq!(decide(999, consent, true), DeliveryDecision::Cancel);
+        }
+        assert_eq!(
+            delivery_decision(&record, "new plan", 1000, "consent", Some("consent"), true),
+            DeliveryDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn incomplete_empty_window_is_recoverable_but_corrupt_metadata_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = Cache::open(root.path()).unwrap();
+        let path = cache.root.join("00000000000000000001");
+        fs::create_dir(&path).unwrap();
+        assert!(cache.pending(2 * DAY_MS).unwrap().is_empty());
+        assert!(
+            protected_outputs(root.path(), 2 * DAY_MS)
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(path.join("window.json"), b"invalid").unwrap();
+        assert!(cache.pending(2 * DAY_MS).is_err());
+        assert!(protected_outputs(root.path(), 2 * DAY_MS).is_err());
+    }
+
+    #[test]
+    fn fallback_day_keeps_the_twenty_fifth_hour_in_order() {
+        use autopiercam_core::timelapse_schedule::WindowMode;
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = scheduled_cache(root.path());
+        cache.schedule.window = WindowMode::LocalNoon;
+        cache.plan_id = fingerprint(&cache.schedule, &cache.camera);
+        let end = timestamp("2026-11-01T20:00:00Z");
+        cache.record(end - 60_000, thumbnail).unwrap();
+        let jobs = cache.pending(end).unwrap();
+        let frames = samples(&jobs[0].1).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(sample_slot(&frames[0]), Some(1499));
+        assert_eq!(read_window(&jobs[0].1).unwrap().unwrap().window.end_ms, end);
+    }
     #[test]
     #[cfg(windows)]
     fn annotated_samples_stay_bounded_immutable_and_keep_unannotated_frames_clean() {
@@ -542,12 +823,19 @@ pub(crate) struct DailyWorker {
 impl DailyWorker {
     pub(crate) fn start(
         directory: &Path,
+        schedule: &TimelapseSchedule,
+        camera: &CameraConfig,
         upload: Option<UploadSink>,
         retention: Option<RetentionSink>,
         sharing: Option<crate::TimelapseSink>,
     ) -> Result<Self> {
         let mut initial_cache = Cache::open(directory)?;
         initial_cache.retention = retention.clone();
+        initial_cache.schedule = schedule.clone();
+        initial_cache.camera = camera.clone();
+        initial_cache.plan_id = fingerprint(schedule, camera);
+        let plan_id = initial_cache.plan_id.clone();
+        let legacy_delivery = schedule == &TimelapseSchedule::default();
         let sink = DailySink(Arc::new(Mutex::new(initial_cache)));
         let cache = sink.clone();
         let directory = directory.to_owned();
@@ -568,33 +856,49 @@ impl DailyWorker {
                             if cancelled.load(Ordering::Acquire) {
                                 break;
                             }
+                            let job = (|| -> Result<()> {
+                            let output = movie_path(&directory,&path)?;
+                            let record = read_window(&path)?;
                             if !path.join("done").exists() {
+                                // Capture consent before publishing; enabling sharing later
+                                // must not turn old local movies into an upload backlog.
+                                if record.is_some() && !path.join("send.pending").exists() && !path.join("send.done").exists() {
+                                    if let Some(key) = sharing.as_ref().and_then(|s| s.consent_key()) {
+                                        marker(&path.join("send.pending"),key.as_bytes())?;
+                                    } else { marker(&path.join("send.done"),b"not consented")?; }
+                                }
                                 finish_day(
                                     &executable,
                                     &path,
-                                    &directory.join(output_name(day)),
+                                    &output,
                                     &cancelled,
                                     upload.as_ref(),
                                     retention.as_ref(),
                                 )?;
-                                if let Some(sharing) = &sharing
-                                    && let Err(error) = sharing.offer_checked(&directory.join(output_name(day)), (day + 1).saturating_mul(DAY_MS),
+                                if record.is_none() && legacy_delivery && let Some(sharing) = &sharing
+                                    && let Err(error) = sharing.offer_checked(&output, (day + 1).saturating_mul(DAY_MS),
                                         |additional| retention.as_ref().map_or(Ok(()), |sink| sink.check_video_space(additional))) {
                                         tracing::warn!(%error, "Timelapse not queued for Chatstronomy; local movie is unchanged");
                                     }
+                            }
+                            if let Some(record) = record {
+                                deliver_scheduled(&path,&output,&record,&plan_id,unix_time_millis(),sharing.as_ref(),retention.as_ref())?;
                             }
                             cache
                                 .0
                                 .lock()
                                 .map_err(|_| anyhow!("timelapse lock poisoned"))?
                                 .clean_done(&path)?;
+                            Ok(())
+                            })();
+                            if let Err(error) = job { tracing::warn!(%error, path=%path.display(), "timelapse window pending; local files kept"); }
                         }
                         Ok(())
                     })();
                     if let Err(error) = result {
-                        tracing::warn!(%error, "daily timelapse pending; retrying in five minutes");
+                        tracing::warn!(%error, "daily timelapse pending; checking again in thirty seconds");
                     }
-                    thread::park_timeout(Duration::from_secs(300));
+                    thread::park_timeout(Duration::from_secs(30));
                 }
             })?;
         Ok(Self {
@@ -639,6 +943,131 @@ fn hash(path: &Path) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryDecision {
+    Wait,
+    Cancel,
+    Offer,
+}
+fn delivery_decision(
+    record: &WindowRecord,
+    plan: &str,
+    now: u64,
+    expected: &str,
+    consent: Option<&str>,
+    ready: bool,
+) -> DeliveryDecision {
+    if record.plan_id != plan
+        || consent != Some(expected)
+        // Existing Hub contract accepts a movie timestamp at most 24 h old.
+        // Do not turn a delayed schedule into a permanently rejected backlog.
+        || now >= record.window.end_ms.saturating_add(DAY_MS)
+    {
+        DeliveryDecision::Cancel
+    } else if now < record.window.send_after_ms || !ready {
+        DeliveryDecision::Wait
+    } else {
+        DeliveryDecision::Offer
+    }
+}
+
+fn deliver_scheduled(
+    path: &Path,
+    output: &Path,
+    record: &WindowRecord,
+    plan: &str,
+    now: u64,
+    sharing: Option<&crate::TimelapseSink>,
+    retention: Option<&RetentionSink>,
+) -> Result<()> {
+    if path.join("send.done").exists() {
+        return Ok(());
+    }
+    if path.join("send.claim").exists() {
+        // A crash after offering is ambiguous. Never replay an accepted post.
+        return marker(
+            &path.join("send.done"),
+            b"interrupted attempt; not replayed",
+        );
+    }
+    let pending = path.join("send.pending");
+    if !pending.exists() {
+        return Ok(());
+    }
+    ensure!(
+        regular(&pending)?.is_file() && regular(&pending)?.len() <= 2048,
+        "invalid timelapse consent record"
+    );
+    let expected = fs::read_to_string(pending)?;
+    let consent = sharing.and_then(|s| s.consent_key());
+    match delivery_decision(
+        record,
+        plan,
+        now,
+        &expected,
+        consent.as_deref(),
+        sharing.is_some_and(|s| s.ready_for_movie()),
+    ) {
+        DeliveryDecision::Wait => Ok(()),
+        DeliveryDecision::Cancel => {
+            tracing::warn!(path=%output.display(), "scheduled timelapse expired or consent/schedule changed; local movie kept");
+            marker(&path.join("send.done"), b"expired or cancelled")
+        }
+        DeliveryDecision::Offer => {
+            // Verify immutable local bytes before the one durable claim. HTTP
+            // retries still use the existing snapshot/UUID/timestamp contract.
+            ensure!(regular(output)?.is_file(), "scheduled movie missing");
+            ensure!(
+                fs::read_to_string(path.join("sha256"))? == hash(output)?,
+                "scheduled movie checksum conflict"
+            );
+            marker(&path.join("send.claim"), b"1")?;
+            let offered = sharing.unwrap().offer_scheduled_checked(
+                output,
+                record.window.end_ms,
+                &expected,
+                |additional| retention.map_or(Ok(()), |s| s.check_video_space(additional)),
+            );
+            marker(&path.join("send.done"), b"attempted")?;
+            match offered {
+                Ok(true) => {
+                    tracing::info!(path=%output.display(),"scheduled timelapse queued for Chatstronomy")
+                }
+                Ok(false) => {
+                    tracing::warn!(path=%output.display(),"scheduled timelapse consent/session changed; local movie kept")
+                }
+                Err(error) => {
+                    tracing::warn!(%error,"scheduled timelapse not queued; local movie kept")
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Retention must not purge a finalized movie while its bounded send window
+/// is pending. Corrupt metadata fails the sweep closed, never authorizes deletion.
+pub(crate) fn protected_outputs(directory: &Path, now: u64) -> Result<Vec<PathBuf>> {
+    let root = directory.join(".autopiercam-timelapse");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut protected = Vec::new();
+    for path in entries(&root)? {
+        if uninitialized_window(&path)? {
+            continue;
+        }
+        if let Some(record) = read_window(&path)?
+            && path.join("send.pending").exists()
+            && !path.join("send.done").exists()
+            && now < record.window.end_ms.saturating_add(DAY_MS)
+        {
+            protected.push(movie_path(directory, &path)?);
+        }
+    }
+    Ok(protected)
 }
 
 fn finish_day(

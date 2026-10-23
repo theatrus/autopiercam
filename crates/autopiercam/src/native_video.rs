@@ -39,8 +39,8 @@ pub(crate) fn write_manifest(directory: &Path, samples: &[Sample]) -> Result<()>
 
 fn validate(samples: &[Sample]) -> Result<()> {
     ensure!(
-        !samples.is_empty() && samples.len() <= 1440,
-        "native video needs 1..=1440 samples"
+        !samples.is_empty() && samples.len() <= 1560,
+        "native video needs 1..=1560 samples"
     );
     let mut total = 0_i64;
     for sample in samples {
@@ -340,5 +340,17 @@ mod tests {
             }])
             .is_ok()
         );
+        let mut long_day = (0..1560)
+            .map(|i| Sample {
+                file: format!("{i:04}.jpg"),
+                duration: 416667,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate(&long_day).is_ok());
+        long_day.push(Sample {
+            file: "1560.jpg".into(),
+            duration: 416667,
+        });
+        assert!(validate(&long_day).is_err());
     }
 }

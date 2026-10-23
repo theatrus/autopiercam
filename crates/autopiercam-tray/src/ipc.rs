@@ -1193,7 +1193,8 @@ mod tests {
                 "capture.preview_rate",
                 "capture.preview_rate_fractional",
                 "video.native",
-                "video.daily_timelapse"
+                "video.daily_timelapse",
+                "video.timelapse_schedule"
             ]
         );
 

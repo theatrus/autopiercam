@@ -41,6 +41,15 @@ path = "LICENSE.txt"
 license = "MIT"
 checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831"
 
+# Combined upstream license text confuses the scanner. Preserve its actual
+# copyright-bearing text rather than falling back to a generic MIT template.
+[chrono-tz.clarify]
+license = "MIT OR Apache-2.0"
+[[chrono-tz.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "4789210f4df8abc03fce1cddd9c2ba517f184840687f2815d741de282c1aa93a"
+
 [regain-core.clarify]
 license = "Apache-2.0"
 [[regain-core.clarify.files]]

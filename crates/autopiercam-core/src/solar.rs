@@ -18,7 +18,7 @@ pub fn startup_mode(config: &CameraConfig, now: SystemTime) -> Option<LightMode>
 /// NOAA's fractional-year approximation. UTC plus east-positive longitude avoids
 /// local timezone/DST assumptions and also works during polar day/night.
 /// https://gml.noaa.gov/grad/solcalc/solareqns.PDF
-fn solar_altitude(latitude: f64, longitude: f64, time: DateTime<Utc>) -> Option<f64> {
+pub fn solar_altitude(latitude: f64, longitude: f64, time: DateTime<Utc>) -> Option<f64> {
     if !latitude.is_finite()
         || !longitude.is_finite()
         || !(-90.0..=90.0).contains(&latitude)

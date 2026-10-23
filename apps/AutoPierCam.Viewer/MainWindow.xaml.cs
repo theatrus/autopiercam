@@ -1141,6 +1141,12 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.Text = configuration.Upload.Endpoint ?? string.Empty;
         VideoEnabledToggle.IsOn = configuration.Video.Enabled;
         DailyTimelapseToggle.IsOn = configuration.Video.DailyTimelapse == true;
+        var schedule = configuration.Video.TimelapseSchedule ?? new AgentTimelapseSchedule();
+        SelectTag(TimelapseWindowComboBox, schedule.Window);
+        SelectTag(TimelapseTwilightComboBox, schedule.Twilight);
+        SelectTag(TimelapseDeliveryComboBox, schedule.Delivery);
+        TimelapseTimezoneTextBox.Text = schedule.Timezone;
+        TimelapseSendTimeTextBox.Text = schedule.ClockText;
         ResetNumberEditors(CaptureNumberBoxes);
 
         _configurationSnapshot = snapshot;
@@ -1154,6 +1160,12 @@ public sealed partial class MainWindow : Window
         ConfigInfoBar.Message =
             "Choose your settings, then save to apply them.";
         SetConfigurationFeedback(InfoBarSeverity.Informational, false);
+    }
+
+    private static string SelectedTag(ComboBox box, string fallback) => (box.SelectedItem as ComboBoxItem)?.Tag as string ?? fallback;
+    private static void SelectTag(ComboBox box, string value)
+    {
+        box.SelectedItem = box.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag as string == value);
     }
 
     private string SelectedWhiteBalanceMode() => WhiteBalanceModeComboBox.SelectedIndex switch {
@@ -1186,6 +1198,15 @@ public sealed partial class MainWindow : Window
                 latitude is double lat && (!double.IsFinite(lat) || lat < -90 || lat > 90) ||
                 longitude is double lon && (!double.IsFinite(lon) || lon < -180 || lon > 180))
                 throw new UserInputException("Enter both coordinates: latitude -90 to 90 and longitude -180 to 180, or leave both blank.");
+        }
+        var timelapseSchedule = original.Video.TimelapseSchedule;
+        if (_latestAgentStatus?.HasCapability("video.timelapse_schedule") == true)
+        {
+            try {
+                timelapseSchedule = AgentTimelapseSchedule.FromForm(SelectedTag(TimelapseWindowComboBox, "utc_day"),
+                    TimelapseTimezoneTextBox.Text, SelectedTag(TimelapseTwilightComboBox, "sunset"),
+                    SelectedTag(TimelapseDeliveryComboBox, "immediate"), TimelapseSendTimeTextBox.Text, latitude, longitude);
+            } catch (InvalidOperationException ex) { throw new UserInputException(ex.Message); }
         }
         double? previewMaxFps = original.Capture.PreviewMaxFps;
         if (_latestAgentStatus?.HasCapability("capture.preview_rate") == true)
@@ -1319,6 +1340,7 @@ public sealed partial class MainWindow : Window
                 Enabled = VideoEnabledToggle.IsOn,
                 DailyTimelapse = _latestAgentStatus?.HasCapability("video.daily_timelapse") == true
                     ? DailyTimelapseToggle.IsOn : original.Video.DailyTimelapse,
+                TimelapseSchedule = timelapseSchedule,
             },
         };
     }
@@ -1676,6 +1698,12 @@ public sealed partial class MainWindow : Window
         UploadEndpointTextBox.IsEnabled = configurationControlsEnabled;
         VideoEnabledToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.native") == true;
         DailyTimelapseToggle.IsEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.daily_timelapse") == true;
+        bool scheduleEnabled = configurationControlsEnabled && _latestAgentStatus?.HasCapability("video.timelapse_schedule") == true;
+        TimelapseWindowComboBox.IsEnabled = scheduleEnabled;
+        TimelapseTimezoneTextBox.IsEnabled = scheduleEnabled;
+        TimelapseTwilightComboBox.IsEnabled = scheduleEnabled;
+        TimelapseDeliveryComboBox.IsEnabled = scheduleEnabled;
+        TimelapseSendTimeTextBox.IsEnabled = scheduleEnabled;
         CaptureKeepEditsButton.IsEnabled = generalControlsEnabled && !_liveStatusUnavailable;
         UpdateOutboxControlAvailability();
         UpdateRetentionControlAvailability();

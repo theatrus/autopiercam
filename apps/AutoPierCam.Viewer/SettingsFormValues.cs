@@ -30,6 +30,11 @@ internal sealed record SettingsFormValues
     internal string Endpoint { get; init; } = "";
     internal bool Video { get; init; }
     internal bool DailyTimelapse { get; init; }
+    internal string TimelapseWindow { get; init; } = "utc_day";
+    internal string TimelapseTimezone { get; init; } = "UTC";
+    internal string TimelapseTwilight { get; init; } = "sunset";
+    internal string TimelapseDelivery { get; init; } = "immediate";
+    internal string TimelapseSendTime { get; init; } = "12:00";
 
     internal static string Text(string? value) => value?.Trim() ?? "";
     internal static string Number(double value) => double.IsNaN(value) ? "disabled" : value == 0 ? "0" : value.ToString("R", CultureInfo.InvariantCulture);
@@ -65,6 +70,11 @@ internal sealed record SettingsFormValues
         CameraId = config.Camera.CameraId, CameraFilter = Text(config.Camera.NameContains),
         Adaptive = true, Raw16 = config.Camera.Raw16 == true,
         Upload = config.Upload.Enabled, Endpoint = Text(config.Upload.Endpoint),
-        Video = config.Video.Enabled, DailyTimelapse = config.Video.DailyTimelapse == true
+        Video = config.Video.Enabled, DailyTimelapse = config.Video.DailyTimelapse == true,
+        TimelapseWindow = config.Video.TimelapseSchedule?.Window ?? "utc_day",
+        TimelapseTimezone = config.Video.TimelapseSchedule?.Timezone ?? "UTC",
+        TimelapseTwilight = config.Video.TimelapseSchedule?.Twilight ?? "sunset",
+        TimelapseDelivery = config.Video.TimelapseSchedule?.Delivery ?? "immediate",
+        TimelapseSendTime = config.Video.TimelapseSchedule?.ClockText ?? "12:00"
     };
 }

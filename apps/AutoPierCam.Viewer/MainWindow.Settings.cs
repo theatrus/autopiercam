@@ -21,11 +21,21 @@ public sealed partial class MainWindow
             // Save available during editing, not only after tabbing away.
             input.RegisterPropertyChangedCallback(NumberBox.TextProperty, (_, _) => MarkSettingsEdited());
         }
-        foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox })
+        foreach (TextBox input in new[] { CameraNameFilterTextBox, CameraSerialTextBox, UploadEndpointTextBox,
+            TimelapseTimezoneTextBox, TimelapseSendTimeTextBox })
             input.TextChanged += (_, _) => MarkSettingsEdited();
         foreach (ToggleSwitch input in new[] { UploadEnabledToggle, VideoEnabledToggle, DailyTimelapseToggle, AdaptiveExposureToggle, Raw16Toggle, PreferShortExposuresToggle, UsbResetOnFaultToggle })
             input.Toggled += (_, _) => MarkSettingsEdited();
         CameraDriverComboBox.SelectionChanged += (_, _) => MarkSettingsEdited();
+        foreach (ComboBox input in new[] { TimelapseWindowComboBox, TimelapseTwilightComboBox, TimelapseDeliveryComboBox })
+            input.SelectionChanged += (_, _) => MarkSettingsEdited();
+        TimelapseWindowComboBox.SelectionChanged += (_, _) => {
+            if (_operationInProgress || _settingsBaseline is null || SelectedTag(TimelapseWindowComboBox, "utc_day") != "dusk_to_dawn") return;
+            // Explicitly selecting night recording offers the requested noon
+            // preset; the user can still choose immediate delivery afterward.
+            SelectTag(TimelapseDeliveryComboBox, "local_time");
+            TimelapseSendTimeTextBox.Text = "12:00";
+        };
         WhiteBalanceModeComboBox.SelectionChanged += (_, _) => {
             MarkSettingsEdited();
             SetControlsForOperation(_operationInProgress);
@@ -111,7 +121,12 @@ public sealed partial class MainWindow
             CameraFilter = SettingsFormValues.Text(CameraNameFilterTextBox.Text),
             Adaptive = AdaptiveExposureToggle.IsOn, Raw16 = Raw16Toggle.IsOn,
             Upload = UploadEnabledToggle.IsOn, Endpoint = SettingsFormValues.Text(UploadEndpointTextBox.Text),
-            Video = VideoEnabledToggle.IsOn, DailyTimelapse = DailyTimelapseToggle.IsOn
+            Video = VideoEnabledToggle.IsOn, DailyTimelapse = DailyTimelapseToggle.IsOn,
+            TimelapseWindow = SelectedTag(TimelapseWindowComboBox, "utc_day"),
+            TimelapseTimezone = SettingsFormValues.Text(TimelapseTimezoneTextBox.Text),
+            TimelapseTwilight = SelectedTag(TimelapseTwilightComboBox, "sunset"),
+            TimelapseDelivery = SelectedTag(TimelapseDeliveryComboBox, "immediate"),
+            TimelapseSendTime = SettingsFormValues.Text(TimelapseSendTimeTextBox.Text)
         };
     }
 }
