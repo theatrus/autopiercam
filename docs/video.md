@@ -1,7 +1,6 @@
 # Windows-native video and daily timelapses
 
-These are development changes after 0.2.26; the published 0.2.26 installer
-predates the native encoder.
+Windows-native security video and daily timelapses are available in 0.2.27.
 
 Both video modes use Windows Media Foundation to produce H.264 MP4, without an
 external executable or codec download. Hardware transforms are allowed; Windows

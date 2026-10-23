@@ -578,7 +578,8 @@ impl DailyWorker {
                                     retention.as_ref(),
                                 )?;
                                 if let Some(sharing) = &sharing
-                                    && let Err(error) = sharing.offer(&directory.join(output_name(day)), (day + 1).saturating_mul(DAY_MS)) {
+                                    && let Err(error) = sharing.offer_checked(&directory.join(output_name(day)), (day + 1).saturating_mul(DAY_MS),
+                                        |additional| retention.as_ref().map_or(Ok(()), |sink| sink.check_video_space(additional))) {
                                         tracing::warn!(%error, "Timelapse not queued for Chatstronomy; local movie is unchanged");
                                     }
                             }

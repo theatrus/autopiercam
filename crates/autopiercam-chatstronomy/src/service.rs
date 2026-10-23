@@ -223,9 +223,14 @@ impl TimelapseSink {
             std::time::Instant::now(),
         )
     }
-    pub fn offer(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+    pub fn offer_checked(
+        &self,
+        path: &Path,
+        captured_at_unix_ms: u64,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<bool> {
         self.0.upgrade().map_or(Ok(false), |shared| {
-            SharingClient(shared).offer_timelapse(path, captured_at_unix_ms)
+            SharingClient(shared).offer_timelapse_checked(path, captured_at_unix_ms, check_space)
         })
     }
 }
@@ -375,9 +380,18 @@ impl SharingClient {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    #[cfg(test)]
+    pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+        self.offer_timelapse_checked(path, captured_at_unix_ms, |_| Ok(()))
+    }
     /// Called by the background daily encoder, never the acquisition callback.
     /// One immutable, bounded disk offer; no directory scan or old-file replay.
-    pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
+    fn offer_timelapse_checked(
+        &self,
+        path: &Path,
+        captured_at_unix_ms: u64,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<bool> {
         let epoch = *self.0.changes.borrow();
         let movie_generation = self.0.movie_generation.load(Ordering::Acquire);
         let settings = self.0.settings.read().unwrap().clone();
@@ -399,12 +413,16 @@ impl SharingClient {
         if self.0.pending_timelapse.lock().unwrap().is_some() {
             bail!("A timelapse is already queued; the local file is unchanged");
         }
-        let movie = crate::movie::Movie::snapshot(path, || {
-            *self.0.changes.borrow() == epoch
-                && self.0.movie_generation.load(Ordering::Acquire) == movie_generation
-                && !self.0.stopped.load(Ordering::Acquire)
-                && (self.0.source)().is_some_and(|current| current.session == frame.session)
-        })?;
+        let movie = crate::movie::Movie::snapshot_checked(
+            path,
+            || {
+                *self.0.changes.borrow() == epoch
+                    && self.0.movie_generation.load(Ordering::Acquire) == movie_generation
+                    && !self.0.stopped.load(Ordering::Acquire)
+                    && (self.0.source)().is_some_and(|current| current.session == frame.session)
+            },
+            check_space,
+        )?;
         let _guard = self.0.mutation.lock().unwrap();
         if *self.0.changes.borrow() != epoch
             || self.0.stopped.load(Ordering::Acquire)

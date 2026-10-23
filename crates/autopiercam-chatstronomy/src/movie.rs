@@ -23,7 +23,15 @@ pub(crate) struct Movie {
 }
 
 impl Movie {
+    #[cfg(test)]
     pub fn snapshot(path: &Path, still_allowed: impl Fn() -> bool) -> Result<Self> {
+        Self::snapshot_checked(path, still_allowed, |_| Ok(()))
+    }
+    pub fn snapshot_checked(
+        path: &Path,
+        still_allowed: impl Fn() -> bool,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<Self> {
         let metadata = std::fs::symlink_metadata(path)?;
         ensure!(
             metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -57,6 +65,10 @@ impl Movie {
             before.len() > 0 && before.len() <= crate::protocol::TIMELAPSE_SAFETY_CEILING,
             "Timelapse exceeds the 512 MiB client safety ceiling; local movie unchanged"
         );
+        // Account for the entire additional copy before creating it. Recheck
+        // remaining bytes periodically as concurrent capture consumes space.
+        check_space(before.len())?;
+        let mut checked_at = std::time::Instant::now();
         // Same volume as the original, under a retention-accounted private prefix.
         let directory = tempfile::Builder::new()
             .prefix(".autopiercam-video-sharing-")
@@ -78,6 +90,10 @@ impl Movie {
                 length <= before.len(),
                 "Timelapse changed while being copied"
             );
+            if checked_at.elapsed() >= std::time::Duration::from_secs(1) {
+                check_space(before.len() - length + count as u64)?;
+                checked_at = std::time::Instant::now();
+            }
             copy.write_all(&buffer[..count])?;
         }
         let after = source.metadata()?;
@@ -88,6 +104,7 @@ impl Movie {
             "Timelapse changed while being copied"
         );
         copy.as_file().sync_all()?;
+        check_space(0)?;
         // Close the only writer. Keep only a read-only handle for all attempts;
         // on Windows deny any other writer for the lifetime of this snapshot.
         let path = copy.into_temp_path();
@@ -187,6 +204,47 @@ mod tests {
         futures_util::pin_mut!(stream);
         assert!(stream.next().await.unwrap().is_err());
         assert_eq!(std::fs::read(original).unwrap(), b"new original contents");
+    }
+
+    #[test]
+    fn snapshot_space_admission_and_final_recheck_preserve_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("daily.mp4");
+        let bytes = vec![19; CHUNK_BYTES * 2 + 7];
+        std::fs::write(&original, &bytes).unwrap();
+        let checks = std::cell::RefCell::new(Vec::new());
+        assert!(
+            Movie::snapshot_checked(
+                &original,
+                || true,
+                |additional| {
+                    checks.borrow_mut().push(additional);
+                    // Admission must happen before even a private directory is made.
+                    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+                    anyhow::bail!("quota exhausted")
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*checks.borrow(), vec![bytes.len() as u64]);
+        checks.borrow_mut().clear();
+        assert!(
+            Movie::snapshot_checked(
+                &original,
+                || true,
+                |additional| {
+                    checks.borrow_mut().push(additional);
+                    if additional == 0 {
+                        anyhow::bail!("concurrent capture consumed quota")
+                    }
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*checks.borrow(), vec![bytes.len() as u64, 0]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
     }
 
     #[test]

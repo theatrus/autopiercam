@@ -367,6 +367,37 @@ pub(crate) mod tests {
         );
         assert!(!OverlayOptions::default().requested());
     }
+
+    #[test]
+    fn repeated_old_snapshots_cannot_revive_cleared_labels() {
+        let (mut history, now, ms, options) =
+            (History::default(), Instant::now(), millis(), options());
+        history.accept(state(fixture()), &options, Some(1), ms, now);
+        let mut cleared = fixture();
+        cleared["revision"] = json!(43);
+        cleared["observed_at"] = json!("2026-10-22T05:10:05Z");
+        cleared["valid_until"] = json!("2026-10-22T05:10:35Z");
+        cleared["target"] = Value::Null;
+        cleared["completed_exposures"] = Value::Null;
+        cleared["temperatures"] = Value::Null;
+        history.accept(state(cleared.clone()), &options, Some(1), ms + 5000, now);
+        for i in 1..=3 {
+            history.accept(state(fixture()), &options, Some(1), ms + 5000 + i, now);
+            assert!(
+                history.overlay(&options, 1, ms + 5000 + i, now).is_none(),
+                "old replay {i} revived cleared state"
+            );
+        }
+        cleared["available"] = json!(false);
+        cleared["state_epoch"] = Value::Null;
+        cleared["revision"] = Value::Null;
+        history.accept(state(cleared), &options, Some(1), ms + 6000, now);
+        history.accept(state(fixture()), &options, Some(1), ms + 7000, now);
+        assert!(
+            history.overlay(&options, 1, ms + 7000, now).is_none(),
+            "old epoch must not revive unavailable state"
+        );
+    }
 }
 #[derive(Default)]
 pub(crate) struct History {
@@ -403,19 +434,25 @@ impl History {
             self.clear();
             return;
         };
+        // Retain the most recent clearing snapshot as a watermark. Dropping it
+        // for an older message would let a second replay revive stale labels.
+        // Timestamp ordering also applies across unavailable/null epochs.
+        if self.samples.back().is_some_and(|previous| {
+            observed < utc_milliseconds(&previous.state.observed_at).unwrap()
+                || now_ms < previous.received
+                || (previous.state.state_epoch == state.state_epoch
+                    && state.revision < previous.state.revision)
+        }) {
+            return;
+        }
         if !state.valid() || observed > now_ms || until <= now_ms {
             self.clear();
             return;
         }
-        if let Some(previous) = self.samples.back() {
-            if previous.state.state_epoch != state.state_epoch {
-                self.samples.clear();
-            } else if state.revision < previous.state.revision
-                || observed < utc_milliseconds(&previous.state.observed_at).unwrap()
-            {
-                self.clear();
-                return;
-            }
+        if let Some(previous) = self.samples.back()
+            && previous.state.state_epoch != state.state_epoch
+        {
+            self.samples.clear();
         }
         if !state.available {
             self.samples.clear();

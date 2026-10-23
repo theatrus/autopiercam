@@ -169,7 +169,10 @@ forgetting, disabling sharing, or changing settings cancels pending work.
 Temporary snapshots are removed after success, rejection, cancellation or retry
 exhaustion. They live in private `.autopiercam-video-sharing-*` directories beside
 the original, counted by the existing video working-storage quota. Snapshot
-creation uses bounded chunks and checks cancellation between chunks. Abrupt
+creation checks room for the full additional copy before starting, rechecks
+remaining space once a second and before queueing, and checks cancellation
+between bounded chunks. These checks share the video retention limits, not a
+hard filesystem reservation against concurrent writes. Abrupt
 process termination can leave a private orphan, still counted by storage limits;
 it is never replayed as a new upload. At most one copy operation, one pending
 snapshot and one active upload can exist at a time.
@@ -207,7 +210,7 @@ temperature. All labels default off. Enable daily timelapse recording in Imaging
 and pairing/master sharing in Chatstronomy; movie uploads, image posts and
 telescope-event triggers remain separate opt-ins.
 
-Overlays require the Hub's [v4 observation-state feed](https://github.com/theatrus/chatstronomy/blob/theatrus/pier-camera-observation-context/docs/OBSERVATION_STATE_PROTOCOL.md)
+Overlays require the Hub's [v4 observation-state feed](https://github.com/theatrus/chatstronomy/blob/main/docs/OBSERVATION_STATE_PROTOCOL.md)
 and the N.I.N.A. plugin's **Share observation state for pier-camera overlays**
 permission. Target labels also require Target Scheduler consent; counts require
 Target Scheduler, Images and Sequence; temperatures require the corresponding
