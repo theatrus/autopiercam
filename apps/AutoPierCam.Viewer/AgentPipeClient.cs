@@ -977,6 +977,10 @@ internal sealed record AgentUploadConfiguration
 
 internal sealed record AgentVideoConfiguration
 {
+    [JsonPropertyName("timelapse_schedule")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public AgentTimelapseSchedule? TimelapseSchedule { get; init; }
+
     // Preserve uneditable legacy/forward fields when talking to an older agent.
     // In particular, saving unrelated settings must not clear its encoder path.
     [JsonExtensionData]
@@ -997,6 +1001,42 @@ internal sealed record AgentVideoConfiguration
     [JsonPropertyName("frames_per_second")]
     [JsonRequired]
     public uint FramesPerSecond { get; init; }
+}
+
+internal sealed record AgentTimelapseSchedule
+{
+    [JsonPropertyName("window")]
+    public string Window { get; init; } = "utc_day";
+    [JsonPropertyName("timezone")]
+    public string Timezone { get; init; } = "UTC";
+    [JsonPropertyName("twilight")]
+    public string Twilight { get; init; } = "sunset";
+    [JsonPropertyName("delivery")]
+    public string Delivery { get; init; } = "immediate";
+    [JsonPropertyName("send_minute")]
+    public ushort SendMinute { get; init; } = 720;
+
+    internal string ClockText => $"{SendMinute / 60:00}:{SendMinute % 60:00}";
+
+    internal static AgentTimelapseSchedule FromForm(string window, string timezone, string twilight,
+        string delivery, string clock, double? latitude, double? longitude)
+    {
+        timezone = timezone.Trim();
+        if (window is not ("utc_day" or "local_noon" or "dusk_to_dawn") ||
+            twilight is not ("sunset" or "civil" or "astronomical") || delivery is not ("immediate" or "local_time"))
+            throw new InvalidOperationException("Choose a supported timelapse schedule.");
+        if (timezone.Length > 100 || (timezone != "UTC" && !TimeZoneInfo.TryConvertIanaIdToWindowsId(timezone, out _)))
+            throw new InvalidOperationException("Enter an IANA timezone, such as America/Los_Angeles.");
+        if (!TimeOnly.TryParseExact(clock.Trim(), "HH:mm", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var time))
+            throw new InvalidOperationException("Timelapse send time must be HH:mm, for example 12:00.");
+        if (window == "dusk_to_dawn" && (latitude is null || longitude is null ||
+            !double.IsFinite(latitude.Value) || !double.IsFinite(longitude.Value) ||
+            Math.Abs(latitude.Value) > 90 || Math.Abs(longitude.Value) > 180))
+            throw new InvalidOperationException("Sunset-to-sunrise timelapses require the observing latitude and longitude above.");
+        return new() { Window = window, Timezone = timezone, Twilight = twilight, Delivery = delivery,
+            SendMinute = (ushort)(time.Hour * 60 + time.Minute) };
+    }
 }
 
 internal sealed record AgentApiConfiguration

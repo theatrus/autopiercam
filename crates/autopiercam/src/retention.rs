@@ -889,10 +889,24 @@ fn sweep_retention(
     if let Some(error) = free_space_error {
         errors.push(error);
     }
+    let scheduled = match crate::timelapse::protected_outputs(directory, swept_at_unix_ms) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return RetentionTelemetry::failed(
+                swept_at_unix_ms,
+                policy,
+                initial_free_bytes,
+                error.to_string(),
+            );
+        }
+    };
     let candidates = inventory
         .into_iter()
         .zip(authorizations)
         .map(|(artifact, mut authorization)| {
+            if scheduled.contains(&artifact.path) {
+                authorization = RetentionAuthorization::protected();
+            }
             if authorization.is_reclaimable()
                 && authorization
                     .expected_file_size_bytes
@@ -1633,6 +1647,55 @@ mod tests {
         );
         assert!(plan.deletions.is_empty());
         assert_eq!(plan.protected_bytes, 80);
+    }
+
+    #[test]
+    fn scheduled_movie_is_protected_until_terminal_delivery_or_age_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let day = root
+            .path()
+            .join(".autopiercam-timelapse/00000000000000000001");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("window.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "window":{"start_ms":0,"end_ms":100,"send_after_ms":1000}, "plan_id":"a".repeat(64)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(day.join("send.pending"), b"consent").unwrap();
+        let name = format!(
+            "frame-0-100-{:032x}-000000.mp4",
+            (1_u128 << 64) | 0x7363686564756c65
+        );
+        let movie = root.path().join(name);
+        fs::write(&movie, [0; 20]).unwrap();
+        let platform = RecordingPlatform {
+            free_bytes: 1000,
+            deleted: Mutex::new(Vec::new()),
+        };
+        let sweep = |now| {
+            sweep_retention(
+                RetentionPolicy {
+                    max_age_ms: Some(1),
+                    ..policy()
+                },
+                root.path(),
+                &crate::parse_generated_capture_filename,
+                &LocalOnlyRetentionAuthority,
+                &platform,
+                &FixedClock(now),
+            )
+        };
+        let waiting = sweep(999);
+        assert_eq!(waiting.reclaimed_file_count, 0);
+        assert!(platform.deleted.lock().unwrap().is_empty());
+        assert!(waiting.protected_bytes >= 20);
+        assert_eq!(sweep(1000).reclaimed_file_count, 0); // due does not mean copied yet
+        fs::write(day.join("send.done"), b"attempted").unwrap();
+        assert_eq!(sweep(1001).reclaimed_file_count, 1);
+        assert_eq!(*platform.deleted.lock().unwrap(), vec![movie]);
     }
 
     #[test]

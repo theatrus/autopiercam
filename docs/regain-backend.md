@@ -1,6 +1,6 @@
 # Regain camera backend
 
-AutoPierCam 0.2.27 pins Regain 0.5.15.1 at
+AutoPierCam 0.2.28 pins Regain 0.5.15.1 at
 `c6d0c463192eb4912f9d03d8808df5cca77525e1`; the four Rust crates report 0.5.15.
 This includes the intervening maintenance updates to recovery diagnostics and
 Direct cooling regulation. AutoPierCam uses the low-level worker adapter, not

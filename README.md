@@ -9,23 +9,23 @@ and can upload completed artifacts. Video uses the Windows-native
 H.264 encoder for security-video segments and daily timelapses from saved stills,
 with no separate encoder installation. See [video setup](docs/video.md).
 
-AutoPierCam 0.2.27 is authored by Yann Ramin and licensed under the
+AutoPierCam 0.2.28 is authored by Yann Ramin and licensed under the
 [Apache License 2.0](LICENSE). Its canonical repository is
 [github.com/theatrus/autopiercam](https://github.com/theatrus/autopiercam).
 
 ## Download
 
-[Download the signed Windows x64 installer (0.2.27)](https://github.com/theatrus/autopiercam/releases/download/v0.2.27/AutoPierCam-0.2.27-x64.msi).
-The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.27)
+[Download the signed Windows x64 installer (0.2.28)](https://github.com/theatrus/autopiercam/releases/download/v0.2.28/AutoPierCam-0.2.28-x64.msi).
+The [GitHub release](https://github.com/theatrus/autopiercam/releases/tag/v0.2.28)
 also includes the signed N.I.N.A. plugin, its manifest, and SHA-256 checksums.
 See the [installation guide](docs/installation.md) for setup. ZWO's camera
 driver is installed separately.
 
-Version 0.2.27 adds native security video and daily timelapses, optional target,
-saved-exposure count and focuser/external-temperature overlays, and opt-in
-Chatstronomy movie sharing. Larger uploads honor the Hub limit up to a separate
-512 MiB client ceiling; Discord delivery is best-effort. See the
-[0.2.27 release notes](docs/releases/0.2.27.md) and [video setup](docs/video.md).
+Version 0.2.28 adds sunset-to-sunrise and local noon-to-noon timelapse windows,
+with an independent local-clock Chatstronomy send time. Select your observing
+coordinates and IANA timezone to collect a night and send it at noon. Existing
+UTC-day schedules, optional overlays and size limits remain available. See the
+[0.2.28 release notes](docs/releases/0.2.28.md) and [video setup](docs/video.md).
 
 The camera-on-pier mark uses cyan for night operation and amber for daylight
 operation. Its canonical vector source and reproducible Windows icon outputs

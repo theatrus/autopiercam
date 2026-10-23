@@ -502,7 +502,26 @@
                                    TextWrapping="Wrap" />
                         <ToggleSwitch x:Name="DailyTimelapseToggle" Header="Daily timelapse from saved stills"
                                       IsEnabled="False" OffContent="Disabled" OnContent="Enabled" />
-                        <TextBlock Text="One saved still per minute, 24 fps, 1280 × 720. Finishes after midnight UTC; keeps up to 1 GiB of private samples across restarts, counted within storage limits. No separate encoder installation."
+                        <TextBlock Text="One saved still per minute, 24 fps, 1280 × 720. Private samples and movies count toward storage limits. Original stills keep their independent retention policy."
+                                   TextWrapping="Wrap" />
+                        <ComboBox x:Name="TimelapseWindowComboBox" Header="Timelapse recording window" SelectedIndex="0" IsEnabled="False">
+                            <ComboBoxItem Content="UTC day (existing behavior)" Tag="utc_day" />
+                            <ComboBoxItem Content="Local noon to noon" Tag="local_noon" />
+                            <ComboBoxItem Content="Night — sunset to sunrise" Tag="dusk_to_dawn" />
+                        </ComboBox>
+                        <TextBox x:Name="TimelapseTimezoneTextBox" Header="Timelapse timezone (IANA)" Text="UTC"
+                                 PlaceholderText="America/Los_Angeles" IsEnabled="False" />
+                        <ComboBox x:Name="TimelapseTwilightComboBox" Header="Night boundaries" SelectedIndex="0" IsEnabled="False">
+                            <ComboBoxItem Content="Sunset to sunrise" Tag="sunset" />
+                            <ComboBoxItem Content="Civil twilight (Sun −6°)" Tag="civil" />
+                            <ComboBoxItem Content="Astronomical twilight (Sun −18°)" Tag="astronomical" />
+                        </ComboBox>
+                        <ComboBox x:Name="TimelapseDeliveryComboBox" Header="Send to Chatstronomy" SelectedIndex="0" IsEnabled="False">
+                            <ComboBoxItem Content="When the movie is ready" Tag="immediate" />
+                            <ComboBoxItem Content="At a local clock time" Tag="local_time" />
+                        </ComboBox>
+                        <TextBox x:Name="TimelapseSendTimeTextBox" Header="Local send time (HH:mm)" Text="12:00" IsEnabled="False" />
+                        <TextBlock Text="Night windows use the observing coordinates above. Enable movie sharing separately in Chatstronomy settings. Sending waits for the window to close and encoding to finish; catch-up expires 24 hours after the window closes. Keep AutoPierCam recording services running. No complete sunset/sunrise pair means no night clip."
                                    TextWrapping="Wrap" />
                     </StackPanel>
                     </ScrollViewer>

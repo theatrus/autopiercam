@@ -6,6 +6,38 @@ using Xunit;
 public sealed class SettingsFormValuesTests
 {
     [Fact]
+    public void TimelapseScheduleRoundTripsAndAllDraftFieldsAreTracked()
+    {
+        var schedule = AgentTimelapseSchedule.FromForm("dusk_to_dawn", "America/Los_Angeles", "sunset", "local_time", "12:00", 38.7, -121.1);
+        Assert.Equal((ushort)720, schedule.SendMinute);
+        var config = Config with { Video = Config.Video with { TimelapseSchedule = schedule } };
+        var roundTrip = JsonSerializer.Deserialize<AgentConfiguration>(JsonSerializer.Serialize(config))!;
+        Assert.Equal(schedule, roundTrip.Video.TimelapseSchedule);
+        var form = SettingsFormValues.FromConfiguration(roundTrip);
+        Assert.Equal("dusk_to_dawn", form.TimelapseWindow);
+        Assert.Equal("sunset", form.TimelapseTwilight);
+        Assert.Equal("12:00", form.TimelapseSendTime);
+        Assert.NotEqual(form, form with { TimelapseTimezone = "UTC" });
+        Assert.NotEqual(form, form with { TimelapseWindow = "local_noon" });
+        Assert.NotEqual(form, form with { TimelapseTwilight = "civil" });
+        Assert.NotEqual(form, form with { TimelapseDelivery = "immediate" });
+        Assert.NotEqual(form, form with { TimelapseSendTime = "invalid draft" });
+        Assert.DoesNotContain("timelapse_schedule", JsonSerializer.Serialize(Config));
+        Assert.Equal("utc_day", SettingsFormValues.FromConfiguration(Config).TimelapseWindow);
+    }
+
+    [Theory]
+    [InlineData("24:00", "America/Los_Angeles", 38.7)]
+    [InlineData("12:30:45", "America/Los_Angeles", 38.7)]
+    [InlineData("12:00", "Pacific Standard Time", 38.7)]
+    [InlineData("12:00", "not/a/zone", 38.7)]
+    [InlineData("12:00", "America/Los_Angeles", null)]
+    public void InvalidTimelapseDraftCannotBeSaved(string clock, string zone, double? latitude)
+    {
+        Assert.Throws<InvalidOperationException>(() => AgentTimelapseSchedule.FromForm("dusk_to_dawn", zone, "sunset", "local_time", clock, latitude, -121.1));
+    }
+
+    [Fact]
     public void NativeVideoAndDailyTimelapseAreIndependentTrackedEdits()
     {
         var baseline = SettingsFormValues.FromConfiguration(Config);

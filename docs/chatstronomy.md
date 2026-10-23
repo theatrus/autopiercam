@@ -149,7 +149,7 @@ their original caption and bytes.
 
 Enable **Share finalized daily timelapses** separately in Chatstronomy settings
 to post newly finished H.264 MP4 movies to the camera's selected Discord channels.
-Daily timelapse recording must also be enabled under Capture. The sharing switch
+Daily timelapse recording must also be enabled under Imaging. The sharing switch
 does not enable recording or any image/snapshot permissions, and chat cannot turn
 it on. Both timelapses and rich observation labels require an updated v3 Hub.
 
@@ -164,8 +164,14 @@ movie in RAM. HTTP uses `Content-Length` and backpressured 64 KiB file reads,
 with at most three attempts using the same clip ID, timestamp and snapshot bytes.
 The Hub keeps per-route
 receipts so retries do not repeat successful destinations. There is no historical
-directory scan or upload backlog after restart. Pause, capture-session changes,
+directory scan of unrelated movies. New [timelapse schedules](video.md#record-a-night-and-send-it-at-noon)
+can retain a delivery intent until the selected local time, including across a
+restart. Catch-up expires 24 hours after window close; schedule or consent
+changes cancel it. An interrupted claimed attempt is not replayed. Legacy UTC-day
+immediate schedules do not acquire restart backlog behavior. Pause, capture-session changes,
 forgetting, disabling sharing, or changing settings cancels pending work.
+Before an upload is claimed, a scheduled intent can wait through a pause or
+offline period until the same expiry; withdrawal of sharing consent cancels it.
 Temporary snapshots are removed after success, rejection, cancellation or retry
 exhaustion. They live in private `.autopiercam-video-sharing-*` directories beside
 the original, counted by the existing video working-storage quota. Snapshot

@@ -456,6 +456,7 @@ impl AgentMonitor {
             "video.native".to_owned(),
             #[cfg(windows)]
             "video.daily_timelapse".to_owned(),
+            "video.timelapse_schedule".to_owned(),
         ];
         Self {
             inner: Arc::new(RwLock::new(status)),
@@ -1569,6 +1570,8 @@ fn run_recording_epoch(
     let timelapse_worker = if config.video.daily_timelapse {
         Some(timelapse::DailyWorker::start(
             &capture_directory,
+            &config.video.timelapse_schedule,
+            &config.camera,
             upload_sink.clone(),
             retention_sink.clone(),
             monitor
@@ -3431,6 +3434,7 @@ mod tests {
                 "video.native".to_owned(),
                 #[cfg(windows)]
                 "video.daily_timelapse".to_owned(),
+                "video.timelapse_schedule".to_owned(),
             ]
         );
         let upload = status.upload.expect("upload telemetry");

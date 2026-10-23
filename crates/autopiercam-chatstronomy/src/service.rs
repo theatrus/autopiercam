@@ -141,6 +141,7 @@ pub(crate) struct Shared {
     pub source: FrameSource,
     pub policy: TransportPolicy,
     pub pending_timelapse: Mutex<Option<QueuedTimelapse>>,
+    pub media_ready: AtomicBool,
     pub observations: Mutex<crate::observation::History>,
     snapshot_copy: Mutex<()>,
     movie_generation: AtomicU64,
@@ -160,6 +161,7 @@ pub(crate) struct QueuedTimelapse {
 
 impl Shared {
     pub fn cancel_timelapses(&self) {
+        self.media_ready.store(false, Ordering::Release);
         let mut pending = self.pending_timelapse.lock().unwrap();
         self.movie_generation.fetch_add(1, Ordering::AcqRel);
         *pending = None;
@@ -205,6 +207,27 @@ impl std::fmt::Debug for TimelapseSink {
 }
 
 impl TimelapseSink {
+    /// Persist only a non-secret consent identity. A settings change or new
+    /// pairing cancels delayed deliveries, including across process restarts.
+    pub fn consent_key(&self) -> Option<String> {
+        let shared = self.0.upgrade()?;
+        let s = shared.settings.read().unwrap();
+        if shared.stopped.load(Ordering::Acquire)
+            || !s.preferences.enabled
+            || !s.preferences.timelapses
+        {
+            return None;
+        }
+        consent_identity(&s)
+    }
+    pub fn ready_for_movie(&self) -> bool {
+        self.0.upgrade().is_some_and(|s| {
+            s.media_ready.load(Ordering::Acquire)
+                && !s.stopped.load(Ordering::Acquire)
+                && (s.source)().is_some()
+                && s.pending_timelapse.lock().unwrap().is_none()
+        })
+    }
     /// Called at capture enqueue time, not at daily encoding time. Never opens a camera.
     pub fn overlay_for(&self, captured_at_unix_ms: u64) -> Option<crate::observation::Overlay> {
         let shared = self.0.upgrade()?;
@@ -230,9 +253,37 @@ impl TimelapseSink {
         check_space: impl Fn(u64) -> Result<()>,
     ) -> Result<bool> {
         self.0.upgrade().map_or(Ok(false), |shared| {
-            SharingClient(shared).offer_timelapse_checked(path, captured_at_unix_ms, check_space)
+            SharingClient(shared).offer_timelapse_checked(
+                path,
+                captured_at_unix_ms,
+                None,
+                check_space,
+            )
         })
     }
+    pub fn offer_scheduled_checked(
+        &self,
+        path: &Path,
+        captured_at_unix_ms: u64,
+        expected_consent: &str,
+        check_space: impl Fn(u64) -> Result<()>,
+    ) -> Result<bool> {
+        self.0.upgrade().map_or(Ok(false), |shared| {
+            SharingClient(shared).offer_timelapse_checked(
+                path,
+                captured_at_unix_ms,
+                Some(expected_consent),
+                check_space,
+            )
+        })
+    }
+}
+
+fn consent_identity(s: &Settings) -> Option<String> {
+    Some(format!(
+        "{}:{}:{}:{}",
+        s.installation_id, s.device_id?, s.revision, s.preferences.hub_origin
+    ))
 }
 
 impl std::fmt::Debug for SharingClient {
@@ -318,6 +369,7 @@ impl SharingService {
             source,
             policy,
             pending_timelapse: Mutex::new(None),
+            media_ready: AtomicBool::new(false),
             observations: Mutex::new(Default::default()),
             snapshot_copy: Mutex::new(()),
             movie_generation: AtomicU64::new(0),
@@ -382,7 +434,7 @@ impl SharingClient {
 
     #[cfg(test)]
     pub fn offer_timelapse(&self, path: &Path, captured_at_unix_ms: u64) -> Result<bool> {
-        self.offer_timelapse_checked(path, captured_at_unix_ms, |_| Ok(()))
+        self.offer_timelapse_checked(path, captured_at_unix_ms, None, |_| Ok(()))
     }
     /// Called by the background daily encoder, never the acquisition callback.
     /// One immutable, bounded disk offer; no directory scan or old-file replay.
@@ -390,6 +442,7 @@ impl SharingClient {
         &self,
         path: &Path,
         captured_at_unix_ms: u64,
+        expected_consent: Option<&str>,
         check_space: impl Fn(u64) -> Result<()>,
     ) -> Result<bool> {
         let epoch = *self.0.changes.borrow();
@@ -399,6 +452,8 @@ impl SharingClient {
             || !settings.preferences.timelapses
             || settings.device_id.is_none()
             || self.0.stopped.load(Ordering::Acquire)
+            || expected_consent
+                .is_some_and(|key| consent_identity(&settings).as_deref() != Some(key))
         {
             return Ok(false);
         }
@@ -427,6 +482,9 @@ impl SharingClient {
         if *self.0.changes.borrow() != epoch
             || self.0.stopped.load(Ordering::Acquire)
             || (self.0.source)().is_none_or(|current| current.session != frame.session)
+            || expected_consent.is_some_and(|key| {
+                consent_identity(&self.0.settings.read().unwrap()).as_deref() != Some(key)
+            })
         {
             return Ok(false);
         }

@@ -389,7 +389,10 @@ async fn session(
                         shared.observations.lock().unwrap().accept(*state, &settings.preferences.overlays,
                             (shared.source)().map(|f|f.session), now_ms() as i64, std::time::Instant::now());
                     }
-                    ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {media_limit = Some(crate::protocol::timelapse_limit(max_timelapse_bytes));}
+                    ServerMessage::MediaReady {max_timelapse_bytes} if settings.preferences.timelapses => {
+                        media_limit = Some(crate::protocol::timelapse_limit(max_timelapse_bytes));
+                        shared.media_ready.store(true, Ordering::Release);
+                    }
                     ServerMessage::ConfigureTriggers { request_id, rules: proposed } if version >= crate::protocol::TRIGGER_PROTOCOL_VERSION => {
                         let accepted = shared.configure_triggers(proposed.clone(), epoch).is_ok();
                         if accepted {
